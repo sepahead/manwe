@@ -614,7 +614,12 @@ impl DetectionHead {
 
         let dbox = dist2bbox(&self.dfl.forward(&box_)?, &anchors)?;
         let dbox = dbox.broadcast_mul(&strides)?;
-        let pred = Tensor::cat(&[dbox, candle_nn::ops::sigmoid(&cls)?], 1)?;
+        let sigmoid = |xs: &Tensor| {
+            let xs = xs.neg()?.exp()?;
+            let one = Tensor::ones_like(&xs)?;
+            (one.clone() / (one + xs)?)
+        };
+        let pred = Tensor::cat(&[dbox, sigmoid(&cls)?], 1)?;
         Ok(DetectionHeadOut {
             pred,
             anchors,
@@ -679,7 +684,12 @@ impl PoseHead {
 
         let ys01 = ((xs.i((.., .., 0..2))? * 2.)?.broadcast_add(&d.anchors)? - 0.5)?
             .broadcast_mul(&d.strides)?;
-        let ys2 = candle_nn::ops::sigmoid(&xs.i((.., .., 2..3))?)?;
+        let sigmoid = |xs: &Tensor| {
+            let xs = xs.neg()?.exp()?;
+            let one = Tensor::ones_like(&xs)?;
+            (one.clone() / (one + xs)?)
+        };
+        let ys2 = sigmoid(&xs.i((.., .., 2..3))?)?;
         let ys = Tensor::cat(&[ys01, ys2], 2)?.flatten(1, 2)?;
         Tensor::cat(&[d.pred, ys], 1)
     }
