@@ -23,9 +23,11 @@ Performance comparison of YOLOv8s object detection on **Apple Silicon M4 Max**, 
 ## Model
 
 - **YOLOv8s** (small variant)
-- ~21 MB weights
+- Downloaded automatically from HuggingFace on first run
 - 80 COCO classes
 - F32 precision
+
+> **Note:** Model weights (`.pt`, `.safetensors`, `.mlpackage`) are not included in this repository. They are downloaded at runtime or can be exported using the provided scripts.
 
 ## Benchmark Results
 
@@ -37,8 +39,6 @@ Performance comparison of YOLOv8s object detection on **Apple Silicon M4 Max**, 
 | Rust (Candle) | 29.94 | 33.40 | Metal GPU |
 | PyTorch MPS | 27.99 | 35.73 | Metal GPU |
 
-![Single Instance Benchmark](benchmark_single_instance.png)
-
 **Key Finding**: CoreML is **2.7x faster** than Rust/Candle and **2.9x faster** than PyTorch MPS in single-instance scenarios. This is because CoreML leverages the Apple Neural Engine (ANE), while both Rust and PyTorch only use the Metal GPU.
 
 ### Concurrent Performance (3 instances, 500 images each)
@@ -49,13 +49,7 @@ Performance comparison of YOLOv8s object detection on **Apple Silicon M4 Max**, 
 | PyTorch MPS | 26.11 | 78.32 | 38.30 |
 | Rust (Candle) | 11.79 | 35.38 | 84.81 |
 
-![Concurrent Benchmark](benchmark_concurrent_3x.png)
-
 **Key Finding**: CoreML maintains excellent performance under load with only **6% degradation** vs single instance. PyTorch MPS scales reasonably well (Total 78 FPS), while Rust/Candle suffers significant degradation (Total 35 FPS) likely due to Metal kernel contention or locking overhead.
-
-### Single vs Concurrent Comparison
-
-![Comparison](benchmark_comparison.png)
 
 ## Analysis
 
@@ -111,9 +105,8 @@ python performance_test_mps.py --model coreml --num-images 500 --run-id test1
 | `src/performance_test.rs` | Rust/Candle benchmark |
 | `performance_test_mps.py` | PyTorch MPS & CoreML benchmark |
 | `run_benchmarks.sh` | Full benchmark suite runner |
-| `plot_benchmark_results.py` | Generate plots |
-| `yolov8s.pt` | PyTorch weights |
-| `yolov8s.mlpackage/` | CoreML model |
+| `plot_benchmark_results.py` | Generate plots from JSON results |
+| `export_coreml_fp32.py` | Export PyTorch model to CoreML format |
 
 ## Conclusions
 
