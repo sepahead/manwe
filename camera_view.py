@@ -1,17 +1,21 @@
 #!/opt/anaconda3/envs/py3-14/bin/python
-import cv2
-import torch
 import threading
 import time
+
+import cv2
 import numpy as np
+import torch
 from ultralytics import YOLO
 
 # Configuration
 RTSP_URLS = [
-    "rtsp://admin:sauronsauron1@192.168.10.172:554/h264",
-    "rtsp://admin:sauronsauron1@192.168.10.145:554/h264"
+    # "rtsp://admin:sauronsauron1@192.168.10.172:554/h264",
+    # "rtsp://admin:sauronsauron1@192.168.10.145:554/h264"
+    "rtsp://root:root@192.168.10.100/axis-media/media.amp"
+    # "rtsp://root:root@192.168.10.100/axis-media/media.amp"
 ]
 MODEL_NAME = "yolov8n.pt"
+
 
 class StreamThread(threading.Thread):
     def __init__(self, url, index):
@@ -24,16 +28,16 @@ class StreamThread(threading.Thread):
         # Load model per thread to ensure thread safety and isolation
         # M4 Max is fast enough to run YOLOv8n on every frame without skipping
         self.model = YOLO(MODEL_NAME)
-        self.device = 'mps' if torch.backends.mps.is_available() else 'cpu'
+        self.device = "mps" if torch.backends.mps.is_available() else "cpu"
         print(f"Stream {index} using device: {self.device}")
 
     def run(self):
         print(f"Connecting to {self.url}...")
         cap = cv2.VideoCapture(self.url)
-        
+
         # Optimize buffer size to reduce latency
         cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-        
+
         while self.running:
             ret, frame = cap.read()
             if not ret:
@@ -46,13 +50,13 @@ class StreamThread(threading.Thread):
             # Inference
             # verbose=False prevents spamming stdout
             results = self.model(frame, device=self.device, verbose=False)
-            
+
             # Plot results on the frame
             annotated_frame = results[0].plot()
-            
+
             with self.lock:
                 self.frame = annotated_frame
-        
+
         cap.release()
 
     def get_frame(self):
@@ -62,6 +66,7 @@ class StreamThread(threading.Thread):
     def stop(self):
         self.running = False
         self.join()
+
 
 def main():
     threads = []
@@ -80,7 +85,15 @@ def main():
                 if f is None:
                     # Placeholder if no frame yet
                     f = np.zeros((360, 640, 3), dtype=np.uint8)
-                    cv2.putText(f, "Connecting...", (50, 180), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
+                    cv2.putText(
+                        f,
+                        "Connecting...",
+                        (50, 180),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        1,
+                        (255, 255, 255),
+                        2,
+                    )
                 else:
                     # Resize to standard size for display
                     f = cv2.resize(f, (640, 360))
@@ -91,9 +104,9 @@ def main():
                 combined = np.hstack(frames)
                 cv2.imshow("Multi-Stream YOLO (PyTorch)", combined)
 
-            if cv2.waitKey(1) & 0xFF == ord('q'):
+            if cv2.waitKey(1) & 0xFF == ord("q"):
                 break
-            
+
             # Small sleep to prevent busy loop if waitKey is fast
             time.sleep(0.001)
 
@@ -104,6 +117,7 @@ def main():
         for t in threads:
             t.stop()
         cv2.destroyAllWindows()
+
 
 if __name__ == "__main__":
     main()

@@ -5,33 +5,14 @@
 // extern crate accelerate_src;
 
 mod model;
-use model::{Multiples, YoloV8, YoloV8Pose};
+use model::{Multiples, YoloV8};
 
-use candle::{DType, Device, IndexOp, Result, Tensor};
+use candle::{DType, Result, Tensor};
 use candle_nn::{Module, VarBuilder};
-use candle_transformers::object_detection::{non_maximum_suppression, Bbox, KeyPoint};
 use clap::{Parser, ValueEnum};
 use image::DynamicImage;
 
-// Keypoints as reported by ChatGPT :)
-// Nose
-// Left Eye
-// Right Eye
-// Left Ear
-// Right Ear
-// Left Shoulder
-// Right Shoulder
-// Left Elbow
-// Right Elbow
-// Left Wrist
-// Right Wrist
-// Left Hip
-// Right Hip
-// Left Knee
-// Right Knee
-// Left Ankle
-// Right Ankle
-use manwe::{report_detect, report_pose, device};
+use candle_demo_yolov8::report_detect;
 
 #[derive(Clone, Copy, ValueEnum, Debug)]
 enum Which {
@@ -45,7 +26,6 @@ enum Which {
 #[derive(Clone, Copy, ValueEnum, Debug)]
 enum YoloTask {
     Detect,
-    Pose,
 }
 
 #[derive(Parser, Debug)]
@@ -101,7 +81,6 @@ impl Args {
                     Which::X => "x",
                 };
                 let task = match self.task {
-                    YoloTask::Pose => "-pose",
                     YoloTask::Detect => "",
                 };
                 api.get(&format!("yolov8{size}{task}.safetensors"))?
@@ -150,27 +129,8 @@ impl Task for YoloV8 {
     }
 }
 
-impl Task for YoloV8Pose {
-    fn load(vb: VarBuilder, multiples: Multiples) -> Result<Self> {
-        YoloV8Pose::load(vb, multiples, /* num_classes=*/ 1, (17, 3))
-    }
-
-    fn report(
-        pred: &Tensor,
-        img: DynamicImage,
-        w: usize,
-        h: usize,
-        confidence_threshold: f32,
-        nms_threshold: f32,
-        legend_size: u32,
-    ) -> Result<DynamicImage> {
-        //TODO:youngday:0422: add detect to pose
-        report_pose(pred, img.clone(), w, h, confidence_threshold, nms_threshold,legend_size)
-    }
-}
-
 pub fn run<T: Task>(args: Args) -> anyhow::Result<()> {
-    let device = device(args.cpu)?;
+    let device = candle_demo_yolov8::device(args.cpu)?;
     // Create the model and load the weights from the file.
     let multiples = match args.which {
         Which::N => Multiples::n(),
@@ -251,7 +211,6 @@ pub fn main() -> anyhow::Result<()> {
 
     match args.task {
         YoloTask::Detect => run::<YoloV8>(args)?,
-        YoloTask::Pose => run::<YoloV8Pose>(args)?,
     }
     Ok(())
 }
