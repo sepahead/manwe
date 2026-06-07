@@ -7,9 +7,8 @@
 mod model;
 use model::{Multiples, YoloV8, YoloV8Pose};
 
-use candle::{DType, Device, IndexOp, Result, Tensor};
+use candle::{DType, Result, Tensor};
 use candle_nn::{Module, VarBuilder};
-use candle_transformers::object_detection::{non_maximum_suppression, Bbox, KeyPoint};
 use clap::{Parser, ValueEnum};
 use image::DynamicImage;
 
@@ -186,7 +185,7 @@ pub fn run<T: Task>(args: Args) -> anyhow::Result<()> {
     for image_name in args.images.iter() {
         println!("processing {image_name}");
         let mut image_name = std::path::PathBuf::from(image_name);
-        let original_image = image::io::Reader::open(&image_name)?
+        let original_image = image::ImageReader::open(&image_name)?
             .decode()
             .map_err(candle::Error::wrap)?;
         let (width, height) = {

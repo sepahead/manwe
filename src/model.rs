@@ -617,7 +617,7 @@ impl DetectionHead {
         let sigmoid = |xs: &Tensor| {
             let xs = xs.neg()?.exp()?;
             let one = Tensor::ones_like(&xs)?;
-            (one.clone() / (one + xs)?)
+            one.clone() / (one + xs)?
         };
         let pred = Tensor::cat(&[dbox, sigmoid(&cls)?], 1)?;
         Ok(DetectionHeadOut {
@@ -687,7 +687,7 @@ impl PoseHead {
         let sigmoid = |xs: &Tensor| {
             let xs = xs.neg()?.exp()?;
             let one = Tensor::ones_like(&xs)?;
-            (one.clone() / (one + xs)?)
+            one.clone() / (one + xs)?
         };
         let ys2 = sigmoid(&xs.i((.., .., 2..3))?)?;
         let ys = Tensor::cat(&[ys01, ys2], 2)?.flatten(1, 2)?;

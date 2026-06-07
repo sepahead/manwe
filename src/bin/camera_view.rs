@@ -86,7 +86,7 @@ fn setup(mut commands: Commands, args: Res<Args>, frame_buffer: Res<FrameBuffer>
             let height = 720;
             let frame_size = width * height * 3;
 
-            let mut child = Command::new(FFMPEG_PATH)
+            let child = Command::new(FFMPEG_PATH)
                 .args([
                     "-i", &url,
                     "-f", "image2pipe",
@@ -211,11 +211,7 @@ fn update_frame(
     mut query: Query<(&CameraView, &mut Handle<Image>)>,
 ) {
     let frames = {
-        let mut lock = frame_buffer.frames.lock().unwrap();
-        // We clone the Option<Image> to release the lock quickly, 
-        // but actually we want to TAKE it to avoid re-uploading same frame?
-        // Or just clone. Cloning DynamicImage is somewhat expensive but fine for 3 streams.
-        // Better: take it.
+        let lock = frame_buffer.frames.lock().unwrap();
         lock.clone() 
     };
 
