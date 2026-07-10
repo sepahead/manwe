@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/manwe-logo.svg" alt="Manwe sky-watch scope — a circular airspace scope: three wind-swept arcs form a wing, a slow sweep turns, two tracked blips ping." width="200" height="200" />
+  <img src="assets/manwe-logo.svg" alt="Manwe perception proving ground — inside a graduated sky scope, a target drone sits in detection brackets; two camera rays triangulate it, acoustic arcs rise from below, and a second tracked target follows a dashed predicted path." width="200" height="200" />
 </p>
 
 # Manwe
