@@ -1,0 +1,85 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 240 240" width="240" height="240" role="img" aria-label="Manwe sky-watch scope: a circular airspace scope in sky cyan; three wind-swept arcs form a wing across it, a slow sweep turns, and two tracked blips ping — real-time airspace awareness.">
+  <title>Manwe — Sky-Watch Scope (the wing over the airspace)</title>
+  <defs>
+    <radialGradient id="sky" cx="50%" cy="42%" r="70%">
+      <stop offset="0%" stop-color="#0d2236"/>
+      <stop offset="60%" stop-color="#081524"/>
+      <stop offset="100%" stop-color="#040a12"/>
+    </radialGradient>
+    <radialGradient id="sweepGrad" gradientUnits="userSpaceOnUse" cx="120" cy="120" r="98">
+      <stop offset="0%" stop-color="#38bdf8" stop-opacity="0.30"/>
+      <stop offset="70%" stop-color="#38bdf8" stop-opacity="0.10"/>
+      <stop offset="100%" stop-color="#38bdf8" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="wingGrad" x1="0" y1="1" x2="1" y2="0">
+      <stop offset="0%" stop-color="#38bdf8"/>
+      <stop offset="100%" stop-color="#a5e3ff"/>
+    </linearGradient>
+    <filter id="glow" x="-60%" y="-60%" width="220%" height="220%">
+      <feGaussianBlur stdDeviation="2.6" result="b"/>
+      <feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+    <style>
+      .bezel{fill:none;stroke:#38bdf8;stroke-width:2.4;stroke-opacity:.9}
+      .bezelglow{fill:none;stroke:#38bdf8;stroke-width:5;stroke-opacity:.22;filter:url(#glow)}
+      .ring{fill:none;stroke:#38bdf8;stroke-opacity:.20;stroke-width:1}
+      .tick{stroke:#38bdf8;stroke-opacity:.55;stroke-width:2;stroke-linecap:round}
+      .wing{fill:none;stroke:url(#wingGrad);stroke-linecap:round;filter:url(#glow)}
+      .blip{fill:#bfe9ff}
+      .trail{fill:#7dd3fc}
+      .ping{fill:none;stroke:#7dd3fc}
+      .hub{fill:#7dd3fc}
+      .sweep{transform-box:view-box;transform-origin:120px 120px;animation:turn 8s linear infinite}
+      .p1{animation:ping 2.4s ease-out infinite}
+      .p2{animation:ping 2.4s ease-out infinite;animation-delay:1.2s}
+      @keyframes turn{from{transform:rotate(0deg)}to{transform:rotate(360deg)}}
+      @keyframes ping{0%{opacity:.9}70%{opacity:.25}100%{opacity:.9}}
+      @media (prefers-reduced-motion:reduce){.sweep,.p1,.p2{animation:none}}
+    </style>
+  </defs>
+
+  <!-- sky disc -->
+  <circle cx="120" cy="120" r="106" fill="url(#sky)"/>
+
+  <!-- range rings + compass ticks -->
+  <circle class="ring" cx="120" cy="120" r="32"/>
+  <circle class="ring" cx="120" cy="120" r="58"/>
+  <circle class="ring" cx="120" cy="120" r="84"/>
+  <line class="tick" x1="120" y1="16" x2="120" y2="26"/>
+  <line class="tick" x1="120" y1="214" x2="120" y2="224"/>
+  <line class="tick" x1="16" y1="120" x2="26" y2="120"/>
+  <line class="tick" x1="214" y1="120" x2="224" y2="120"/>
+
+  <!-- slow sweep (under the wing) -->
+  <g class="sweep">
+    <path d="M120 120 L218 120 A98 98 0 0 0 189.3 50.7 Z" fill="url(#sweepGrad)"/>
+    <line x1="120" y1="120" x2="218" y2="120" stroke="#7dd3fc" stroke-opacity="0.6" stroke-width="1.4"/>
+  </g>
+
+  <!-- the wing: three wind-swept arcs (vision / audio / geometry) -->
+  <path class="wing" d="M40 160 Q100 140 176 76" stroke-width="6" stroke-opacity="0.95"/>
+  <path class="wing" d="M52 178 Q116 158 188 96" stroke-width="4.2" stroke-opacity="0.7"/>
+  <path class="wing" d="M66 194 Q130 174 196 116" stroke-width="2.8" stroke-opacity="0.5"/>
+
+  <!-- tracked blips: heading trails behind, velocity tick ahead -->
+  <g class="p1">
+    <circle class="trail" cx="139" cy="75" r="1.6" opacity="0.35"/>
+    <circle class="trail" cx="146" cy="70" r="2" opacity="0.6"/>
+    <circle class="blip" cx="154" cy="65" r="3.2" filter="url(#glow)"/>
+    <line x1="160" y1="61" x2="167" y2="57" stroke="#bfe9ff" stroke-width="1.4" stroke-linecap="round" opacity="0.8"/>
+    <circle class="ping" cx="154" cy="65" r="8" stroke-opacity="0.4"/>
+  </g>
+  <g class="p2">
+    <circle class="trail" cx="73" cy="72" r="1.4" opacity="0.35"/>
+    <circle class="trail" cx="79" cy="67" r="1.7" opacity="0.6"/>
+    <circle class="blip" cx="86" cy="62" r="2.6" filter="url(#glow)"/>
+    <line x1="91" y1="58" x2="97" y2="54" stroke="#bfe9ff" stroke-width="1.2" stroke-linecap="round" opacity="0.8"/>
+  </g>
+
+  <!-- hub -->
+  <circle class="hub" cx="120" cy="120" r="2.6"/>
+
+  <!-- bezel -->
+  <circle class="bezelglow" cx="120" cy="120" r="104"/>
+  <circle class="bezel" cx="120" cy="120" r="104"/>
+</svg>
