@@ -32,7 +32,7 @@ tracing-subscriber = "0.3"
 # The viewer is experimental. Retain its validated 0.13 API for this alpha;
 # newer Bevy lines require a dedicated migration and do not remove the legacy
 # transitive advisory currently accepted in deny.toml.
-bevy = { version = "0.13", optional = true, default-features = false, features = ["bevy_winit", "bevy_render", "bevy_core_pipeline", "bevy_sprite", "bevy_asset", "tonemapping_luts", "default_font"] }
+bevy = { version = "0.19", optional = true, default-features = false, features = ["bevy_winit", "bevy_render", "bevy_core_pipeline", "bevy_sprite", "bevy_asset", "tonemapping_luts", "default_font"] }
 ab_glyph = "0.2"
 # imageproc 0.27 declares Rust 1.87 but currently resolves nalgebra/wide releases
 # that require Rust 1.89; retain the latest 0.25 patch at Manwe's 1.88 floor.
