@@ -38,7 +38,7 @@ ab_glyph = "0.2"
 # that require Rust 1.89; retain the latest 0.25 patch at Manwe's 1.88 floor.
 imageproc = { version = "0.25.1", default-features = false }
 libc = "0.2"
-sha2 = "0.10"
+sha2 = "0.11"
 
 [[bin]]
 name = "camera_view"
