@@ -11,7 +11,7 @@ autobins = false
 anyhow = "1.0"
 # Keep this synchronized with the root crate's MSRV-compatible Candle line.
 candle = { package = "candle-core", version = "0.9.2", default-features = false, features = ["metal"] }
-candle-nn = { version = "0.9.2", default-features = false, features = ["metal"] }
+candle-nn = { version = "0.11.0", default-features = false, features = ["metal"] }
 candle-transformers = { version = "0.9.2", default-features = false, features = ["metal"] }
 clap = { version = "=4.5.57", features = ["derive"] }
 image = { version = "0.25.1", default-features = false, features = ["jpeg", "png"] }
