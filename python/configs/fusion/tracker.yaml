@@ -2,7 +2,8 @@
 #   from pathlib import Path
 #   from manwe.common.config_io import read_strict_yaml
 #   from manwe.fusion import TrackerConfig
-#   payload = read_strict_yaml(Path("configs/fusion/tracker.yaml"), 65536, "tracker config")
+#   path = Path("configs/fusion/tracker.yaml").resolve()  # loader requires an absolute path
+#   payload = read_strict_yaml(path, 65536, "tracker config")
 #   TrackerConfig(**payload)
 
 filter: ekf                # kalman | ekf | ukf | particle | imm

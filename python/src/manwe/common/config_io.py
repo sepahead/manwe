@@ -5,7 +5,9 @@ from __future__ import annotations
 import os
 import pathlib
 import stat
-from typing import BinaryIO
+from typing import Any, BinaryIO
+
+from .deps import require
 
 MAX_YAML_TOKENS = 100_000
 MAX_YAML_NESTING = 64
@@ -68,7 +70,15 @@ def open_regular_nofollow(path: pathlib.Path, subject: str) -> BinaryIO:
     if ".." in path.parts:
         raise ValueError(f"{subject} path must not contain parent-directory components")
     directory_fd = open_directory_nofollow(path.parent, subject)
-    file_flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    # O_NONBLOCK is a no-op for regular-file reads but stops a FIFO at this path
+    # from blocking os.open until a writer appears — the fstat below then rejects
+    # it as a non-regular file instead of hanging this fail-closed read.
+    file_flags = (
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+    )
     try:
         fd = os.open(path.name, file_flags, dir_fd=directory_fd)
         metadata = os.fstat(fd)
@@ -133,7 +143,7 @@ def read_bounded_utf8_regular(path: pathlib.Path, limit: int, subject: str) -> s
 
 def load_unambiguous_yaml(text: str, subject: str) -> object:
     """Safely load YAML while rejecting aliases, custom tags, and duplicate keys."""
-    import yaml
+    yaml: Any = require("yaml", "config")
 
     forbidden_tokens = (
         yaml.tokens.AliasToken,

@@ -180,7 +180,12 @@ def _cmd_fusion_sim(args) -> int:
     print(f"{'filter':12s} {'OSPA':>8s} {'localization':>13s} {'cardinality':>12s}")
     for filt in args.filters:
         tracker = MultiSensorTracker(TrackerConfig(filter=filt))
-        s = score_tracker(tracker, scenario)
+        try:
+            s = score_tracker(tracker, scenario)
+        except ValueError as error:
+            # e.g. a large --clutter makes a frame exceed the tracker's bounded
+            # measurement capacity; report it as a usage error, not a traceback.
+            _usage_error(error)
         print(f"{filt:12s} {s['ospa']:8.2f} {s['localization']:13.2f} {s['cardinality']:12.2f}")
     return 0
 

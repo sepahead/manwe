@@ -184,7 +184,9 @@ def sha256_artifact_at(
     nofollow = getattr(os, "O_NOFOLLOW", 0)
     cloexec = getattr(os, "O_CLOEXEC", 0)
     directory_flags = os.O_RDONLY | cloexec | getattr(os, "O_DIRECTORY", 0) | nofollow
-    file_flags = os.O_RDONLY | cloexec | nofollow
+    # O_NONBLOCK is inert for regular-file reads but prevents a TOCTOU swap-to-FIFO
+    # between the stat above and os.open below from blocking this bounded hash.
+    file_flags = os.O_RDONLY | cloexec | nofollow | getattr(os, "O_NONBLOCK", 0)
     root_metadata = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
     if stat.S_ISLNK(root_metadata.st_mode):
         raise ValueError(f"artifact root must not be a symbolic link: {name}")

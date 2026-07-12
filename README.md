@@ -149,9 +149,9 @@ available. Neither accelerator path is a downstream deployment adapter.
 Annotated JPEGs are staged, synced, and verified before no-replace publication. A
 hard interruption may leave a sibling `.manwe-image-output-*.in-progress`
 directory, optionally beside a complete-looking JPEG; treat the marker as an
-incomplete publication and inspect it before cleanup. Any failure after a final
-link may exist deliberately preserves both artifacts instead of unlinking a
-possibly replaced pathname.
+incomplete publication and inspect it before cleanup. A failure after the final
+link deliberately preserves both artifacts rather than unlinking a pathname that
+may already have been replaced.
 
 CI compiles/tests the CPU path on Linux and the Metal/viewer path on arm64 macOS.
 The CUDA feature remains a target-hardware gate: it needs an NVIDIA runner, the

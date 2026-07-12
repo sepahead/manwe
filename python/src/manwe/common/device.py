@@ -78,7 +78,13 @@ def resolve_device(prefer: str = "auto", *, allow_fallback: bool = False) -> Dev
             raise RuntimeError(f"requested {prefer!r}, but torch is not installed") from None
         return Device(kind="cpu", name="cpu (torch not installed)")
     except OSError as exc:
-        raise RuntimeError(f"torch is installed but failed to load: {exc}") from exc
+        # A broken install (missing shared objects, bad CUDA libs) is exactly what
+        # `manwe doctor` exists to surface, so 'auto'/allow_fallback degrade to CPU
+        # here just as they do for a missing torch. An explicit accelerator request
+        # still fails closed.
+        if kind not in {"auto", "cpu"} and not allow_fallback:
+            raise RuntimeError(f"torch is installed but failed to load: {exc}") from exc
+        return Device(kind="cpu", name="cpu (torch failed to load)")
 
     cuda_ok = torch.cuda.is_available()
     mps_ok = getattr(torch.backends, "mps", None) is not None and torch.backends.mps.is_available()

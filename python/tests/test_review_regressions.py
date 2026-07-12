@@ -1,6 +1,10 @@
 """Regression tests locking in the fixes from the 10-lens review."""
 
+import builtins
+import os
+
 import numpy as np
+import pytest
 
 from manwe.cli import main
 from manwe.fusion.filters import IMMEstimator
@@ -83,3 +87,40 @@ def test_cli_rejects_unknown_filter():
     except SystemExit:  # argparse choices → exit(2)
         raised = True
     assert raised
+
+
+def test_fusion_sim_clutter_over_capacity_is_a_usage_error_not_a_traceback():
+    """A --clutter that overruns the tracker's bounded capacity exits cleanly."""
+    with pytest.raises(SystemExit) as excinfo:
+        main(["fusion-sim", "--targets", "1", "--duration", "2", "--clutter", "8000"])
+    assert excinfo.value.code == 2
+
+
+def test_resolve_device_auto_falls_back_when_torch_fails_to_load(monkeypatch):
+    """`manwe doctor` (resolve_device('auto')) must not crash on a broken torch."""
+    from manwe.common import device as device_module
+
+    real_import = builtins.__import__
+
+    def fake_import(name, *args, **kwargs):
+        if name == "torch":
+            raise OSError("simulated broken torch shared library")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", fake_import)
+    assert device_module.resolve_device("auto").kind == "cpu"
+    # An explicit accelerator request still fails closed.
+    with pytest.raises(RuntimeError):
+        device_module.resolve_device("cuda")
+
+
+def test_open_regular_nofollow_rejects_a_fifo_without_hanging(tmp_path):
+    """O_NONBLOCK means a FIFO is rejected promptly instead of blocking forever."""
+    if not hasattr(os, "mkfifo"):
+        pytest.skip("mkfifo is unavailable on this platform")
+    from manwe.common.config_io import open_regular_nofollow
+
+    fifo = tmp_path / "pipe.yaml"
+    os.mkfifo(fifo)
+    with pytest.raises(ValueError):  # completing at all proves it did not hang
+        open_regular_nofollow(fifo.resolve(), "config")

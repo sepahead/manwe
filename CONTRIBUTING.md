@@ -81,8 +81,8 @@ For model/export changes, include artifact digests, tensor/pre/postprocess fixtu
 per-class AP50/AP50-small deltas, deployed-threshold precision/recall/FPPI, direct
 box/score agreement, required-class coverage and the exact consumer path. Use
 unique `image_id` values and source-image-pixel `xyxy` boxes. For performance
-changes, follow the ten-point protocol in `metal-yolo-tests/README.md`; numbers with
-different timed scopes are not comparable.
+changes, satisfy the "What a publishable comparison still requires" checklist in
+`metal-yolo-tests/README.md`; numbers with different timed scopes are not comparable.
 
 ## Areas of interest
 
