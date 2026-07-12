@@ -21,7 +21,7 @@ anyhow = "1.0"
 # smaller 0.9.2 graph validated by the alpha matrix.
 candle = { package = "candle-core", version = "0.9.2", default-features = false }
 candle-nn = { version = "0.9.2", default-features = false }
-candle-transformers = { version = "0.9.2", default-features = false }
+candle-transformers = { version = "0.11.0", default-features = false }
 # Keep the CLI parser family exact so lock regeneration cannot silently change
 # accepted command syntax or the compiler floor.
 clap = { version = "=4.5.57", features = ["derive", "env"] }
