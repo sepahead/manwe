@@ -1,122 +1,139 @@
-# YOLOv8s Benchmark: Rust/Candle vs PyTorch MPS vs CoreML
+# Candle/Metal inference benchmark harness
 
-Performance comparison of YOLOv8s object detection on **Apple Silicon M4 Max**, testing three different implementations:
+This directory contains two bounded Rust/Candle profiles for Apple Silicon:
 
-- **Rust (Candle 0.9.1)** - Metal GPU backend
-- **PyTorch MPS** - Metal Performance Shaders
-- **CoreML** - Apple Neural Engine / GPU / CPU
+- `performance_test` measures static-image raw forward execution.
+- `benchmark_video` measures a decoded video pipeline with latest-frame backpressure.
 
-## Hardware & Software
+These profiles are useful for one pinned configuration. They are not a
+cross-backend leaderboard, an accuracy evaluation, or evidence that another runtime
+will produce equivalent detections.
 
-| Component | Version |
-|-----------|---------|
-| CPU | Apple M4 Max |
-| GPU | M4 Max integrated GPU |
-| Neural Engine | M4 Max ANE |
-| macOS | 15.x (Sequoia) |
-| Rust | 1.x + Candle 0.9.1 |
-| Python | 3.12 |
-| PyTorch | 2.9.1 |
-| Ultralytics | 8.3.x |
-| CoreML Tools | 9.0 |
+## Historical results are not decision evidence
 
-## Model
+An earlier version of this directory reported CoreML, Candle, and PyTorch FPS from
+different implementations and timing boundaries. Those numbers did not capture
+enough artifact, environment, preprocessing, or semantic provenance to support a
+backend ranking. The legacy Python, Swift, plotting, export, and orchestration
+scripts were removed because they auto-downloaded mutable checkpoints, trusted
+pickle-backed weights, overwrote evidence, and could not enforce comparable work.
 
-- **YOLOv8s** (small variant)
-- Downloaded automatically from HuggingFace on first run
-- 80 COCO classes
-- F32 precision
+Do not use results from that legacy harness for deployment decisions.
 
-> **Note:** Model weights (`.pt`, `.safetensors`, `.mlpackage`) are not included in this repository. They are downloaded at runtime or can be exported using the provided scripts.
+## Enforced artifact contract
 
-## Benchmark Results
+Both remaining executables:
 
-### Single Instance Performance (500 images)
+- require a local, nonempty, regular, non-symlink `.safetensors` model;
+- require the expected SHA-256 and fail before inference on a mismatch;
+- use Candle 0.9.2 with the Metal backend and fail if Metal is unavailable;
+- use FP32 and a 640×640 isotropic letterbox input;
+- bound input dimensions, decoded allocation, requested work, FPS, and identifiers;
+- hash the model and inputs used by the run;
+- restrict video inputs to seekable MP4/MOV, Matroska/WebM, or AVI demuxers so
+  FFmpeg cannot interpret an authenticated input as a playlist of unrecorded files;
+- reserve each run in a private staging directory, publish with no-replace hard
+  links, and remove staging after ordinary failures that occur before publication;
+- refuse to replace existing JSON or video evidence; and
+- build from the checked-in lockfile with Rust 1.88 or newer.
 
-| Implementation | FPS | Latency (ms) | Device |
-|----------------|-----|--------------|--------|
-| **CoreML** | **80.33** | **12.45** | ANE/GPU/CPU |
-| Rust (Candle) | 29.94 | 33.40 | Metal GPU |
-| PyTorch MPS | 27.99 | 35.73 | Metal GPU |
+The model architecture is the repository's fixed YOLOv8-small, 80-class graph.
+A valid safetensors container with different keys or shapes is rejected while the
+model loads. The SHA proves artifact identity, not accuracy, licensing, or semantic
+compatibility.
 
-**Key Finding**: CoreML is **2.7x faster** than Rust/Candle and **2.9x faster** than PyTorch MPS in single-instance scenarios. This is because CoreML leverages the Apple Neural Engine (ANE), while both Rust and PyTorch only use the Metal GPU.
+## Static-image profile
 
-### Concurrent Performance (3 instances, 500 images each)
-
-| Implementation | Avg FPS/Instance | Total FPS (3x) | Avg Latency (ms) |
-|----------------|------------------|----------------|------------------|
-| **CoreML** | **75.48** | **226.45** | **13.25** |
-| PyTorch MPS | 26.11 | 78.32 | 38.30 |
-| Rust (Candle) | 11.79 | 35.38 | 84.81 |
-
-**Key Finding**: CoreML maintains excellent performance under load with only **6% degradation** vs single instance. PyTorch MPS scales reasonably well (Total 78 FPS), while Rust/Candle suffers significant degradation (Total 35 FPS) likely due to Metal kernel contention or locking overhead.
-
-## Analysis
-
-### Why is CoreML so much faster?
-
-1.  **Apple Neural Engine (ANE)**: CoreML automatically routes inference to the 16-core Neural Engine on M4 Max.
-2.  **Fused Operations**: CoreML compiles the model with fused operations (Conv+BN+ReLU), minimizing memory bandwidth usage.
-3.  **Concurrent Scaling**: ANE handles multiple instances efficiently without the heavy contention seen on the GPU.
-
-### Rust/Candle vs PyTorch MPS
-
-- **Single Instance**: Rust (29.9 FPS) is slightly faster than PyTorch (28.0 FPS).
-- **Concurrent**: PyTorch significantly outperforms Rust (78 Total FPS vs 35 Total FPS). This suggests PyTorch's Metal backend handles context switching and concurrent command encoding much better than the current Candle Metal implementation.
-
-## Running the Benchmarks
-
-### Prerequisites
+From this directory on Apple Silicon:
 
 ```bash
-# Install Rust dependencies
-cargo build --release
+cargo build --release --locked --bin performance_test
 
-# Install Python dependencies
-pip install ultralytics coremltools torch
-
-# Download CoreML model
-python -c "from huggingface_hub import hf_hub_download; ..."
+RUN_DIR=/absolute/path/to/new-results \
+  ./target/release/performance_test \
+  --model /absolute/path/to/yolov8s.safetensors \
+  --model-sha256 <64-hex> \
+  --image-dir /absolute/path/to/images \
+  --num-images 500 \
+  --run-id candle_metal_001
 ```
 
-### Run All Benchmarks
+The harness sorts candidate paths, selects exactly the requested number of valid
+images, hashes their bytes into an ordered manifest, and rechecks each digest when
+the input is decoded. Images are processed one at a time rather than retained as a
+large tensor collection.
+
+The timed boundary includes CPU-to-device upload, model forward execution, and a
+scalar device readback used for synchronization. It excludes model loading, image
+decode, letterboxing, raw-output decode, confidence filtering, NMS, and annotation.
+The JSON records that scope explicitly.
+
+The run identifier is reserved before model work begins. Results are written,
+synced, and verified inside a private
+`.manwe-static-benchmark-<run-id>.in-progress` directory, then atomically published
+with a no-replace hard link. Pre-link failures remove staging. Once a final link may
+exist, any later failure preserves the link and in-progress directory for manual
+recovery rather than unlinking a possibly replaced pathname. Treat that marker as
+an incomplete run and inspect it before cleanup or retry.
+
+## Video profile
 
 ```bash
-./run_benchmarks.sh
+cargo build --release --locked --bin benchmark_video
+
+RUN_DIR=/absolute/path/to/new-results \
+  ./target/release/benchmark_video \
+  --model /absolute/path/to/yolov8s.safetensors \
+  --model-sha256 <64-hex> \
+  --video /absolute/path/to/input.mp4 \
+  --target-fps 30 \
+  --max-duration-seconds 7200 \
+  --run-id candle_video_001
 ```
 
-### Run Individual Benchmarks
+Use `--target-fps 0` for an explicitly unthrottled input and `--save-video` only
+when an annotated artifact is needed. The result includes the source-video digest,
+model digest, FFmpeg path and digest, selected demuxer, presented/processed counts,
+drop rate, selected-frame raw-pipe read wait, synchronized preprocess/upload and
+model-forward stage times, raw-pipe-to-forward latency, and (when requested) the
+output-video digest. The stage split uses a scalar synchronization barrier after
+normalized input preparation and another after model forward. Latency starts when
+the reader requests a selected raw frame and ends when model forward synchronizes;
+it excludes source capture plus optional NMS, rendering, and encoding.
+FFmpeg decode and output failures are surfaced; output paths are reserved before
+work begins and final names are published only after verification. Failures before
+the first final link clean staging. Once either the optional video or result link
+may exist, later failures preserve all links and the
+`.manwe-benchmark-*.in-progress` marker rather than unlinking a possibly replaced
+pathname. Treat that marker or a video without its JSON commit marker as
+incomplete, inspect it, and remove it before intentionally retrying the run ID.
+The optional video's staged inode and SHA-256 are authenticated before publication;
+the digest is rechecked on both staged and published hard links before JSON commit.
 
-```bash
-# Rust/Candle (500 images)
-./target/release/performance_test --num-images 500 --run-id test1
+## What a publishable comparison still requires
 
-# PyTorch MPS (500 images)
-python performance_test_mps.py --model pytorch --num-images 500 --run-id test1
+A cross-backend claim needs, at minimum:
 
-# CoreML (500 images)
-python performance_test_mps.py --model coreml --num-images 500 --run-id test1
-```
+1. Exact repository commit, clean/dirty state, lockfiles, OS, toolchain, framework,
+   runtime/provider, hardware, power mode, thermal state, and competing workloads.
+2. Checkpoint source and digest, conversion command and digest for every backend,
+   precision, calibration-data digest, and artifact rights.
+3. An immutable ordered input manifest and golden preprocessing fixtures covering
+   color, orientation, interpolation, padding, normalization, and input layout.
+4. Golden raw tensors and postprocessed detections proving box, score, class, and
+   NMS parity, followed by a representative held-out accuracy/fidelity gate.
+5. One identical timed boundary, appropriate synchronization, randomized run
+   order, cold-start measurements, at least 100 samples, tail latency, variance,
+   and confidence intervals.
+6. A precise concurrency and backpressure model with sustained-load latency,
+   accuracy, queueing, and dropped-frame behavior—not summed isolated FPS.
 
-## Files
+Until a shared runner enforces those rules, report these outputs only as standalone
+Candle/Metal profiles with their declared scope.
 
-| File | Description |
-|------|-------------|
-| `src/performance_test.rs` | Rust/Candle benchmark |
-| `performance_test_mps.py` | PyTorch MPS & CoreML benchmark |
-| `run_benchmarks.sh` | Full benchmark suite runner |
-| `plot_benchmark_results.py` | Generate plots from JSON results |
-| `export_coreml_fp32.py` | Export PyTorch model to CoreML format |
+## Model and software rights
 
-## Conclusions
-
-1. **For maximum single-instance performance**: Use **CoreML** (80.33 FPS)
-2. **For Rust-based inference**: Use **Candle with Metal** (29.94 FPS)
-3. **For Python-based GPU inference**: Use **PyTorch MPS** (27.99 FPS)
-4. **For multi-instance workloads**: **CoreML** scales best with minimal degradation
-
-CoreML's advantage comes from utilizing the Apple Neural Engine, making it the clear choice for production deployments on Apple Silicon when maximum performance is required.
-
-## License
-
-MIT
+The benchmark source is MIT-licensed. Checkpoints, datasets, FFmpeg builds, and
+optional frameworks retain their own terms. Record exact artifacts and review their
+rights before redistribution or commercial use; see
+[`../docs/MODEL_CONTRACTS.md`](../docs/MODEL_CONTRACTS.md).

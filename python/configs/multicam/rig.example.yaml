@@ -1,0 +1,53 @@
+# Multi-camera rig — versioned calibration for triangulation.
+# Manwe's local geometry convention: P_i = K_i[R_i|t_i],
+# C_i = -R_iᵀ t_i, ray d_i = normalize(R_iᵀ K_i⁻¹ [u,v,1]ᵀ).
+# No reviewed consumer automatically shares it; an adapter must pin and transform
+# frames, axes, units, timestamps, and covariance explicitly.
+# NOTE: triangulation across cameras REQUIRES hardware time-sync (trigger/PTP).
+# Detection2D producers must explicitly assert pixels_undistorted=true, provide
+# pixel_std_px, and stamp image exposure/capture time (not inference completion).
+#
+# Build cameras in code with manwe.multicam.Camera.from_lookat(...) or load this
+# complete file with CameraRig.from_yaml(...). Calibrate real cameras: Zhang/OpenCV (intrinsics) →
+# COLMAP/PnP (extrinsics) → GeoCalib/AnyCalib (single-image fallback).
+
+schema_version: 1
+cameras:
+  - name: cam0
+    position: [0, 0, 100]
+    look_at: [0, 0, 0]
+    fov_deg: 60
+    width: 1920
+    height: 1080
+  - name: cam1
+    position: [100, 0, 20]
+    look_at: [0, 0, 0]
+    fov_deg: 60
+    width: 1920
+    height: 1080
+  - name: cam2
+    position: [-80, 60, 40]
+    look_at: [0, 0, 0]
+    fov_deg: 60
+    width: 1920
+    height: 1080
+
+# Cross-camera correlation + triangulation gates
+max_ray_gap_m: 8.0
+max_reprojection_px: 12.0
+max_time_skew_s: 0.05
+min_ray_angle_deg: 1.0
+max_range_m: 100000.0
+
+# Required temporal uncertainty model. This is a conservative target-speed
+# bound used to turn capture skew into spatial covariance.
+max_speed_mps: 100.0
+
+# Per-call resource ceilings. Candidate-pair cost is O(detections^2); exact
+# multi-camera hypothesis selection fails closed when either combinatorial
+# budget is exhausted.
+max_cameras: 16
+max_detections: 4096
+max_candidate_pairs: 1000000
+max_hypotheses: 100000
+max_association_states: 1000000

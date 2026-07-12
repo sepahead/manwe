@@ -1,0 +1,140 @@
+# ============================================================================
+#  manwe — independent perception research and validation workbench
+#  Python package: config-driven training, sensor-fusion research,
+#  and raw export (ONNX / CoreML / TensorRT) on Metal & CUDA.
+# ============================================================================
+[build-system]
+requires = ["hatchling==1.31.0"]
+build-backend = "hatchling.build"
+
+[project]
+name = "manwe-perception"
+version = "0.2.0a1"
+description = "Perception research workbench for vision, audio, multi-camera geometry, and multi-target tracking with optional training and export adapters."
+readme = "README.md"
+requires-python = ">=3.10,<3.15"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Sepehr Mahmoudian" }]
+keywords = [
+    "computer-vision", "object-detection", "sensor-fusion", "multi-target-tracking",
+    "acoustic-detection", "multi-camera", "kalman-filter", "metal", "cuda", "yolo",
+]
+classifiers = [
+    "Private :: Do Not Upload",
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: MacOS :: MacOS X",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Scientific/Engineering :: Image Recognition",
+]
+
+# --- Core: pure-numpy. The fusion, geometry, DOA, metrics and contract layers
+#     run and test with zero heavy dependencies. ------------------------------
+dependencies = [
+    # NumPy 2.3 dropped Python 3.10; split the universal lock so every declared
+    # interpreter receives an upstream wheel from its supported NumPy line.
+    "numpy>=1.24,<=2.2.6; python_version < '3.11'",
+    "numpy>=2.3.5,<2.4; python_version >= '3.11'",
+]
+
+[project.optional-dependencies]
+# YAML-backed training and camera-rig configuration.
+config = [
+    "pyyaml>=6.0",
+]
+# Vision architecture training from random initialization and sliced inference.
+# NOTE: torch wheels lag new Python releases — use Python 3.11 or 3.12 for these.
+vision = [
+    "torch>=2.5,<3",
+    "torchvision>=0.19",
+    "ultralytics==8.4.91",
+    "sahi>=0.11",
+    "pycocotools>=2.0.7",
+    "pillow>=10.0",
+    "opencv-python>=4.9",
+    "pyyaml>=6.0",
+]
+# RF-DETR model construction/inference is isolated because its upstream `train`
+# extra currently installs both GUI and headless OpenCV distributions, which own
+# the same `cv2` files. Manwe does not publish that ambiguous training environment.
+# RF-DETR 1.8.3 is the vetted correctness baseline; stay within the 1.8 API line.
+rfdetr = [
+    "rfdetr>=1.8.3,<1.9",
+]
+# Raw model export to three backend formats. Ultralytics drives the ONNX/CoreML/
+# TensorRT export API, so it belongs here too. (TensorRT itself is NVIDIA-only and
+# installed separately from NVIDIA's index — see docs/research/SOTA-2026.md §5.)
+export = [
+    "torch>=2.5,<3",
+    "ultralytics==8.4.91",
+    "onnx>=1.16",
+    "onnxruntime>=1.18",
+    "onnxslim>=0.1",
+    "coremltools>=8.0,<10",
+]
+dev = [
+    "pytest>=8.2",
+    "pytest-cov>=5.0",
+    # Config contract tests must execute in the core CI suite, not skip.
+    "pyyaml>=6.0",
+    "ruff>=0.5",
+    "mypy>=1.10",
+]
+audit = [
+    "pip-audit==2.10.1",
+]
+# Every implemented optional runtime (development tools remain separate).
+all = [
+    "manwe-perception[config,vision,rfdetr,export]",
+]
+
+[project.scripts]
+manwe = "manwe.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/sepahead/manwe"
+Repository = "https://github.com/sepahead/manwe"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/manwe"]
+
+# ----------------------------------------------------------------------------
+[tool.pytest.ini_options]
+minversion = "8.0"
+testpaths = ["tests"]
+addopts = "-ra -q"
+markers = [
+    "heavy: tests that require optional deps (torch, ultralytics, coremltools, ...)",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "NPY"]
+ignore = [
+    "E501",   # line length handled by the formatter
+    "B905",   # zip(strict=) — not required; many zips here are equal-length by construction
+    "E741",   # `I` is an accepted identity-matrix name in the numerical code
+]
+
+[tool.ruff.lint.per-file-ignores]
+# seed_everything intentionally seeds the legacy global numpy RNG.
+"src/manwe/common/seed.py" = ["NPY002"]
+
+[tool.mypy]
+python_version = "3.10"
+ignore_missing_imports = true
+warn_unused_ignores = true
+check_untyped_defs = true
+disallow_untyped_defs = false

@@ -1,0 +1,21 @@
+# Ultralytics dataset manifest for Manwe's candidate aerial taxonomy.
+# Point `path` at a YOLO-format dataset (images/ + labels/) whose class indices
+# follow the order below. `uv run --no-sync manwe synth <dir>` writes a compatible
+# producer-side smoke dataset.
+#
+# Real corpora (see `uv run --no-sync manwe data`): drone-vs-bird / WOSDETC,
+# anti-uav410 (thermal IR), visdrone (small objects), ard-mav (air-to-air).
+
+path: ./datasets/aerial      # dataset root
+train: images/train
+val: images/val
+test:                        # optional
+
+# Index order is a local candidate taxonomy. A consumer adapter must carry and
+# validate the complete mapping; do not infer compatibility from these names.
+names:
+  0: drone
+  1: bird
+  2: aircraft
+  3: helicopter
+  4: unknown

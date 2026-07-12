@@ -1,0 +1,420 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  python-test:
+    name: Python ${{ matrix.python-version }} tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12", "3.13", "3.14"]
+    env:
+      UV_PYTHON: ${{ matrix.python-version }}
+      PYTHONWARNINGS: error
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Set up uv
+        uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990 # v8.3.2
+        with:
+          version: "0.11.28"
+          enable-cache: true
+          cache-dependency-glob: python/uv.lock
+      - name: Install locked core, test, and audit dependencies
+        working-directory: python
+        run: uv sync --locked --extra dev --extra audit
+      - name: Run tests without resolving dependencies
+        working-directory: python
+        run: uv run --no-sync pytest
+      - name: Audit runtime extras for this Python marker set
+        working-directory: python
+        run: |
+          uv -q export --locked --extra all --no-dev --no-emit-project --output-file /tmp/manwe-requirements.txt
+          uv run --no-sync pip-audit --require-hashes --disable-pip --strict -r /tmp/manwe-requirements.txt
+
+  python-quality:
+    name: Python lint, types, and package smoke test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      UV_PYTHON: "3.12"
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: "3.12"
+      - name: Set up uv
+        uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990 # v8.3.2
+        with:
+          version: "0.11.28"
+          enable-cache: true
+          cache-dependency-glob: python/uv.lock
+      - name: Install locked quality dependencies
+        working-directory: python
+        run: uv sync --locked --extra dev
+      - name: Verify source and lock files are tracked-eligible
+        run: |
+          test -f Cargo.lock
+          test -f metal-yolo-tests/Cargo.lock
+          test -f python/.python-version
+          test -f python/src/manwe/py.typed
+          test -f python/uv.lock
+          if git check-ignore --no-index python/src/manwe/data/datasets.py; then
+            echo "python/src/manwe/data is unexpectedly ignored" >&2
+            exit 1
+          fi
+          if git check-ignore --no-index Cargo.lock metal-yolo-tests/Cargo.lock; then
+            echo "A Rust executable lockfile is unexpectedly ignored" >&2
+            exit 1
+          fi
+          if git check-ignore --no-index python/.python-version python/src/manwe/py.typed; then
+            echo "Python release markers are unexpectedly ignored" >&2
+            exit 1
+          fi
+      - name: Verify alpha release metadata is synchronized
+        env:
+          REF_NAME: ${{ github.ref_name }}
+          REF_TYPE: ${{ github.ref_type }}
+        run: |
+          python - <<'PY'
+          import os
+          from pathlib import Path
+          import re
+          import runpy
+          import tomllib
+
+          root = tomllib.loads(Path("Cargo.toml").read_text(encoding="utf-8"))
+          benchmark = tomllib.loads(
+              Path("metal-yolo-tests/Cargo.toml").read_text(encoding="utf-8")
+          )
+          project = tomllib.loads(Path("python/pyproject.toml").read_text(encoding="utf-8"))
+          python_version = runpy.run_path("python/src/manwe/_version.py")["__version__"]
+          rust_version = root["package"]["version"]
+          expected_python = rust_version.replace("-alpha.", "a")
+          if benchmark["package"]["version"] != rust_version:
+              raise SystemExit("root and benchmark Rust versions differ")
+          requirement = benchmark["dependencies"]["manwe"]["version"]
+          if requirement != f"={rust_version}":
+              raise SystemExit("benchmark path dependency does not pin the root version")
+          if python_version != expected_python:
+              raise SystemExit(
+                  f"Rust/Python prerelease mismatch: {rust_version} vs {python_version}"
+              )
+          if project["project"]["name"] != "manwe-perception":
+              raise SystemExit("unexpected Python distribution name")
+          if project["project"]["version"] != python_version:
+              raise SystemExit(
+                  "pyproject/runtime version mismatch: "
+                  f"{project['project']['version']} != {python_version}"
+              )
+          if os.environ["REF_TYPE"] == "tag":
+              expected_tag = f"v{rust_version}"
+              if os.environ["REF_NAME"] != expected_tag:
+                  raise SystemExit(
+                      f"tag/source version mismatch: {os.environ['REF_NAME']} != {expected_tag}"
+                  )
+              changelog = Path("CHANGELOG.md").read_text(encoding="utf-8")
+              dated_heading = re.compile(
+                  rf"^## {re.escape(rust_version)} — \d{{4}}-\d{{2}}-\d{{2}}$",
+                  re.MULTILINE,
+              )
+              if dated_heading.search(changelog) is None:
+                  raise SystemExit("tagged changelog entry needs an ISO release date")
+          PY
+      - name: Scan the current worktree for credential material
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REF_TYPE: ${{ github.ref_type }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PUSH_BEFORE_SHA: ${{ github.event.before }}
+          PUSH_HEAD_SHA: ${{ github.sha }}
+        run: |
+          python scripts/check_secrets.py
+          if [ -n "$PR_BASE_SHA" ] && [ -n "$PR_HEAD_SHA" ]; then
+            python scripts/check_secrets.py --git-range "$PR_BASE_SHA..$PR_HEAD_SHA"
+          elif [ "$EVENT_NAME" = "push" ] && [ "$REF_TYPE" = "branch" ]; then
+            test -n "$PUSH_BEFORE_SHA"
+            test -n "$PUSH_HEAD_SHA"
+            python scripts/check_secrets.py --git-range "$PUSH_BEFORE_SHA..$PUSH_HEAD_SHA"
+          fi
+      - name: Reject ambiguous OpenCV package ownership
+        working-directory: python
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import tomllib
+
+          owners = {
+              "opencv-python",
+              "opencv-python-headless",
+              "opencv-contrib-python",
+              "opencv-contrib-python-headless",
+          }
+          lock = tomllib.loads(Path("uv.lock").read_text(encoding="utf-8"))
+          locked = {package["name"] for package in lock["package"]}
+          locked_owners = sorted(owners & locked)
+          if len(locked_owners) != 1:
+              raise SystemExit(
+                  "the universal lock must contain exactly one distribution that owns cv2; "
+                  f"found {locked_owners or 'none'}"
+              )
+          PY
+      - name: Ruff
+        working-directory: python
+        run: |
+          uv run --no-sync ruff check src tests
+          uv run --no-sync ruff format --check src tests
+      - name: Mypy
+        working-directory: python
+        run: uv run --no-sync mypy src
+      - name: Build source and wheel distributions
+        working-directory: python
+        run: |
+          uv build --no-sources --sdist
+          sdist=$(find dist -maxdepth 1 -name '*.tar.gz' -print -quit)
+          test -n "$sdist"
+          uv build --no-sources --wheel "$sdist"
+      - name: Install and inspect wheel in isolation
+        working-directory: python
+        run: |
+          uv venv --python 3.12 .wheel-venv
+          wheel=$(find dist -maxdepth 1 -name '*.whl' -print -quit)
+          test -n "$wheel"
+          uv pip install --python .wheel-venv/bin/python "$wheel"
+          .wheel-venv/bin/python -I - <<'PY'
+          import importlib.metadata
+          import pkgutil
+          import manwe
+
+          expected = {"audio", "common", "data", "eval", "export", "fusion", "multicam", "vision"}
+          packaged = {module.name for module in pkgutil.iter_modules(manwe.__path__)}
+          missing = expected - packaged
+          if missing:
+              raise SystemExit(f"wheel is missing packages: {sorted(missing)}")
+
+          metadata = importlib.metadata.metadata("manwe-perception")
+          if metadata["Version"] != manwe.__version__:
+              raise SystemExit(
+                  f"metadata/code version mismatch: {metadata['Version']} != {manwe.__version__}"
+              )
+          if metadata["License-Expression"] != "MIT":
+              raise SystemExit(f"unexpected license: {metadata['License-Expression']}")
+          files = importlib.metadata.files("manwe-perception") or []
+          if not any(str(path).endswith("licenses/LICENSE") for path in files):
+              raise SystemExit("wheel does not contain the declared license file")
+          if not any(str(path).endswith("manwe/py.typed") for path in files):
+              raise SystemExit("wheel does not contain the PEP 561 marker")
+
+          for package in sorted(expected):
+              __import__(f"manwe.{package}")
+          PY
+          .wheel-venv/bin/manwe --version
+
+  python-macos:
+    name: Python 3.12 tests (macOS 15 arm64)
+    runs-on: macos-15
+    timeout-minutes: 20
+    env:
+      UV_PYTHON: "3.12"
+      PYTHONWARNINGS: error
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: "3.12"
+      - name: Set up uv
+        uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990 # v8.3.2
+        with:
+          version: "0.11.28"
+          enable-cache: true
+          cache-dependency-glob: python/uv.lock
+      - name: Install the locked core development environment
+        working-directory: python
+        run: uv sync --locked --extra dev
+      - name: Run tests without resolving dependencies
+        working-directory: python
+        run: uv run --no-sync pytest
+
+  python-vision-policy:
+    name: Locked vision runtime safety policy
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    env:
+      UV_PYTHON: "3.12"
+      PYTHONWARNINGS: error
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: "3.12"
+      - name: Set up uv
+        uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990 # v8.3.2
+        with:
+          version: "0.11.28"
+          enable-cache: true
+          cache-dependency-glob: python/uv.lock
+      - name: Install the exact locked vision adapter
+        working-directory: python
+        run: uv sync --locked --extra vision --extra dev
+      - name: Verify no-install, offline, safe-load, and analytics policy
+        working-directory: python
+        run: |
+          uv run --no-sync python - <<'PY'
+          from manwe.common.ultralytics import harden_ultralytics_runtime, verify_ultralytics_policy
+
+          harden_ultralytics_runtime()
+          import ultralytics
+
+          verify_ultralytics_policy()
+          print(f"verified ultralytics {ultralytics.__version__}")
+          PY
+      - name: Reject animated and multi-page inference inputs
+        working-directory: python
+        run: >-
+          uv run --no-sync pytest -q tests/test_runtime_boundaries.py
+          -k inference_input_is_one_owned_bounded_local_image
+
+  rust-cpu:
+    name: Rust CPU (${{ matrix.toolchain }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        toolchain: ["1.88.0", "stable"]
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
+        with:
+          toolchain: ${{ matrix.toolchain }}
+          components: rustfmt, clippy
+      - name: Fetch locked dependencies
+        run: cargo fetch --locked
+      - name: Check CPU build offline
+        run: cargo check --locked --offline --all-targets --no-default-features
+      - name: Test CPU build offline
+        run: cargo test --locked --offline --all-targets --no-default-features
+      - name: Clippy CPU build offline
+        run: cargo clippy --locked --offline --all-targets --no-default-features -- -D warnings
+      - name: Check formatting
+        if: matrix.toolchain == 'stable'
+        run: cargo fmt --all --check
+
+  rust-metal:
+    name: Rust Metal and benchmark crates (${{ matrix.os }}, ${{ matrix.toolchain }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-15
+            toolchain: "1.88.0"
+          - os: macos-15
+            toolchain: stable
+          - os: macos-26
+            toolchain: stable
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
+        with:
+          toolchain: ${{ matrix.toolchain }}
+          components: rustfmt, clippy
+      - name: Fetch root dependencies
+        run: cargo fetch --locked
+      - name: Check root Metal and viewer targets offline
+        run: cargo check --locked --offline --all-targets --features metal,viewer
+      - name: Test root Metal and viewer targets offline
+        run: cargo test --locked --offline --all-targets --features metal,viewer
+      - name: Clippy root Metal and viewer targets offline
+        run: cargo clippy --locked --offline --all-targets --features metal,viewer -- -D warnings
+      - name: Check root formatting
+        if: matrix.toolchain == 'stable'
+        run: cargo fmt --all --check
+      - name: Fetch benchmark dependencies
+        working-directory: metal-yolo-tests
+        run: cargo fetch --locked
+      - name: Check benchmark targets offline
+        working-directory: metal-yolo-tests
+        run: cargo check --locked --offline --all-targets
+      - name: Test benchmark targets offline
+        working-directory: metal-yolo-tests
+        run: cargo test --locked --offline --all-targets
+      - name: Clippy benchmark targets offline
+        working-directory: metal-yolo-tests
+        run: cargo clippy --locked --offline --all-targets -- -D warnings
+      - name: Check benchmark formatting
+        if: matrix.toolchain == 'stable'
+        working-directory: metal-yolo-tests
+        run: cargo fmt --all --check
+
+  rust-security:
+    name: Rust dependency advisories
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
+        with:
+          toolchain: 1.91.1
+      - name: Install pinned cargo-audit
+        run: cargo install cargo-audit --version 0.22.2 --locked
+      - name: Install pinned cargo-deny
+        run: cargo install cargo-deny --version 0.19.9 --locked
+      - name: Audit root lock
+        run: cargo audit --file Cargo.lock
+      - name: Audit benchmark lock
+        run: cargo audit --file metal-yolo-tests/Cargo.lock
+      - name: Enforce root advisory, license, ban, and source policy
+        run: cargo deny --locked check
+      - name: Enforce benchmark advisory, license, ban, and source policy
+        run: >-
+          cargo deny --manifest-path metal-yolo-tests/Cargo.toml --locked
+          check --config deny.toml --allow license-not-encountered

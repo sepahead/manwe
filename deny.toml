@@ -1,0 +1,42 @@
+[graph]
+all-features = true
+
+[advisories]
+ignore = [
+  { id = "RUSTSEC-2024-0436", reason = "Transitive through Candle/gemm and imageproc/nalgebra; no fixed release is available. Monitor upstream replacement of paste." },
+  { id = "RUSTSEC-2026-0192", reason = "Transitive through ab_glyph/imageproc; no fixed release is available. No untrusted font parser API is exposed." },
+]
+
+[licenses]
+allow = [
+  "0BSD",
+  "Apache-2.0",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "CC0-1.0",
+  "ISC",
+  "MIT",
+  "MIT-0",
+  "Unicode-3.0",
+  "Unlicense",
+  "Zlib",
+]
+confidence-threshold = 0.8
+
+[licenses.private]
+ignore = false
+
+[bans]
+# Bevy/WGPU and Candle/imageproc intentionally carry parallel semver-major
+# transitive lines. Vulnerability/license/source checks still cover every node.
+multiple-versions = "allow"
+wildcards = "deny"
+highlight = "simplest-path"
+workspace-default-features = "allow"
+external-default-features = "allow"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

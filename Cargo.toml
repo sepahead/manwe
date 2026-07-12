@@ -1,32 +1,59 @@
 [package]
 name = "manwe"
-version = "0.1.0"
+version = "0.2.0-alpha.1"
 edition = "2021"
+rust-version = "1.88"
+publish = false
+license = "MIT"
+description = "Rust/Candle inference and benchmarking tools for the Manwe perception workbench"
+repository = "https://github.com/sepahead/manwe"
+
+[features]
+default = []
+metal = ["candle/metal", "candle-nn/metal", "candle-transformers/metal"]
+cuda = ["candle/cuda", "candle-nn/cuda", "candle-transformers/cuda"]
+viewer = ["dep:bevy"]
 
 [dependencies]
 anyhow = "1.0"
-candle = { package = "candle-core", version = "0.8.4", features = ["metal"] }
-candle-nn = { version = "0.8.4", features = ["metal"] }
-candle-transformers = { version = "0.8.4", features = ["metal"] }
-clap = { version = "4.4", features = ["derive"] }
-image = "0.25"
-hf-hub = "0.3"
+# Candle 0.10 pulls a tokenizer/Oniguruma stack unused by this vision-only
+# binary; 0.11 also requires unstable aarch64 NEON APIs at Rust 1.88. Keep the
+# smaller 0.9.2 graph validated by the alpha matrix.
+candle = { package = "candle-core", version = "0.9.2", default-features = false }
+candle-nn = { version = "0.9.2", default-features = false }
+candle-transformers = { version = "0.9.2", default-features = false }
+# Keep the CLI parser family exact so lock regeneration cannot silently change
+# accepted command syntax or the compiler floor.
+clap = { version = "=4.5.57", features = ["derive", "env"] }
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 tracing = "0.1"
 tracing-chrome = "0.7"
 tracing-subscriber = "0.3"
-# opencv removed
-bevy = { version = "0.13", default-features = false, features = ["bevy_winit", "bevy_render", "bevy_core_pipeline", "bevy_sprite", "bevy_asset", "x11", "wayland", "tonemapping_luts", "default_font"] }
-tokio = { version = "1.32", features = ["full"] }
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
+# The viewer is experimental. Retain its validated 0.13 API for this alpha;
+# newer Bevy lines require a dedicated migration and do not remove the legacy
+# transitive advisory currently accepted in deny.toml.
+bevy = { version = "0.13", optional = true, default-features = false, features = ["bevy_winit", "bevy_render", "bevy_core_pipeline", "bevy_sprite", "bevy_asset", "tonemapping_luts", "default_font"] }
 ab_glyph = "0.2"
-imageproc = "0.25"
-rand = "=0.8.5"
+# imageproc 0.27 declares Rust 1.87 but currently resolves nalgebra/wide releases
+# that require Rust 1.89; retain the latest 0.25 patch at Manwe's 1.88 floor.
+imageproc = { version = "0.25.1", default-features = false }
+libc = "0.2"
+sha2 = "0.10"
 
 [[bin]]
 name = "camera_view"
 path = "src/bin/camera_view.rs"
+required-features = ["viewer"]
 
 [[bin]]
 name = "launcher"
 path = "src/bin/launcher.rs"
+required-features = ["viewer"]
+
+[lints.rust]
+future-incompatible = "warn"
+nonstandard-style = "deny"
+
+[lints.clippy]
+all = { level = "deny", priority = 10 }
+perf = { level = "deny", priority = 9 }

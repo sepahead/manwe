@@ -1,0 +1,27 @@
+# Multi-sensor tracker config — local Manwe policy. Load in code with:
+#   from pathlib import Path
+#   from manwe.common.config_io import read_strict_yaml
+#   from manwe.fusion import TrackerConfig
+#   payload = read_strict_yaml(Path("configs/fusion/tracker.yaml"), 65536, "tracker config")
+#   TrackerConfig(**payload)
+
+filter: ekf                # kalman | ekf | ukf | particle | imm
+sigma_a: 3.0               # process-noise acceleration std (m/s²)
+gate_chi2: 11.345          # 3-DOF Mahalanobis gate at 0.99
+
+# Sliding-window M-of-N local policy; this is not consumer numerical parity.
+confirm_hits: 3            # M
+confirm_window: 5          # N
+coast_after_misses: 2      # consecutive misses → Coasting
+max_missed_in_window: 5    # misses within window → Lost (must be ≤ confirm_window)
+max_position_cov_volume: 1.0e+9  # determinant in m^6
+
+# Track management
+max_tracks: 200
+init_vel_var: 100.0
+init_merge_dist: 15.0      # cluster simultaneous new measurements within this radius
+max_dt: 1.0                # maximum duration of one numerical prediction step
+max_prediction_gap: 60.0   # reject larger clock gaps instead of integrating indefinitely
+max_substeps: 120          # hard work bound for one cycle
+max_measurements: 1024     # hard association/input bound for one cycle
+n_particles: 512           # particle filter only

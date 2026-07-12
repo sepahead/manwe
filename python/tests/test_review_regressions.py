@@ -1,0 +1,85 @@
+"""Regression tests locking in the fixes from the 10-lens review."""
+
+import numpy as np
+
+from manwe.cli import main
+from manwe.fusion.filters import IMMEstimator
+from manwe.fusion.tracker import Measurement, measurement_cartesian
+from manwe.multicam.triangulation import triangulate_midpoint
+
+
+def test_core_is_import_clean_without_torch():
+    """Invariant #1: a fresh pure-numpy core import must not load torch."""
+    import os
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    source = Path(__file__).resolve().parents[1] / "src"
+    env = os.environ.copy()
+    env["PYTHONPATH"] = str(source)
+    code = """
+import sys
+for name in ('manwe.common', 'manwe.fusion', 'manwe.multicam', 'manwe.audio', 'manwe.eval'):
+    __import__(name)
+raise SystemExit(1 if 'torch' in sys.modules else 0)
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", code],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr or "a core module imported torch"
+
+
+def test_imm_update_before_predict_does_not_crash():
+    """_cbar must be initialised in __init__ (dt==0 frames update without predict)."""
+    x0 = np.zeros(6)
+    P0 = np.diag([25.0] * 3 + [100.0] * 3)
+    imm = IMMEstimator.default_cv_bank(x0, P0)
+    imm.update(np.array([1.0, 2.0, 3.0]), np.diag([4.0, 4.0, 9.0]))  # must not raise
+    assert abs(imm.mode_probs.sum() - 1.0) < 1e-9
+
+
+def test_imm_bank_honours_radar_polar():
+    """default_cv_bank uses EKFs, so update_polar exists on the bank."""
+    x0 = np.zeros(6)
+    P0 = np.diag([25.0] * 3 + [100.0] * 3)
+    imm = IMMEstimator.default_cv_bank(x0, P0)
+    assert hasattr(imm, "update_polar")
+    imm.update_polar(np.array([100.0, 0.0, 0.0]), np.diag([9.0, 1e-4, 1e-4]), np.zeros(3))
+
+
+def test_parallel_ray_gap_is_perpendicular_distance():
+    # two parallel +x rays offset 3 m in y and 100 m in x → gap must be 3, not 100
+    pt, gap = triangulate_midpoint(
+        np.zeros(3), np.array([1.0, 0, 0]), np.array([100.0, 3.0, 0]), np.array([1.0, 0, 0])
+    )
+    assert abs(gap - 3.0) < 1e-6, f"gap {gap} should be perpendicular distance 3.0"
+
+
+def test_radar_covariance_transform_exact_values():
+    # range=100, az=0, el=0 with polar var [9, 4e-4, 4e-4] → cartesian diag [9, 4, 4]
+    m = Measurement("radar", [100.0, 0.0, 0.0], [9.0, 4e-4, 4e-4], 0.0)
+    _, cov = measurement_cartesian(m)
+    assert np.allclose(cov, np.diag([9.0, 4.0, 4.0]), atol=1e-6), cov
+
+
+def test_unknown_modality_rejected():
+    raised = False
+    try:
+        Measurement("sonar", [1, 2, 3], [1, 1, 1], 0.0)
+    except ValueError:
+        raised = True
+    assert raised
+
+
+def test_cli_rejects_unknown_filter():
+    raised = False
+    try:
+        main(["fusion-sim", "--filters", "bogus", "--duration", "4"])
+    except SystemExit:  # argparse choices → exit(2)
+        raised = True
+    assert raised

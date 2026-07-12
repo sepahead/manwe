@@ -1,85 +1,104 @@
 # Contributing to Manwe
 
-Thank you for your interest in contributing! Manwe is a computer vision toolkit for real-time object detection and pose estimation on Apple Silicon, focused on civilian aerial vehicle detection for applications like disaster relief and urban delivery logistics.
+Manwe is a Python research/numerical package plus Rust/Candle inference and
+benchmark tooling. Crebain and the other ecosystem repositories are intended
+consumers, not automatically compatible dependencies. Applications are civilian
+and dual-use (disaster relief, delivery deconfliction, inspection and airspace
+awareness), so failure modes and provenance matter as much as happy-path output.
 
-## Getting Started
+## Ground rules
 
-### Prerequisites
+- **Keep the core pure-numpy.** `manwe.common`, `manwe.fusion`, `manwe.multicam`,
+  `manwe.audio` (DSP), and `manwe.eval` must import and test with **numpy only**.
+  Training/conversion dependencies belong behind a lazy
+  `manwe.common.deps.require(module, extra)` call. TensorRT is installed as a
+  platform runtime; MLX conversion is not implemented.
+- **Never hard-code a device.** Use `manwe.common.resolve_device`.
+- **Do not call a candidate contract “compatible.”** Class taxonomy and model
+  manifests live in `manwe.common.contracts`, while the audited consumer gaps live
+  in [docs/INTEGRATION_CREBAIN.md](docs/INTEGRATION_CREBAIN.md). A change touching
+  tensors, preprocessing, taxonomy, coordinates, time, IDs or shapes needs a
+  consumer fixture and an explicit compatibility-status update.
+- **Weights and datasets are never committed** (see `.gitignore`).
+- **Fail closed at trust boundaries.** Reject malformed/non-finite/oversized input,
+  wrong artifact digests and unsupported schemas instead of guessing defaults.
 
-- macOS 15+ (Apple Silicon)
-- Rust 1.82+ with `aarch64-apple-darwin` target
-- Python 3.12+
+## Python development
 
-### Development Setup
+Use Python 3.10–3.14 for the core checks and `uv` 0.11.28, the exact resolver
+version pinned in CI. The optional heavy stack is conservatively documented for
+Python 3.11–3.12. Rust checks require Rust 1.88 or newer; Metal/viewer checks need
+Apple tooling and CUDA checks need a target NVIDIA toolchain.
 
 ```bash
-# Clone and build
-git clone https://github.com/sepehrmn/manwe.git
-cd manwe
-cargo build --release
+cd python
+uv sync --locked --extra dev        # core + pytest/ruff/mypy
+# Optional heavy stack (use a supported Python/platform and review the lock diff):
+uv sync --locked --extra all --extra dev
 
-# Verify everything compiles cleanly
-cargo build --release 2>&1 | grep warning  # should output nothing
+uv run --no-sync pytest tests
+uv run --no-sync ruff check src tests
+uv run --no-sync ruff format --check src tests
+uv run --no-sync mypy src/manwe
 ```
 
-### Project Structure
+The locked `rfdetr` extra covers construction/inference only. Do not install the
+upstream training extra into the combined environment while it pulls competing
+OpenCV distributions; curate and verify one package owner first.
 
+Add a test for every new numeric routine — the filters, triangulation, DOA, and
+metrics are all covered by fast, seeded tests in `python/tests/`. New pillar code
+that needs torch should be split so its pure logic (postprocessing, mapping, math)
+is testable without it.
+
+## Rust development
+
+```bash
+cargo fmt --all --check
+cargo test --locked --no-default-features
+cargo clippy --locked --all-targets --no-default-features -- -D warnings
+
+# Platform-specific paths (run on matching hardware/toolchain):
+cargo test --locked --features metal
+cargo clippy --locked --all-targets --features viewer,metal -- -D warnings
+# NVIDIA host: cargo test --locked --features cuda
+
+# Benchmark crate (Apple Silicon/Metal):
+cargo test --manifest-path metal-yolo-tests/Cargo.toml --locked
+cargo clippy --manifest-path metal-yolo-tests/Cargo.toml --locked --all-targets -- -D warnings
 ```
-manwe/
-├── src/                   # Rust YOLOv8 CLI (object detection + pose estimation)
-│   ├── main.rs            # CLI entry point
-│   ├── lib.rs             # Shared utilities (image I/O, annotation, NMS)
-│   ├── model.rs           # YOLOv8 model architecture (Candle)
-│   ├── coco_classes.rs    # 80-class COCO label names
-│   └── bin/               # Additional binaries
-├── camera_view.py         # Python multi-camera RTSP viewer
-├── metal-yolo-tests/      # Cross-backend benchmarking suite
-│   ├── src/               # Rust benchmark sources
-│   ├── *.py               # Python benchmark scripts
-│   └── *.sh               # Shell benchmark runners
-├── Cargo.toml
-└── LICENSE
-```
 
-## How to Contribute
+## Pull requests
 
-### Reporting Issues
+1. Open an issue first to discuss non-trivial changes.
+2. One focused change per PR.
+3. Keep the applicable core, lint, package and platform-feature checks green.
+4. Update docs whenever usage, a candidate contract or a default changes. Record
+   empirical justification; a research citation alone does not validate a default.
+5. Preserve lockfiles and explain dependency/license changes.
 
-- Search [existing issues](https://github.com/sepehrmn/manwe/issues) before opening a new one
-- Include your macOS version, chip model (M1/M2/M3/M4), and any relevant logs
-- For performance issues, include benchmark results if available
+For model/export changes, include artifact digests, tensor/pre/postprocess fixtures,
+per-class AP50/AP50-small deltas, deployed-threshold precision/recall/FPPI, direct
+box/score agreement, required-class coverage and the exact consumer path. Use
+unique `image_id` values and source-image-pixel `xyxy` boxes. For performance
+changes, follow the ten-point protocol in `metal-yolo-tests/README.md`; numbers with
+different timed scopes are not comparable.
 
-### Pull Requests
+## Areas of interest
 
-1. **Open an issue first** to discuss the proposed change before writing code
-2. **Fork the repository** and create a feature branch
-3. **Keep changes focused** — one feature or fix per PR
-4. **Ensure `cargo build --release` succeeds with zero warnings**
-5. **Write clear commit messages** describing what changed and why
-6. **Update documentation** if your change affects usage or APIs
-
-### Code Style
-
-- Follow existing conventions in the codebase
-- Use `cargo fmt` for Rust formatting
-- Use descriptive variable names
-- Add comments for non-obvious logic
-- Run `cargo clippy` before submitting (if installed)
-
-### Areas of Interest
-
-We're particularly interested in contributions in these areas:
-
-- **Additional model architectures** — support for YOLOv9, YOLOv10, RT-DETR, etc.
-- **Performance optimizations** — Metal GPU kernel improvements, CoreML integration
-- **New benchmark scenarios** — multi-stream testing, different hardware comparisons
-- **Expanded civilian use cases** — infrastructure inspection, wildlife monitoring, traffic analysis
-- **Documentation** — tutorials, usage examples, deployment guides
+- Vision: RF-DETR / YOLO26 fine-tuning recipes, P2 head, SAHI training integration.
+- Audio: a SELD ResNet-Conformer (Multi-ACCDOA) upgrade over the SRP-PHAT baseline.
+- Multi-camera: RANSAC-over-subsets triangulation, LOSTU-style covariance, ReID.
+- Fusion: a Coordinated-Turn IMM model, GLMB/PMBM for dense swarms, a Stone Soup
+  cross-validation adapter.
+- Export: an implemented and fixture-tested MLX path, TensorRT INT8 calibration,
+  COCO-style evaluation, and consumer-owned integration fixtures.
 
 ## License
 
-By contributing, you agree that your contributions will be licensed under the MIT License.
+By contributing you agree your contributions are licensed under the MIT License.
+That license covers your source contribution; it does not relicense checkpoints,
+datasets, generated weights or third-party dependencies included in a test/run.
 
-## Questions?
-
-Open an issue or start a discussion — we're happy to help!
+Release maintainers must also follow [docs/RELEASING.md](docs/RELEASING.md); an
+alpha tag is not authorized until its external credential-response gate is closed.

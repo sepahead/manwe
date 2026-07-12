@@ -1,11 +1,17 @@
 use candle::{DType, IndexOp, Result, Tensor, D};
 use candle_nn::{batch_norm, conv2d, conv2d_no_bias, Conv2d, Conv2dConfig, Module, VarBuilder};
 
+const MAX_MODEL_BATCH_SIZE: usize = 64;
+const MAX_MODEL_INPUT_DIMENSION: usize = 4_096;
+const MAX_MODEL_BATCH_PIXELS: usize = 32 * 1024 * 1024;
+const MODEL_INPUT_ALIGNMENT: usize = 32;
+const POSE_KEYPOINT_SHAPE: (usize, usize) = (17, 3);
+
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub struct Multiples {
-    pub depth: f64,
-    pub width: f64,
-    pub ratio: f64,
+    depth: f64,
+    width: f64,
+    ratio: f64,
 }
 
 impl Multiples {
@@ -67,7 +73,15 @@ impl Upsample {
 impl Module for Upsample {
     fn forward(&self, xs: &Tensor) -> candle::Result<Tensor> {
         let (_b_size, _channels, h, w) = xs.dims4()?;
-        xs.upsample_nearest2d(self.scale_factor * h, self.scale_factor * w)
+        let target_h = self
+            .scale_factor
+            .checked_mul(h)
+            .ok_or_else(|| candle::Error::Msg("upsampled height overflowed".to_string()))?;
+        let target_w = self
+            .scale_factor
+            .checked_mul(w)
+            .ok_or_else(|| candle::Error::Msg("upsampled width overflowed".to_string()))?;
+        xs.upsample_nearest2d(target_h, target_w)
     }
 }
 
@@ -92,6 +106,7 @@ impl ConvBlock {
             stride,
             groups: 1,
             dilation: 1,
+            cudnn_fwd_algo: None,
         };
         let bn = batch_norm(c2, 1e-3, vb.pp("bn"))?;
         let conv = conv2d_no_bias(c1, c2, k, cfg, vb.pp("conv"))?.absorb_bn(&bn)?;
@@ -161,7 +176,7 @@ impl C2f {
         let cv2 = ConvBlock::load(vb.pp("cv2"), (2 + n) * c, c2, 1, 1, None)?;
         let mut bottleneck = Vec::with_capacity(n);
         for idx in 0..n {
-            let b = Bottleneck::load(vb.pp(&format!("bottleneck.{idx}")), c, c, shortcut)?;
+            let b = Bottleneck::load(vb.pp(format!("bottleneck.{idx}")), c, c, shortcut)?;
             bottleneck.push(b)
         }
         Ok(Self {
@@ -179,7 +194,10 @@ impl Module for C2f {
         let ys = self.cv1.forward(xs)?;
         let mut ys = ys.chunk(2, 1)?;
         for m in self.bottleneck.iter() {
-            ys.push(m.forward(ys.last().unwrap())?)
+            let Some(last) = ys.last() else {
+                candle::bail!("C2f split unexpectedly produced no tensors")
+            };
+            ys.push(m.forward(last)?)
         }
         let zs = Tensor::cat(ys.as_slice(), 1)?;
         self.cv2.forward(&zs)
@@ -494,8 +512,15 @@ fn make_anchors(
     for (xs, stride) in [(xs0, s0), (xs1, s1), (xs2, s2)] {
         // xs is only used to extract the h and w dimensions.
         let (_, _, h, w) = xs.dims4()?;
-        let sx = (Tensor::arange(0, w as u32, dev)?.to_dtype(DType::F32)? + grid_cell_offset)?;
-        let sy = (Tensor::arange(0, h as u32, dev)?.to_dtype(DType::F32)? + grid_cell_offset)?;
+        let w_u32 = u32::try_from(w)
+            .map_err(|_| candle::Error::Msg("anchor-grid width exceeds u32".to_string()))?;
+        let h_u32 = u32::try_from(h)
+            .map_err(|_| candle::Error::Msg("anchor-grid height exceeds u32".to_string()))?;
+        let anchor_count = h
+            .checked_mul(w)
+            .ok_or_else(|| candle::Error::Msg("anchor-grid size overflowed".to_string()))?;
+        let sx = (Tensor::arange(0, w_u32, dev)?.to_dtype(DType::F32)? + grid_cell_offset)?;
+        let sy = (Tensor::arange(0, h_u32, dev)?.to_dtype(DType::F32)? + grid_cell_offset)?;
         let sx = sx
             .reshape((1, sx.elem_count()))?
             .repeat((h, 1))?
@@ -505,7 +530,7 @@ fn make_anchors(
             .repeat((1, w))?
             .flatten_all()?;
         anchor_points.push(Tensor::stack(&[&sx, &sy], D::Minus1)?);
-        stride_tensor.push((Tensor::ones(h * w, DType::F32, dev)? * stride as f64)?);
+        stride_tensor.push((Tensor::ones(anchor_count, DType::F32, dev)? * stride as f64)?);
     }
     let anchor_points = Tensor::cat(anchor_points.as_slice(), 0)?;
     let stride_tensor = Tensor::cat(stride_tensor.as_slice(), 0)?.unsqueeze(1)?;
@@ -528,8 +553,65 @@ struct DetectionHeadOut {
     strides: Tensor,
 }
 
+fn validate_class_count(count: usize) -> Result<()> {
+    if !(1..=1_000).contains(&count) {
+        candle::bail!("class count must be between 1 and 1000")
+    }
+    Ok(())
+}
+
+fn keypoint_count(kpt: (usize, usize)) -> Result<usize> {
+    if kpt != POSE_KEYPOINT_SHAPE {
+        candle::bail!(
+            "pose head requires exactly {} keypoints with x/y/visibility",
+            POSE_KEYPOINT_SHAPE.0
+        )
+    }
+    kpt.0
+        .checked_mul(kpt.1)
+        .ok_or_else(|| candle::Error::Msg("keypoint head size overflowed".to_string()))
+}
+
+fn validate_model_input_shape(
+    batch: usize,
+    channels: usize,
+    height: usize,
+    width: usize,
+) -> Result<()> {
+    if !(1..=MAX_MODEL_BATCH_SIZE).contains(&batch) {
+        candle::bail!("model batch size must be between 1 and {MAX_MODEL_BATCH_SIZE}")
+    }
+    if channels != 3 {
+        candle::bail!("YOLO input must contain exactly 3 channels")
+    }
+    if height == 0 || width == 0 {
+        candle::bail!("model input dimensions must be non-zero")
+    }
+    if height > MAX_MODEL_INPUT_DIMENSION || width > MAX_MODEL_INPUT_DIMENSION {
+        candle::bail!("model input dimensions must not exceed {MAX_MODEL_INPUT_DIMENSION}")
+    }
+    if !height.is_multiple_of(MODEL_INPUT_ALIGNMENT) || !width.is_multiple_of(MODEL_INPUT_ALIGNMENT)
+    {
+        candle::bail!("model input dimensions must be multiples of {MODEL_INPUT_ALIGNMENT}")
+    }
+    let batch_pixels = height
+        .checked_mul(width)
+        .and_then(|pixels| pixels.checked_mul(batch))
+        .ok_or_else(|| candle::Error::Msg("model input work size overflowed".to_string()))?;
+    if batch_pixels > MAX_MODEL_BATCH_PIXELS {
+        candle::bail!("model input exceeds the {MAX_MODEL_BATCH_PIXELS}-pixel batch work limit")
+    }
+    Ok(())
+}
+
+fn validate_model_input(xs: &Tensor) -> Result<()> {
+    let (batch, channels, height, width) = xs.dims4()?;
+    validate_model_input_shape(batch, channels, height, width)
+}
+
 impl DetectionHead {
     fn load(vb: VarBuilder, nc: usize, filters: (usize, usize, usize)) -> Result<Self> {
+        validate_class_count(nc)?;
         let ch = 16;
         let dfl = Dfl::load(vb.pp("dfl"), ch)?;
         let c1 = usize::max(filters.0, nc);
@@ -544,7 +626,9 @@ impl DetectionHead {
             Self::load_cv2(vb.pp("cv2.1"), c2, ch, filters.1)?,
             Self::load_cv2(vb.pp("cv2.2"), c2, ch, filters.2)?,
         ];
-        let no = nc + ch * 4;
+        let no = nc
+            .checked_add(ch * 4)
+            .ok_or_else(|| candle::Error::Msg("detection head size overflowed".to_string()))?;
         Ok(Self {
             dfl,
             cv2,
@@ -602,7 +686,13 @@ impl DetectionHead {
         let reshape = |xs: &Tensor| {
             let d = xs.dim(0)?;
             let el = xs.elem_count();
-            xs.reshape((d, self.no, el / (d * self.no)))
+            let leading = d.checked_mul(self.no).ok_or_else(|| {
+                candle::Error::Msg("detection-head leading dimensions overflowed".to_string())
+            })?;
+            if leading == 0 || !el.is_multiple_of(leading) {
+                candle::bail!("detection-head tensor shape is inconsistent")
+            }
+            xs.reshape((d, self.no, el / leading))
         };
         let ys0 = reshape(&xs0)?;
         let ys1 = reshape(&xs1)?;
@@ -614,12 +704,7 @@ impl DetectionHead {
 
         let dbox = dist2bbox(&self.dfl.forward(&box_)?, &anchors)?;
         let dbox = dbox.broadcast_mul(&strides)?;
-        let sigmoid = |xs: &Tensor| {
-            let xs = xs.neg()?.exp()?;
-            let one = Tensor::ones_like(&xs)?;
-            one.clone() / (one + xs)?
-        };
-        let pred = Tensor::cat(&[dbox, sigmoid(&cls)?], 1)?;
+        let pred = Tensor::cat(&[dbox, candle_nn::ops::sigmoid(&cls)?], 1)?;
         Ok(DetectionHeadOut {
             pred,
             anchors,
@@ -638,7 +723,7 @@ impl PoseHead {
         filters: (usize, usize, usize),
     ) -> Result<Self> {
         let detect = DetectionHead::load(vb.clone(), nc, filters)?;
-        let nk = kpt.0 * kpt.1;
+        let nk = keypoint_count(kpt)?;
         let c4 = usize::max(filters.0 / 4, nk);
         let cv4 = [
             Self::load_cv4(vb.pp("cv4.0"), c4, nk, filters.0)?,
@@ -670,10 +755,14 @@ impl PoseHead {
         let d = self.detect.forward(xs0, xs1, xs2)?;
         let forward_cv = |xs: &Tensor, i: usize| {
             let (b_sz, _, h, w) = xs.dims4()?;
+            let anchors = h.checked_mul(w).ok_or_else(|| {
+                candle::Error::Msg("pose-head anchor count overflowed".to_string())
+            })?;
             let xs = self.cv4[i].0.forward(xs)?;
             let xs = self.cv4[i].1.forward(&xs)?;
             let xs = self.cv4[i].2.forward(&xs)?;
-            xs.reshape((b_sz, self.kpt.0 * self.kpt.1, h * w))
+            let keypoint_values = keypoint_count(self.kpt)?;
+            xs.reshape((b_sz, keypoint_values, anchors))
         };
         let xs0 = forward_cv(xs0, 0)?;
         let xs1 = forward_cv(xs1, 1)?;
@@ -684,12 +773,7 @@ impl PoseHead {
 
         let ys01 = ((xs.i((.., .., 0..2))? * 2.)?.broadcast_add(&d.anchors)? - 0.5)?
             .broadcast_mul(&d.strides)?;
-        let sigmoid = |xs: &Tensor| {
-            let xs = xs.neg()?.exp()?;
-            let one = Tensor::ones_like(&xs)?;
-            one.clone() / (one + xs)?
-        };
-        let ys2 = sigmoid(&xs.i((.., .., 2..3))?)?;
+        let ys2 = candle_nn::ops::sigmoid(&xs.i((.., .., 2..3))?)?;
         let ys = Tensor::cat(&[ys01, ys2], 2)?.flatten(1, 2)?;
         Tensor::cat(&[d.pred, ys], 1)
     }
@@ -705,6 +789,7 @@ pub struct YoloV8 {
 
 impl YoloV8 {
     pub fn load(vb: VarBuilder, m: Multiples, num_classes: usize) -> Result<Self> {
+        validate_class_count(num_classes)?;
         let net = DarkNet::load(vb.pp("net"), m)?;
         let fpn = YoloV8Neck::load(vb.pp("fpn"), m)?;
         let head = DetectionHead::load(vb.pp("head"), num_classes, m.filters())?;
@@ -720,6 +805,7 @@ impl YoloV8 {
 impl Module for YoloV8 {
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
         let _enter = self.span.enter();
+        validate_model_input(xs)?;
         let (xs1, xs2, xs3) = self.net.forward(xs)?;
         let (xs1, xs2, xs3) = self.fpn.forward(&xs1, &xs2, &xs3)?;
         Ok(self.head.forward(&xs1, &xs2, &xs3)?.pred)
@@ -741,6 +827,8 @@ impl YoloV8Pose {
         num_classes: usize,
         kpt: (usize, usize),
     ) -> Result<Self> {
+        validate_class_count(num_classes)?;
+        keypoint_count(kpt)?;
         let net = DarkNet::load(vb.pp("net"), m)?;
         let fpn = YoloV8Neck::load(vb.pp("fpn"), m)?;
         let head = PoseHead::load(vb.pp("head"), num_classes, kpt, m.filters())?;
@@ -756,8 +844,33 @@ impl YoloV8Pose {
 impl Module for YoloV8Pose {
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
         let _enter = self.span.enter();
+        validate_model_input(xs)?;
         let (xs1, xs2, xs3) = self.net.forward(xs)?;
         let (xs1, xs2, xs3) = self.fpn.forward(&xs1, &xs2, &xs3)?;
         self.head.forward(&xs1, &xs2, &xs3)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use candle::Device;
+
+    #[test]
+    fn public_loaders_reject_unbounded_head_dimensions_before_loading_weights() {
+        let vb = VarBuilder::zeros(DType::F32, &Device::Cpu);
+        assert!(YoloV8::load(vb.clone(), Multiples::s(), 0).is_err());
+        assert!(YoloV8Pose::load(vb.clone(), Multiples::s(), 1, (usize::MAX, 2)).is_err());
+        assert!(YoloV8Pose::load(vb.clone(), Multiples::s(), 1, (17, 4)).is_err());
+        assert!(YoloV8Pose::load(vb, Multiples::s(), 1, (16, 3)).is_err());
+    }
+
+    #[test]
+    fn public_forward_shape_contract_rejects_zero_unaligned_and_excessive_work() {
+        assert!(validate_model_input_shape(0, 3, 640, 640).is_err());
+        assert!(validate_model_input_shape(1, 4, 640, 640).is_err());
+        assert!(validate_model_input_shape(1, 3, 641, 640).is_err());
+        assert!(validate_model_input_shape(3, 3, 4_096, 4_096).is_err());
+        assert!(validate_model_input_shape(2, 3, 4_096, 4_096).is_ok());
     }
 }

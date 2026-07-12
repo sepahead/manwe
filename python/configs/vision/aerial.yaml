@@ -1,0 +1,36 @@
+# Vision from-scratch training config — candidate aerial-object detector taxonomy.
+# Maps 1:1 onto manwe.vision.train.VisionTrainConfig. Run with:
+#   uv run --no-sync manwe vision-train configs/vision/aerial.yaml
+#
+# Ultralytics tooling research track. Upstream export availability is not a
+# consumer-compatibility claim. RF-DETR construction is available separately,
+# but its training environment is not represented by the combined lock.
+
+model: yolo11s            # detector zoo name (`uv run --no-sync manwe models`)
+data: data.example.yaml   # resolved relative to this config by the Manwe CLI
+epochs: 100
+imgsz: 640
+batch: 16
+device: auto             # auto | cuda | mps | cpu | cuda:0
+lr0: 0.01
+lrf: 0.01
+patience: 50
+pretrained: false        # the only accepted value; local-checkpoint loading is not implemented
+seed: 1337
+project: runs/vision
+name: aerial
+
+# Augmentation — heavy mosaic + copy-paste helps tiny aerial objects; close the
+# mosaic for the final epochs so the model sees realistic layouts before eval.
+mosaic: 1.0
+mixup: 0.1
+copy_paste: 0.1
+close_mosaic: 10
+
+# Export is deliberately a separate, auditable command after training.
+export_formats: []
+
+# Any extra Ultralytics train kwargs pass through here (e.g. cos_lr, amp):
+extra:
+  cos_lr: true
+  amp: false             # opt in only after validating the exact backend/model combination

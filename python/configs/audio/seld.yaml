@@ -1,0 +1,30 @@
+# Acoustic detection / DOA research sketch. This file is not consumed by a
+# trainer or CLI and is not an executable deep-SELD configuration.
+# The classical GCC-PHAT / SRP-PHAT path (manwe.audio) is cross-platform and
+# needs no training—the runnable baseline. A deep ResNet-Conformer/Multi-ACCDOA
+# SELD path is only a proposal; see docs/research/SOTA-2026.md §2.
+
+sample_rate: 16000
+n_fft: 1024
+hop: 256
+n_mels: 64
+fmin: 20.0
+fmax: 8000.0
+speed_of_sound: 343.0
+
+# Microphone array geometry (metres, relative to array centre). A non-coplanar
+# (tetrahedral) array is required to observe elevation.
+mic_positions:
+  - [0.1, 0.1, 0.1]
+  - [0.1, -0.1, -0.1]
+  - [-0.1, 0.1, -0.1]
+  - [-0.1, -0.1, 0.1]
+
+# DOA search grid
+az_steps: 72
+el_steps: 19
+
+# Acoustic → fusion measurement uncertainty (good bearing, weak range).
+angle_std_rad: 0.05
+range_std_m: 30.0
+nominal_range_m: 100.0     # single array cannot triangulate range
