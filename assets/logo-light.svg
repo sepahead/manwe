@@ -107,6 +107,7 @@
     .mel-facet    { fill: #070302; }
     .mel-tin      { stroke: #000000; stroke-opacity: 0.4; stroke-width: 0.6; stroke-linejoin: round; }
     .mel-splat    { fill: url(#melSplat); }
+    .mel-front    { fill: #ffedd5; filter: url(#edgeGlow); }
     .mel-edge     { fill: none; stroke: url(#melBezel); stroke-width: 2.4; stroke-linejoin: miter; }
     .mel-groove   { fill: none; stroke: #05070b; stroke-opacity: 0.5; stroke-width: 1; }
     .mel-hairline { fill: none; stroke: #2b333d; stroke-opacity: 0.55; stroke-width: 1; }
@@ -163,6 +164,8 @@
     .mw-blade-sh  { fill: none; stroke: #05070b; stroke-opacity: 0.7; stroke-width: 1.2; }
     .mw-inner     { fill: none; stroke: url(#mwBezel); stroke-width: 1.6; stroke-opacity: 0.9; stroke-linecap: round; }
     .mw-notch     { fill: none; stroke: #bae6fd; stroke-width: 1.4; stroke-linejoin: round; stroke-linecap: round; }
+    .mw-tick      { stroke: #38bdf8; stroke-opacity: 0.4; stroke-width: 1; }
+    .mw-dot       { fill: #7dd3fc; fill-opacity: 0.16; }
     .mw-lock      { fill: none; stroke: #ef4444; stroke-width: 1.2; stroke-linecap: round; stroke-linejoin: round; }
     .mw-lock-dot  { fill: #ff6b5e; }
     .mw-drone-arm { fill: none; stroke: #7dd3fc; stroke-width: 1.4; stroke-linecap: round; }
@@ -243,9 +246,13 @@
       <radialGradient id="mwCore" gradientUnits="userSpaceOnUse" cx="298" cy="386" r="6">
         <stop offset="0%" stop-color="#cfeafe" stop-opacity="0.7"/><stop offset="45%" stop-color="#38bdf8" stop-opacity="0.42"/><stop offset="100%" stop-color="#38bdf8" stop-opacity="0"/>
       </radialGradient>
+      <pattern id="mwDots" width="5.5" height="5.5" patternUnits="userSpaceOnUse" patternTransform="translate(298 386)">
+        <circle cx="1.4" cy="1.4" r="0.5" class="mw-dot"/>
+      </pattern>
     </defs>
     <g filter="url(#nodeShadow)"><circle cx="298" cy="386" r="34" fill="url(#mwBarrel)"/></g>
     <circle cx="298" cy="386" r="28" class="mw-iris"/>
+    <circle cx="298" cy="386" r="26.5" fill="url(#mwDots)"/>
     <polygon points="307,395 294.7,398.3 285.7,389.3 289,377 301.3,373.7 310.3,382.7" class="mw-well"/>
     <circle cx="298" cy="386" r="6" class="mw-core">
       <animate attributeName="opacity" values="1;0.82;1" dur="3.4s" repeatCount="indefinite"/>
@@ -254,7 +261,7 @@
     <g class="mw-trigger" opacity="1"><animate attributeName="opacity" values="0;0;1;1;0;0" keyTimes="0;0.22;0.31;0.9;0.97;1" dur="10s" repeatCount="indefinite"/><polyline class="mw-lock" points="296.6,376.4 298,377.8 299.4,376.4"/><circle class="mw-lock-dot" cx="298" cy="376.1" r="0.6"/></g>
     <polygon points="307,395 294.7,398.3 285.7,389.3 289,377 301.3,373.7 310.3,382.7" class="mw-aphex"/>
     <g class="mw-blades"><animateTransform attributeName="transform" type="rotate" values="0 298 386;0 298 386;360 298 386;360 298 386" keyTimes="0;0.34;0.7;1" calcMode="spline" keySplines="0 0 1 1;0.45 0 0.55 1;0 0 1 1" dur="10s" repeatCount="indefinite"/><path class="mw-blade-sh" d="M308.4 395.4 L303.7 412.9"/><path class="mw-blade" d="M307 395 L302.1 413.1"/><path class="mw-blade-sh" d="M295.1 399.7 L277.6 404.4"/><path class="mw-blade" d="M294.7 398.3 L276.6 403.1"/><path class="mw-blade-sh" d="M284.7 390.3 L271.9 377.5"/><path class="mw-blade" d="M285.7 389.3 L272.4 376"/><path class="mw-blade-sh" d="M287.6 376.6 L292.3 359.1"/><path class="mw-blade" d="M289 377 L293.9 358.9"/><path class="mw-blade-sh" d="M300.9 372.3 L318.4 367.6"/><path class="mw-blade" d="M301.3 373.7 L319.4 368.9"/><path class="mw-blade-sh" d="M311.3 381.7 L324.1 394.5"/><path class="mw-blade" d="M310.3 382.7 L323.6 396"/></g>
-    <path class="mw-inner" d="M302.2 356.3 A30 30 0 1 1 293.8 356.3"/><path class="mw-notch" d="M302.2 356.3 L298 359 L293.8 356.3"/>
+    <path class="mw-inner" d="M302.2 356.3 A30 30 0 1 1 293.8 356.3"/><path class="mw-notch" d="M302.2 356.3 L298 359 L293.8 356.3"/><line class="mw-tick" x1="328.6" y1="386" x2="331.4" y2="386"/><line class="mw-tick" x1="324.5" y1="401.3" x2="326.9" y2="402.7"/><line class="mw-tick" x1="313.3" y1="412.5" x2="314.7" y2="414.9"/><line class="mw-tick" x1="298" y1="416.6" x2="298" y2="419.4"/><line class="mw-tick" x1="282.7" y1="412.5" x2="281.3" y2="414.9"/><line class="mw-tick" x1="271.5" y1="401.3" x2="269.1" y2="402.7"/><line class="mw-tick" x1="267.4" y1="386" x2="264.6" y2="386"/><line class="mw-tick" x1="271.5" y1="370.7" x2="269.1" y2="369.3"/><line class="mw-tick" x1="282.7" y1="359.5" x2="281.3" y2="357.1"/><line class="mw-tick" x1="298" y1="355.4" x2="298" y2="352.6"/><line class="mw-tick" x1="313.3" y1="359.5" x2="314.7" y2="357.1"/><line class="mw-tick" x1="324.5" y1="370.7" x2="326.9" y2="369.3"/>
     <circle cx="298" cy="386" r="34" class="mw-ring"/>
     <circle cx="298" cy="386" r="31.8" class="mw-groove"/>
     <circle cx="298" cy="386" r="35.4" class="mw-hairline"/>
