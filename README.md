@@ -1,5 +1,8 @@
 <p align="center">
-  <img src="assets/manwe-logo.svg" alt="Manwe perception proving ground — inside a graduated sky scope, a target drone sits in detection brackets; two camera rays triangulate it, acoustic arcs rise from below, and a second tracked target follows a dashed predicted path." width="200" height="200" />
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/logo-dark.svg">
+    <img src="assets/logo-light.svg" alt="Manwe perception proving ground — a machined sky-scope optic with a mechanical iris and a quadcopter caught in the aperture." width="200">
+  </picture>
 </p>
 
 # Manwe
