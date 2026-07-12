@@ -36,7 +36,7 @@ bevy = { version = "0.13", optional = true, default-features = false, features =
 ab_glyph = "0.2"
 # imageproc 0.27 declares Rust 1.87 but currently resolves nalgebra/wide releases
 # that require Rust 1.89; retain the latest 0.25 patch at Manwe's 1.88 floor.
-imageproc = { version = "0.25.1", default-features = false }
+imageproc = { version = "0.27.0", default-features = false }
 libc = "0.2"
 sha2 = "0.10"
 
