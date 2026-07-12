@@ -16,7 +16,7 @@ candle-transformers = { version = "0.9.2", default-features = false, features = 
 clap = { version = "=4.5.57", features = ["derive"] }
 image = { version = "0.25.1", default-features = false, features = ["jpeg", "png"] }
 # Keep this on the root crate's Rust-1.88-compatible imageproc line.
-imageproc = { version = "0.25.1", default-features = false }
+imageproc = { version = "0.27.0", default-features = false }
 manwe = { path = "..", version = "=0.2.0-alpha.1", features = ["metal"] }
 serde_json = "1.0"
 sha2 = "0.10"
