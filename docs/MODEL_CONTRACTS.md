@@ -34,8 +34,36 @@ negotiates or enforces this JSON today; see the
 Schema 1.2 validation rejects missing values, incomplete class maps, invalid tensor
 descriptions, wrong artifact suffix/type, empty or oversized artifacts, missing
 artifacts, digest mismatches, and symlinks. CoreML bundles use a bounded,
-deterministic directory-tree digest. Sidecars refuse occupied or dangling-symlink
-paths and roll back the first file if creating the pair fails.
+deterministic directory-tree digest. Sidecars are first written, synced, and
+verified inside an adjacent private `.manwe-contract-*.in-progress` directory,
+then published with descriptor-relative no-replace hard links. An occupied path
+is rejected before staging, while the link operations remain the authoritative
+no-replace check. Once either final link exists, any failure preserves every final
+pathname; failures detected before marker removal also preserve the staging marker
+for manual recovery. Cleanup never check-then-unlinks a possibly replaced final
+path. It proceeds only after revalidating the parent pathname identity,
+signed-artifact digest, and original staged/final inode/content identities,
+including one complete commit-boundary check immediately before marker removal.
+`save_contract` returns success only after both durable final links are verified,
+the marker is removed, and that removal is synced. If cleanup cannot be
+authenticated, it raises and preserves the marker. If marker removal succeeds but
+its parent fsync fails, it raises an **indeterminate commit** error: the current
+namespace has no marker, but a crash may make it reappear.
+
+POSIX provides no conditional unlink-by-inode operation. The absolute guarantee is
+that Manwe never removes either final pathname; private-stage cleanup relies on its
+high-entropy mode-0700 name plus immediate identity/content checks. A hostile
+same-UID process actively racing those checks remains outside this boundary.
+
+Manual recovery is intentionally conservative:
+
+1. Stop concurrent writers and retain every final path and in-progress directory.
+2. Compare any staged files still present, the final files, recorded digests, and
+   signed artifact; a late failure may leave an empty marker, so never infer
+   completeness from names alone.
+3. Quarantine mismatches. Remove the marker and sync its parent only after both
+   sidecars are verified, or re-sync and re-inspect the parent after an indeterminate
+   marker-removal error.
 
 The builder does not infer tensors from `family="yolo"` or a file extension. Raw
 export receipts deliberately set `tensor_signature_verified=false`; a caller must

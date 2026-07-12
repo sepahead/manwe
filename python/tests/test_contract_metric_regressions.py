@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+
 import numpy as np
 import pytest
 
@@ -199,6 +201,7 @@ def test_coreml_directory_contract_and_save_digest_gate(tmp_path):
     json_path, markdown_path = save_contract(contract, package)
     assert json_path.is_file()
     assert markdown_path.is_file()
+    assert not list(tmp_path.glob(".manwe-contract-*.in-progress"))
 
     (package / "Manifest.json").write_text('{"changed": true}', encoding="utf-8")
     with pytest.raises(ValueError, match="SHA-256"):
@@ -239,7 +242,7 @@ def test_contract_rejects_root_symlinks_and_artifact_tampering(tmp_path):
         contract.validate()
 
 
-def test_save_contract_never_replaces_paths_and_rolls_back_partial_pair(tmp_path):
+def test_save_contract_never_replaces_preoccupied_paths(tmp_path):
     artifact = tmp_path / "model.onnx"
     artifact.write_bytes(b"model")
     contract = _build_contract(artifact)
@@ -251,6 +254,7 @@ def test_save_contract_never_replaces_paths_and_rolls_back_partial_pair(tmp_path
         save_contract(contract, artifact)
     assert json_path.read_text(encoding="utf-8") == "owned"
     assert not markdown_path.exists()
+    assert not list(tmp_path.glob(".manwe-contract-*.in-progress"))
 
     json_path.unlink()
     dangling_target = tmp_path / "missing-target"
@@ -260,6 +264,7 @@ def test_save_contract_never_replaces_paths_and_rolls_back_partial_pair(tmp_path
     assert not json_path.exists()
     assert markdown_path.is_symlink()
     assert not dangling_target.exists()
+    assert not list(tmp_path.glob(".manwe-contract-*.in-progress"))
 
 
 def test_save_contract_detects_replacement_and_preserves_foreign_path(tmp_path, monkeypatch):
@@ -268,41 +273,262 @@ def test_save_contract_detects_replacement_and_preserves_foreign_path(tmp_path, 
     artifact = tmp_path / "model.onnx"
     artifact.write_bytes(b"model")
     contract = _build_contract(artifact)
-    real_write = contract_module._write_text_exclusive
+    real_link = contract_module._link_staged_sidecar
 
-    def replace_json_after_write(path, value, **kwargs):
-        identity = real_write(path, value, **kwargs)
-        if path.suffix == ".json":
-            path.unlink()
-            path.write_text("foreign", encoding="utf-8")
-        return identity
+    def replace_json_after_link(stage_fd, stage_name, parent_fd, final_name):
+        real_link(stage_fd, stage_name, parent_fd, final_name)
+        if stage_name == contract_module._STAGE_JSON:
+            final_path = tmp_path / final_name
+            final_path.unlink()
+            final_path.write_text("foreign", encoding="utf-8")
 
-    monkeypatch.setattr(contract_module, "_write_text_exclusive", replace_json_after_write)
+    monkeypatch.setattr(contract_module, "_link_staged_sidecar", replace_json_after_link)
     with pytest.raises(RuntimeError, match="replaced"):
         save_contract(contract, artifact)
     assert artifact.with_suffix(".contract.json").read_text(encoding="utf-8") == "foreign"
     assert not artifact.with_suffix(".contract.md").exists()
+    markers = list(tmp_path.glob(".manwe-contract-*.in-progress"))
+    assert len(markers) == 1
+    assert (markers[0].stat().st_mode & 0o777) == 0o700
+    assert (markers[0] / "contract.json").is_file()
+    assert (markers[0] / "contract.md").is_file()
 
 
-def test_save_contract_detects_same_inode_sidecar_tampering(tmp_path, monkeypatch):
+def test_save_contract_preserves_same_inode_tampering_and_recovery_marker(tmp_path, monkeypatch):
     from manwe.export import contract as contract_module
 
     artifact = tmp_path / "model.onnx"
     artifact.write_bytes(b"model")
     contract = _build_contract(artifact)
-    real_write = contract_module._write_text_exclusive
+    real_link = contract_module._link_staged_sidecar
 
-    def mutate_json_after_write(path, value, **kwargs):
-        publication = real_write(path, value, **kwargs)
-        if path.suffix == ".json":
-            path.write_text("tampered", encoding="utf-8")
-        return publication
+    def mutate_json_after_link(stage_fd, stage_name, parent_fd, final_name):
+        real_link(stage_fd, stage_name, parent_fd, final_name)
+        if stage_name == contract_module._STAGE_JSON:
+            fd = os.open(final_name, os.O_WRONLY | os.O_TRUNC, dir_fd=parent_fd)
+            with os.fdopen(fd, "wb") as handle:
+                handle.write(b"tampered")
+                handle.flush()
+                os.fsync(handle.fileno())
 
-    monkeypatch.setattr(contract_module, "_write_text_exclusive", mutate_json_after_write)
+    monkeypatch.setattr(contract_module, "_link_staged_sidecar", mutate_json_after_link)
     with pytest.raises(RuntimeError, match="modified"):
         save_contract(contract, artifact)
-    assert not artifact.with_suffix(".contract.json").exists()
+    assert artifact.with_suffix(".contract.json").read_bytes() == b"tampered"
     assert not artifact.with_suffix(".contract.md").exists()
+    assert len(list(tmp_path.glob(".manwe-contract-*.in-progress"))) == 1
+
+
+def test_save_contract_second_link_collision_preserves_partial_publication(tmp_path, monkeypatch):
+    from manwe.export import contract as contract_module
+
+    artifact = tmp_path / "model.onnx"
+    artifact.write_bytes(b"model")
+    contract = _build_contract(artifact)
+    real_link = contract_module._link_staged_sidecar
+
+    def occupy_markdown_before_link(stage_fd, stage_name, parent_fd, final_name):
+        if stage_name == contract_module._STAGE_MARKDOWN:
+            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+            fd = os.open(final_name, flags, 0o644, dir_fd=parent_fd)
+            with os.fdopen(fd, "wb") as handle:
+                handle.write(b"foreign-markdown")
+                handle.flush()
+                os.fsync(handle.fileno())
+        real_link(stage_fd, stage_name, parent_fd, final_name)
+
+    monkeypatch.setattr(contract_module, "_link_staged_sidecar", occupy_markdown_before_link)
+    with pytest.raises(FileExistsError):
+        save_contract(contract, artifact)
+    assert artifact.with_suffix(".contract.json").read_text(encoding="utf-8") == contract.to_json()
+    assert artifact.with_suffix(".contract.md").read_bytes() == b"foreign-markdown"
+    markers = list(tmp_path.glob(".manwe-contract-*.in-progress"))
+    assert len(markers) == 1
+    assert (markers[0] / "contract.json").is_file()
+    assert (markers[0] / "contract.md").is_file()
+
+
+def test_save_contract_cleanup_refuses_replaced_staged_entry(tmp_path, monkeypatch):
+    from manwe.export import contract as contract_module
+
+    artifact = tmp_path / "model.onnx"
+    artifact.write_bytes(b"model")
+    contract = _build_contract(artifact)
+    real_cleanup = contract_module._cleanup_private_stage
+
+    def replace_json_before_cleanup(
+        parent_fd,
+        stage_fd,
+        stage_name,
+        stage_identity,
+        publications,
+        commit_boundary,
+    ):
+        os.unlink(contract_module._STAGE_JSON, dir_fd=stage_fd)
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        fd = os.open(contract_module._STAGE_JSON, flags, 0o600, dir_fd=stage_fd)
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(b"foreign-stage-entry")
+            handle.flush()
+            os.fsync(handle.fileno())
+        return real_cleanup(
+            parent_fd,
+            stage_fd,
+            stage_name,
+            stage_identity,
+            publications,
+            commit_boundary,
+        )
+
+    monkeypatch.setattr(contract_module, "_cleanup_private_stage", replace_json_before_cleanup)
+    with pytest.raises(RuntimeError, match="staging cleanup failed"):
+        save_contract(contract, artifact)
+    assert artifact.with_suffix(".contract.json").read_text(encoding="utf-8") == contract.to_json()
+    assert artifact.with_suffix(".contract.md").is_file()
+    markers = list(tmp_path.glob(".manwe-contract-*.in-progress"))
+    assert len(markers) == 1
+    assert (markers[0] / "contract.json").read_bytes() == b"foreign-stage-entry"
+
+
+def test_save_contract_revalidates_final_paths_before_marker_removal(tmp_path, monkeypatch):
+    from manwe.export import contract as contract_module
+
+    artifact = tmp_path / "model.onnx"
+    artifact.write_bytes(b"model")
+    contract = _build_contract(artifact)
+    real_cleanup = contract_module._cleanup_private_stage
+
+    def replace_final_before_cleanup(
+        parent_fd,
+        stage_fd,
+        stage_name,
+        stage_identity,
+        publications,
+        commit_boundary,
+    ):
+        json_path = artifact.with_suffix(".contract.json")
+        json_path.unlink()
+        json_path.write_bytes(b"foreign-final")
+        return real_cleanup(
+            parent_fd,
+            stage_fd,
+            stage_name,
+            stage_identity,
+            publications,
+            commit_boundary,
+        )
+
+    monkeypatch.setattr(contract_module, "_cleanup_private_stage", replace_final_before_cleanup)
+    with pytest.raises(RuntimeError, match="manual recovery"):
+        save_contract(contract, artifact)
+    assert artifact.with_suffix(".contract.json").read_bytes() == b"foreign-final"
+    assert artifact.with_suffix(".contract.md").is_file()
+    markers = list(tmp_path.glob(".manwe-contract-*.in-progress"))
+    assert len(markers) == 1
+    assert (markers[0] / "contract.json").is_file()
+    assert (markers[0] / "contract.md").is_file()
+
+
+def test_save_contract_reports_indeterminate_marker_removal_sync(tmp_path, monkeypatch):
+    from manwe.export import contract as contract_module
+
+    artifact = tmp_path / "model.onnx"
+    artifact.write_bytes(b"model")
+    contract = _build_contract(artifact)
+    monkeypatch.setattr(contract_module, "_sync_parent_after_marker_removal", lambda _fd: False)
+
+    with pytest.raises(RuntimeError, match="commit state is indeterminate"):
+        save_contract(contract, artifact)
+    assert artifact.with_suffix(".contract.json").read_text(encoding="utf-8") == contract.to_json()
+    assert artifact.with_suffix(".contract.md").is_file()
+    assert not list(tmp_path.glob(".manwe-contract-*.in-progress"))
+
+
+def test_save_contract_revalidates_parent_path_before_marker_removal(tmp_path, monkeypatch):
+    from manwe.export import contract as contract_module
+
+    parent = tmp_path / "publish"
+    parent.mkdir()
+    moved_parent = tmp_path / "moved-publish"
+    artifact = parent / "model.onnx"
+    artifact.write_bytes(b"model")
+    contract = _build_contract(artifact)
+    real_cleanup = contract_module._cleanup_private_stage
+
+    def replace_parent_before_cleanup(
+        parent_fd,
+        stage_fd,
+        stage_name,
+        stage_identity,
+        publications,
+        commit_boundary,
+    ):
+        parent.rename(moved_parent)
+        parent.mkdir()
+        (parent / "foreign.txt").write_bytes(b"foreign")
+        return real_cleanup(
+            parent_fd,
+            stage_fd,
+            stage_name,
+            stage_identity,
+            publications,
+            commit_boundary,
+        )
+
+    monkeypatch.setattr(contract_module, "_cleanup_private_stage", replace_parent_before_cleanup)
+    with pytest.raises(RuntimeError, match="manual recovery"):
+        save_contract(contract, artifact)
+    assert (parent / "foreign.txt").read_bytes() == b"foreign"
+    assert (moved_parent / "model.onnx").read_bytes() == b"model"
+    assert (moved_parent / "model.contract.json").is_file()
+    assert (moved_parent / "model.contract.md").is_file()
+    markers = list(moved_parent.glob(".manwe-contract-*.in-progress"))
+    assert len(markers) == 1
+    assert (markers[0] / "contract.json").is_file()
+    assert (markers[0] / "contract.md").is_file()
+
+
+def test_save_contract_revalidates_artifact_before_marker_removal(tmp_path, monkeypatch):
+    from manwe.export import contract as contract_module
+
+    artifact = tmp_path / "model.onnx"
+    artifact.write_bytes(b"model")
+    contract = _build_contract(artifact)
+    real_cleanup = contract_module._cleanup_private_stage
+
+    def replace_artifact_before_cleanup(
+        parent_fd,
+        stage_fd,
+        stage_name,
+        stage_identity,
+        publications,
+        commit_boundary,
+    ):
+        artifact.unlink()
+        artifact.write_bytes(b"foreign-artifact")
+        return real_cleanup(
+            parent_fd,
+            stage_fd,
+            stage_name,
+            stage_identity,
+            publications,
+            commit_boundary,
+        )
+
+    monkeypatch.setattr(
+        contract_module,
+        "_cleanup_private_stage",
+        replace_artifact_before_cleanup,
+    )
+    with pytest.raises(RuntimeError, match="manual recovery"):
+        save_contract(contract, artifact)
+    assert artifact.read_bytes() == b"foreign-artifact"
+    assert artifact.with_suffix(".contract.json").is_file()
+    assert artifact.with_suffix(".contract.md").is_file()
+    markers = list(tmp_path.glob(".manwe-contract-*.in-progress"))
+    assert len(markers) == 1
+    assert (markers[0] / "contract.json").is_file()
+    assert (markers[0] / "contract.md").is_file()
 
 
 def test_save_contract_parent_replacement_cannot_redirect_sidecars(tmp_path, monkeypatch):
@@ -314,30 +540,30 @@ def test_save_contract_parent_replacement_cannot_redirect_sidecars(tmp_path, mon
     artifact = parent / "model.onnx"
     artifact.write_bytes(b"model")
     contract = _build_contract(artifact)
-    real_write = contract_module._write_text_exclusive
+    real_link = contract_module._link_staged_sidecar
     replaced = False
 
-    def replace_parent_after_first_write(path, value, **kwargs):
+    def replace_parent_after_first_link(stage_fd, stage_name, parent_fd, final_name):
         nonlocal replaced
-        publication = real_write(path, value, **kwargs)
+        real_link(stage_fd, stage_name, parent_fd, final_name)
         if not replaced:
             parent.rename(moved_parent)
             parent.mkdir()
             (parent / "foreign.txt").write_text("foreign", encoding="utf-8")
             replaced = True
-        return publication
 
     monkeypatch.setattr(
         contract_module,
-        "_write_text_exclusive",
-        replace_parent_after_first_write,
+        "_link_staged_sidecar",
+        replace_parent_after_first_link,
     )
     with pytest.raises(RuntimeError, match="parent was replaced"):
         save_contract(contract, artifact)
     assert (parent / "foreign.txt").read_text(encoding="utf-8") == "foreign"
     assert (moved_parent / "model.onnx").read_bytes() == b"model"
-    assert not (moved_parent / "model.contract.json").exists()
+    assert (moved_parent / "model.contract.json").is_file()
     assert not (moved_parent / "model.contract.md").exists()
+    assert len(list(moved_parent.glob(".manwe-contract-*.in-progress"))) == 1
 
 
 def test_contract_markdown_escapes_raw_html(tmp_path):

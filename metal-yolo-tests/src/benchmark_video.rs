@@ -8,7 +8,7 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::{
-    atomic::{AtomicBool, AtomicU64, Ordering},
+    atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering},
     Arc, Mutex,
 };
 use std::thread;
@@ -250,9 +250,47 @@ impl ChildGuard {
     }
 }
 
+struct PipelineDeadlineState {
+    value: AtomicU8,
+}
+
+impl PipelineDeadlineState {
+    const PENDING: u8 = 0;
+    const CANCELLED: u8 = 1;
+    const TIMED_OUT: u8 = 2;
+
+    fn new() -> Self {
+        Self {
+            value: AtomicU8::new(Self::PENDING),
+        }
+    }
+
+    fn is_pending(&self) -> bool {
+        self.value.load(Ordering::Acquire) == Self::PENDING
+    }
+
+    fn cancel(&self) -> bool {
+        self.claim(Self::CANCELLED)
+    }
+
+    fn claim_timeout(&self) -> bool {
+        self.claim(Self::TIMED_OUT)
+    }
+
+    fn timed_out(&self) -> bool {
+        self.value.load(Ordering::Acquire) == Self::TIMED_OUT
+    }
+
+    fn claim(&self, outcome: u8) -> bool {
+        self.value
+            .compare_exchange(Self::PENDING, outcome, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+}
+
 struct PipelineDeadlineWatchdog {
-    stop: Arc<AtomicBool>,
-    timed_out: Arc<AtomicBool>,
+    deadline: Instant,
+    state: Arc<PipelineDeadlineState>,
     handle: Option<thread::JoinHandle<()>>,
 }
 
@@ -263,17 +301,17 @@ impl PipelineDeadlineWatchdog {
         input: ChildTerminator,
         output: Option<ChildTerminator>,
     ) -> Self {
-        let stop = Arc::new(AtomicBool::new(false));
-        let timed_out = Arc::new(AtomicBool::new(false));
-        let watch_stop = Arc::clone(&stop);
-        let watch_timed_out = Arc::clone(&timed_out);
+        let state = Arc::new(PipelineDeadlineState::new());
+        let watch_state = Arc::clone(&state);
         let handle = thread::spawn(move || loop {
-            if watch_stop.load(Ordering::Acquire) {
+            if !watch_state.is_pending() {
                 return;
             }
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
-                watch_timed_out.store(true, Ordering::Release);
+                if !watch_state.claim_timeout() {
+                    return;
+                }
                 running.store(false, Ordering::Release);
                 if let Some(output) = &output {
                     output.terminate();
@@ -284,24 +322,29 @@ impl PipelineDeadlineWatchdog {
             thread::sleep(remaining.min(Duration::from_millis(50)));
         });
         Self {
-            stop,
-            timed_out,
+            deadline,
+            state,
             handle: Some(handle),
         }
     }
 
     fn finish(mut self) -> bool {
-        self.stop.store(true, Ordering::Release);
+        // A completion observed before the deadline cancels the watchdog. Once
+        // the deadline has passed, leave it armed so a delayed watchdog thread
+        // still records the timeout and terminates the child processes.
+        if Instant::now() < self.deadline {
+            self.state.cancel();
+        }
         if let Some(handle) = self.handle.take() {
             let _ = handle.join();
         }
-        self.timed_out.load(Ordering::Acquire)
+        self.state.timed_out()
     }
 }
 
 impl Drop for PipelineDeadlineWatchdog {
     fn drop(&mut self) {
-        self.stop.store(true, Ordering::Release);
+        self.state.cancel();
         if let Some(handle) = self.handle.take() {
             let _ = handle.join();
         }
@@ -612,7 +655,7 @@ fn main() -> anyhow::Result<()> {
 
     // 1. Load Model
     let device = Device::new_metal(0)?;
-    println!("Loading Model on {:?}...", device);
+    println!("Loading Model on {device:?}...");
 
     let model_path = &args.model;
     if model_path.extension().and_then(|ext| ext.to_str()) != Some("safetensors") {
@@ -715,7 +758,7 @@ fn main() -> anyhow::Result<()> {
                 "-pix_fmt",
                 "rgb24",
                 "-s",
-                &format!("{}x{}", INPUT_W, INPUT_H),
+                &format!("{INPUT_W}x{INPUT_H}"),
                 "-r",
                 &format!("{output_fps}"),
                 "-i",
@@ -979,7 +1022,7 @@ fn main() -> anyhow::Result<()> {
             }
 
             if frames_processed.is_multiple_of(100) {
-                println!("[Rust] Processed {} frames...", frames_processed);
+                println!("[Rust] Processed {frames_processed} frames...");
             }
         }
         Ok(())
@@ -1132,13 +1175,7 @@ fn main() -> anyhow::Result<()> {
     evidence.publish(&results, authenticated_output_video.as_ref())?;
 
     println!(
-        "[Rust Candle] FPS: {:.2} | Infer: {:.1}ms (preprocess/upload+sync: {:.1}ms, forward+sync: {:.1}ms) | Pipe->forward: {:.1}ms avg | Processed-frame read wait: {:.1}ms",
-        processed_fps,
-        avg_infer,
-        avg_preprocess_upload_sync,
-        avg_model_forward_sync,
-        avg_lat,
-        avg_frame_read_wait
+        "[Rust Candle] FPS: {processed_fps:.2} | Infer: {avg_infer:.1}ms (preprocess/upload+sync: {avg_preprocess_upload_sync:.1}ms, forward+sync: {avg_model_forward_sync:.1}ms) | Pipe->forward: {avg_lat:.1}ms avg | Processed-frame read wait: {avg_frame_read_wait:.1}ms"
     );
 
     Ok(())
@@ -1155,6 +1192,19 @@ mod tests {
             std::process::id(),
             std::thread::current().id()
         ))
+    }
+
+    fn blocking_child() -> ChildGuard {
+        let child = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "tests::child_guard_blocking_helper"])
+            .env_clear()
+            .env("MANWE_BENCHMARK_CHILD_GUARD_TEST", "1")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        ChildGuard::new(child)
     }
 
     #[test]
@@ -1324,28 +1374,57 @@ mod tests {
 
     #[test]
     fn pipeline_deadline_terminates_a_blocked_child() {
-        let child = Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", "tests::child_guard_blocking_helper"])
-            .env_clear()
-            .env("MANWE_BENCHMARK_CHILD_GUARD_TEST", "1")
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap();
-        let child = ChildGuard::new(child);
+        let child = blocking_child();
         let running = Arc::new(AtomicBool::new(true));
         let watchdog = PipelineDeadlineWatchdog::spawn(
-            Instant::now() + Duration::from_millis(20),
+            Instant::now(),
             Arc::clone(&running),
             child.terminator(),
             None,
         );
-        thread::sleep(Duration::from_millis(100));
 
         assert!(watchdog.finish());
         assert!(!running.load(Ordering::Acquire));
+        assert!(child.child.lock().unwrap().is_none());
         drop(child);
+    }
+
+    #[test]
+    fn pipeline_completion_before_deadline_cancels_the_watchdog() {
+        let child = blocking_child();
+        let running = Arc::new(AtomicBool::new(true));
+        let watchdog = PipelineDeadlineWatchdog::spawn(
+            Instant::now() + Duration::from_secs(MAX_BENCHMARK_DURATION_SECONDS),
+            Arc::clone(&running),
+            child.terminator(),
+            None,
+        );
+
+        assert!(!watchdog.finish());
+        assert!(running.load(Ordering::Acquire));
+        assert!(child.child.lock().unwrap().is_some());
+        drop(child);
+    }
+
+    #[test]
+    fn pipeline_cancellation_wins_after_worker_observes_pending() {
+        let state = PipelineDeadlineState::new();
+
+        // Force the former race ordering without depending on thread scheduling:
+        // worker observes pending, finish cancels, then worker claims timeout.
+        let worker_observed_pending = state.is_pending();
+        let cancellation_claimed = state.cancel();
+        let timeout_claimed = state.claim_timeout();
+
+        assert_eq!(
+            (
+                worker_observed_pending,
+                cancellation_claimed,
+                timeout_claimed,
+                state.timed_out(),
+            ),
+            (true, true, false, false)
+        );
     }
 
     #[test]

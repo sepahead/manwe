@@ -335,8 +335,8 @@ fn main() -> anyhow::Result<()> {
     println!();
     println!("Configuration:");
     println!("  Images: {}", args.num_images);
-    println!("  Run ID: {}", run_id);
-    println!("  Warmup: {} iterations", WARMUP_ITERATIONS);
+    println!("  Run ID: {run_id}");
+    println!("  Warmup: {WARMUP_ITERATIONS} iterations");
     println!();
 
     // This crate produces Metal evidence; changing backend invalidates the run.
@@ -361,7 +361,7 @@ fn main() -> anyhow::Result<()> {
 
     // Load and preprocess images
     let image_dir = args.image_dir;
-    println!("Loading images from {:?}...", image_dir);
+    println!("Loading images from {image_dir:?}...");
 
     let mut images: Vec<SelectedImage> = Vec::new();
     let all_entries = fs::read_dir(&image_dir)?
@@ -420,7 +420,7 @@ fn main() -> anyhow::Result<()> {
     println!();
 
     // Warmup phase - compile Metal shaders and warm caches
-    println!("Warming up ({} iterations)...", WARMUP_ITERATIONS);
+    println!("Warming up ({WARMUP_ITERATIONS} iterations)...");
     let first_img = load_selected_image(&images[0])?;
     for _ in 0..WARMUP_ITERATIONS {
         let img_dev = first_img.to_device(&device)?;
@@ -463,44 +463,17 @@ fn main() -> anyhow::Result<()> {
     println!("╔══════════════════════════════════════════════════════════╗");
     println!("║                        RESULTS                           ║");
     println!("╠══════════════════════════════════════════════════════════╣");
-    println!(
-        "║ Images processed: {:>6}                                 ║",
-        num_images
-    );
-    println!(
-        "║ Total time:       {:>6.2} s                               ║",
-        total_time_s
-    );
-    println!(
-        "║ Average FPS:      {:>6.2}                                 ║",
-        fps
-    );
-    println!(
-        "║ Avg latency:      {:>6.2} ms                              ║",
-        avg_latency
-    );
+    println!("║ Images processed: {num_images:>6}                                 ║");
+    println!("║ Total time:       {total_time_s:>6.2} s                               ║");
+    println!("║ Average FPS:      {fps:>6.2}                                 ║");
+    println!("║ Avg latency:      {avg_latency:>6.2} ms                              ║");
     println!("╠══════════════════════════════════════════════════════════╣");
     println!("║ Latency Percentiles:                                     ║");
-    println!(
-        "║   Min (best):     {:>6.2} ms                              ║",
-        min_latency
-    );
-    println!(
-        "║   P1:             {:>6.2} ms                              ║",
-        p1_latency
-    );
-    println!(
-        "║   P50 (median):   {:>6.2} ms                              ║",
-        p50_latency
-    );
-    println!(
-        "║   P99:            {:>6.2} ms                              ║",
-        p99_latency
-    );
-    println!(
-        "║   Max (worst):    {:>6.2} ms                              ║",
-        max_latency
-    );
+    println!("║   Min (best):     {min_latency:>6.2} ms                              ║");
+    println!("║   P1:             {p1_latency:>6.2} ms                              ║");
+    println!("║   P50 (median):   {p50_latency:>6.2} ms                              ║");
+    println!("║   P99:            {p99_latency:>6.2} ms                              ║");
+    println!("║   Max (worst):    {max_latency:>6.2} ms                              ║");
     println!("╚══════════════════════════════════════════════════════════╝");
 
     // Save results to JSON

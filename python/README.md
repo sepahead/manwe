@@ -52,6 +52,18 @@ Raw export also requires an unoccupied caller-selected destination and returns a
 TensorRT INT8 export additionally copies the bounded calibration tree into a
 read-only private snapshot, binds that exact tree plus normalized manifest in the
 receipt digest, and rechecks the caller-visible source before publication.
+Contract JSON/Markdown sidecars use an adjacent private
+`.manwe-contract-*.in-progress` stage and no-replace hard links. If publication
+fails after either final link appears, Manwe deliberately preserves the final paths;
+failures detected before marker removal also preserve the marker for manual recovery.
+A successful return requires both final links to be durable and verified and the
+private marker removal to be synced. Authenticated cleanup failure preserves the
+marker and reports an error; its commit check revalidates the parent path, signed
+artifact, and both final sidecars immediately before removal. A parent-fsync failure
+after marker removal reports an indeterminate commit instead: finals are retained,
+the marker is currently absent, and a crash may restore it. Manwe never cleans final
+pathnames; active same-UID races against private-stage cleanup are outside the POSIX
+boundary.
 
 RF-DETR's upstream `train` extra currently installs both `opencv-python` and
 `opencv-python-headless`, which overwrite the same `cv2` package. Manwe therefore
