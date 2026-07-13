@@ -18,7 +18,7 @@ _NETWORK_INTEGRATIONS = (
     "raytune",
     "wandb",
 )
-_VETTED_ULTRALYTICS_VERSION = "8.4.91"
+_VETTED_ULTRALYTICS_VERSION = "8.4.92"
 
 
 def _blocked_download(*_args, **_kwargs):

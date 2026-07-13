@@ -2,24 +2,30 @@
 name = "manwe-benchmarks"
 version = "0.2.0-alpha.1"
 edition = "2021"
-rust-version = "1.88"
+# Keep synchronized with the root crate's floor, which Bevy 0.19 sets at 1.95.
+rust-version = "1.95"
 license = "MIT"
 publish = false
 autobins = false
 
 [dependencies]
 anyhow = "1.0"
-# Keep this synchronized with the root crate's MSRV-compatible Candle line.
-candle = { package = "candle-core", version = "0.9.2", default-features = false, features = ["metal"] }
-candle-nn = { version = "0.9.2", default-features = false, features = ["metal"] }
-candle-transformers = { version = "0.9.2", default-features = false, features = ["metal"] }
-clap = { version = "=4.5.57", features = ["derive"] }
+# Keep this synchronized with the root crate's Candle line; this crate path-depends
+# on the root crate, so the two must move together.
+candle = { package = "candle-core", version = "0.11.0", default-features = false, features = ["metal"] }
+candle-nn = { version = "0.11.0", default-features = false, features = ["metal"] }
+candle-transformers = { version = "0.11.0", default-features = false, features = ["metal"] }
+# Exact, for the same reason as the root crate: clap moves its MSRV in minor
+# releases, and the two crates must agree on one parser build.
+clap = { version = "=4.6.1", features = ["derive"] }
 image = { version = "0.25.1", default-features = false, features = ["jpeg", "png"] }
-# Keep this on the root crate's Rust-1.88-compatible imageproc line.
-imageproc = { version = "0.25.1", default-features = false }
+# Matches the root crate's imageproc line. These binaries only draw rectangles, so
+# the `text` feature stays off here; the root crate enables it for detection labels.
+imageproc = { version = "0.27.0", default-features = false }
+# Digests come from `manwe::secure_io::sha256_hex`, the single audited renderer
+# shared with the root crate, so this crate no longer depends on `sha2` directly.
 manwe = { path = "..", version = "=0.2.0-alpha.1", features = ["metal"] }
 serde_json = "1.0"
-sha2 = "0.10"
 
 [[bin]]
 name = "performance_test"

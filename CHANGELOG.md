@@ -28,6 +28,32 @@ This is the first planned tagged alpha after the untagged Rust/Candle prototypes
   immutable evidence, bounds work, and removes incomparable legacy runners.
 - Camera URLs and model paths are supplied at runtime; credential-bearing values
   are no longer embedded or echoed by current source.
+- Raised the Rust floor from 1.88 to 1.95 across both crates, CI, and the docs.
+  Bevy 0.19 sets it (`rust-version = 1.95.0`, reached through the optional `viewer`
+  feature); Candle 0.11 independently needs 1.94 on aarch64 (`stdarch_neon_f16`,
+  stabilised in 1.94) and imageproc 0.27 needs 1.89 through its mandatory nalgebra
+  0.35. Cargo declares one floor per package, so the highest of the three wins.
+- The experimental camera viewer moved from Bevy 0.13 to Bevy 0.19 (required
+  components, the `Message` split, `Sprite`/`Camera2d`, and the `bevy_sprite_render`
+  feature split). `camera_view` now exits non-zero when Bevy reports
+  `AppExit::Error` instead of discarding it.
+- Upgraded Candle (core/nn/transformers) 0.9.2 to 0.11.0. No inference source
+  changed. Candle 0.11 rewrote its Metal backend onto `objc2-metal`; a full YOLOv8
+  forward pass was revalidated on the Metal device and is bit-identical to CPU.
+  Candle 0.11 takes a non-optional `tokenizers`/Oniguruma dependency that no feature
+  gate can drop, so builds now require a C toolchain and a larger cold build.
+- Upgraded imageproc 0.25.1 to 0.27.0 (text drawing moved behind a `text` feature,
+  now enabled explicitly) and clap 4.5.57 to 4.6.1. The exact clap pin is retained:
+  clap raised its own MSRV in a minor release, so a caret range could move the
+  compiler floor without a source change. CLI parsing is unchanged.
+- Upgraded sha2 0.10 to 0.11 (digest 0.11 / hybrid-array). Digest output no longer
+  implements `LowerHex`, so all five SHA-256 rendering sites now route through a
+  single audited `secure_io::sha256_hex`, pinned by known-answer vectors; the
+  benchmark crate no longer depends on `sha2` directly.
+- Upgraded the vetted Ultralytics runtime from 8.4.91 to 8.4.92.
+- Pinned CI to actions/checkout v7.0.0 and actions/setup-python v6.3.0 by commit
+  SHA. checkout v7 blocks fork-PR checkout under `pull_request_target` and
+  `workflow_run`; neither trigger is used here, so no opt-in is taken.
 
 ### Known alpha limits
 

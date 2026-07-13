@@ -11,14 +11,13 @@ use clap::{Parser, ValueEnum};
 use image::DynamicImage;
 use manwe::model::{Multiples, YoloV8, YoloV8Pose};
 use manwe::secure_io::{
-    open_bounded_regular_file, read_bounded_open_file, read_bounded_regular_file, BoundDirectory,
-    FileIdentity, MAX_ENCODED_IMAGE_BYTES, MAX_MODEL_BYTES,
+    open_bounded_regular_file, read_bounded_open_file, read_bounded_regular_file, sha256_hex,
+    BoundDirectory, FileIdentity, MAX_ENCODED_IMAGE_BYTES, MAX_MODEL_BYTES,
 };
 use manwe::{
     device, prepare_image, report_detect_with_output, report_pose_with_output, ImageTransform,
     ReportOutput,
 };
-use sha2::{Digest, Sha256};
 
 const MAX_OUTPUT_ATTEMPTS: u32 = 10_000;
 const MAX_OUTPUT_JPEG_BYTES: u64 = 256 * 1024 * 1024;
@@ -386,7 +385,7 @@ fn run<T: Task>(args: Args) -> Result<()> {
     };
     let model_path = args.model_path()?;
     let model_bytes = read_bounded_regular_file(model_path, MAX_MODEL_BYTES)?;
-    let actual_digest = format!("{:x}", Sha256::digest(&model_bytes));
+    let actual_digest = sha256_hex(&model_bytes);
     if actual_digest != args.model_sha256 {
         anyhow::bail!("model SHA-256 does not match the expected digest")
     }

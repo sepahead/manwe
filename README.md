@@ -69,7 +69,7 @@ Prerequisites for the alpha development workflow:
 - Python 3.10–3.14 for the core; Python 3.11–3.12 is the conservative heavy-ML
   path documented below.
 - [`uv` 0.11.28](https://docs.astral.sh/uv/getting-started/installation/), matching
-  CI, and Rust 1.88 or newer.
+  CI, and Rust 1.95 or newer.
 - Xcode/Metal tooling for the macOS feature path, an NVIDIA CUDA toolkit for the
   unvalidated CUDA feature, and FFmpeg for camera/video tools.
 

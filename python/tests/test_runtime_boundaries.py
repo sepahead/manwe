@@ -510,7 +510,10 @@ def test_ultralytics_policy_disables_install_network_and_analytics(monkeypatch):
         "ultralytics.utils.events": events_module,
     }.items():
         monkeypatch.setitem(sys.modules, name, module)
-    monkeypatch.setattr(policy.importlib.metadata, "version", lambda _name: "8.4.91")
+    # Track the policy's own constant rather than restating the version here, so a
+    # vetted-version bump cannot leave a stale duplicate behind in the tests.
+    vetted = policy._VETTED_ULTRALYTICS_VERSION
+    monkeypatch.setattr(policy.importlib.metadata, "version", lambda _name: vetted)
 
     policy.verify_ultralytics_policy()
     assert root.SETTINGS == {"sync": False, "hub": False}  # type: ignore[attr-defined]
@@ -518,6 +521,12 @@ def test_ultralytics_policy_disables_install_network_and_analytics(monkeypatch):
     assert events_module.events.enabled is False  # type: ignore[attr-defined]
     with pytest.raises(RuntimeError, match="network downloads are disabled"):
         downloads.safe_download("https://example.invalid/model.pt")  # type: ignore[attr-defined]
+
+    # The vetted-version gate is a safety control: an unvetted runtime must be
+    # rejected outright, never merely hardened.
+    monkeypatch.setattr(policy.importlib.metadata, "version", lambda _name: "8.4.0")
+    with pytest.raises(RuntimeError, match="not the vetted"):
+        policy.verify_ultralytics_policy()
 
 
 def test_logger_cannot_mutate_the_process_root_logger():

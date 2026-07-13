@@ -10,8 +10,8 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use bevy::app::AppExit;
+use bevy::asset::RenderAssetUsages;
 use bevy::prelude::*;
-use bevy::render::render_asset::RenderAssetUsages;
 use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
 use bevy::window::PrimaryWindow;
 use candle::{DType, Device};
@@ -20,12 +20,11 @@ use clap::Parser;
 use image::{DynamicImage, ImageBuffer, Rgb};
 use manwe::model::{Multiples, YoloV8};
 use manwe::secure_io::{
-    open_bounded_regular_file, read_bounded_open_file, resolve_executable, ResolvedExecutable,
-    MAX_MODEL_BYTES,
+    open_bounded_regular_file, read_bounded_open_file, resolve_executable, sha256_hex,
+    ResolvedExecutable, MAX_MODEL_BYTES,
 };
 use manwe::stream_url::{validate_rtsp_url, INVALID_RTSP_URL};
 use manwe::{device, prepare_image, report_detect};
-use sha2::{Digest, Sha256};
 
 const MAX_STREAMS: usize = 8;
 const MAX_FRAME_PIXELS: usize = 16_777_216;
@@ -358,7 +357,9 @@ fn main() -> Result<()> {
     let model_bytes =
         load_verified_model_bytes(&args.model, &args.model_sha256, pixels, stream_count)?;
 
-    App::new()
+    // Bevy 0.14 made `App::run` return the terminal `AppExit`; surface a failing
+    // exit instead of discarding it.
+    let exit = App::new()
         .add_plugins(DefaultPlugins)
         .insert_resource(args)
         .insert_resource(FfmpegExecutable(ffmpeg))
@@ -374,6 +375,9 @@ fn main() -> Result<()> {
         .add_systems(Update, (layout_views, update_frame))
         .add_systems(Last, shutdown_workers)
         .run();
+    if let AppExit::Error(code) = exit {
+        anyhow::bail!("viewer exited with status {code}")
+    }
     Ok(())
 }
 
@@ -385,7 +389,9 @@ fn setup(
     frame_buffer: Res<FrameBuffer>,
     worker_control: Res<WorkerControl>,
 ) {
-    commands.spawn(Camera2dBundle::default());
+    // Bevy 0.15 replaced bundles with required components: `Camera2d` pulls in
+    // `Camera`, the orthographic projection, and the 2D render graph by itself.
+    commands.spawn(Camera2d);
 
     for (index, url) in args.urls.iter().cloned().enumerate() {
         let buffer = Arc::clone(&frame_buffer.frames);
@@ -428,7 +434,9 @@ fn setup(
     }
 
     for index in 0..args.urls.len() {
-        commands.spawn((SpriteBundle::default(), CameraView { index }));
+        // `Sprite` (0.15+) carries the texture handle and requires `Transform`
+        // and `Visibility`, replacing `SpriteBundle`.
+        commands.spawn((Sprite::default(), CameraView { index }));
     }
 }
 
@@ -573,7 +581,7 @@ fn load_verified_model_bytes(
         usize::try_from(identity.len()).context("model is too large for this host")?;
     validate_viewer_work(frame_pixels, streams, model_bytes)?;
     let bytes = read_bounded_open_file(&mut file, identity, path, MAX_MODEL_BYTES)?;
-    if format!("{:x}", Sha256::digest(&bytes)) != expected_sha256 {
+    if sha256_hex(&bytes) != expected_sha256 {
         anyhow::bail!("model SHA-256 does not match the expected digest")
     }
     Ok(bytes)
@@ -615,8 +623,10 @@ fn sleep_while_running(running: &AtomicBool, duration: Duration) -> bool {
     false
 }
 
-fn shutdown_workers(mut exit_events: EventReader<AppExit>, control: Res<WorkerControl>) {
-    if exit_events.read().next().is_none() {
+// Bevy 0.17 split buffered events out of `Event` into `Message`; `AppExit` is a
+// message, so it is drained with a `MessageReader` instead of an `EventReader`.
+fn shutdown_workers(mut exit_messages: MessageReader<AppExit>, control: Res<WorkerControl>) {
+    if exit_messages.read().next().is_none() {
         return;
     }
     control.running.store(false, Ordering::Release);
@@ -634,7 +644,7 @@ fn shutdown_workers(mut exit_events: EventReader<AppExit>, control: Res<WorkerCo
 fn update_frame(
     frame_buffer: Res<FrameBuffer>,
     mut images: ResMut<Assets<Image>>,
-    mut query: Query<(&CameraView, &mut Handle<Image>)>,
+    mut query: Query<(&CameraView, &mut Sprite)>,
 ) {
     let pending = {
         let Ok(mut frames) = frame_buffer.frames.lock() else {
@@ -647,7 +657,7 @@ fn update_frame(
             .collect::<Vec<_>>()
     };
 
-    for (view, mut handle) in &mut query {
+    for (view, mut sprite) in &mut query {
         let Some((_, frame)) = pending.iter().find(|(index, _)| *index == view.index) else {
             continue;
         };
@@ -665,11 +675,14 @@ fn update_frame(
             TextureFormat::Rgba8UnormSrgb,
             RenderAssetUsages::MAIN_WORLD | RenderAssetUsages::RENDER_WORLD,
         );
-        if let Some(existing) = images.get_mut(&*handle) {
+        // `Assets::get_mut` now hands back a change-tracking `AssetMut` guard that
+        // borrows `images` until it is dropped, so the in-place update has to be
+        // scoped before the fallback insert can borrow `images` again.
+        if let Some(mut existing) = images.get_mut(&sprite.image) {
             *existing = image;
-        } else {
-            *handle = images.add(image);
+            continue;
         }
+        sprite.image = images.add(image);
     }
 }
 
@@ -678,7 +691,8 @@ fn layout_views(
     windows: Query<&Window, With<PrimaryWindow>>,
     mut views: Query<(&CameraView, &mut Transform)>,
 ) {
-    let Ok(window) = windows.get_single() else {
+    // `Query::get_single` was renamed to `Query::single` (returning `Result`).
+    let Ok(window) = windows.single() else {
         return;
     };
     let placements = grid_placements(

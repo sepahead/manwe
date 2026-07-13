@@ -35,7 +35,7 @@ Both remaining executables:
 - reserve each run in a private staging directory, publish with no-replace hard
   links, and remove staging after ordinary failures that occur before publication;
 - refuse to replace existing JSON or video evidence; and
-- build from the checked-in lockfile with Rust 1.88 or newer.
+- build from the checked-in lockfile with Rust 1.95 or newer.
 
 The model architecture is the repository's fixed YOLOv8-small, 80-class graph.
 A valid safetensors container with different keys or shapes is rejected while the

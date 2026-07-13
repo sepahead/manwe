@@ -18,6 +18,35 @@ pub const MAX_VIDEO_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 /// Maximum accepted executable size for a verified child-process boundary (1 GiB).
 pub const MAX_EXECUTABLE_BYTES: u64 = 1024 * 1024 * 1024;
 
+/// Lowercase hexadecimal alphabet for every digest this workspace renders.
+const HEX_LOWER: [u8; 16] = *b"0123456789abcdef";
+
+/// Render bytes as lowercase, zero-padded hexadecimal.
+///
+/// `digest` 0.11 moved fixed-size outputs from `generic-array` to `hybrid-array`,
+/// which deliberately does not implement `LowerHex`. This reproduces exactly what
+/// the previous `format!("{:x}", ..)` emitted: two lowercase digits per byte, most
+/// significant nibble first, zero-padded, never truncated. Digests are compared for
+/// equality against operator-supplied values, so the rendering is load-bearing and
+/// is pinned by known-answer tests below.
+fn hex_lower(bytes: &[u8]) -> String {
+    let mut encoded = String::with_capacity(bytes.len().saturating_mul(2));
+    for &byte in bytes {
+        encoded.push(char::from(HEX_LOWER[usize::from(byte >> 4)]));
+        encoded.push(char::from(HEX_LOWER[usize::from(byte & 0x0f)]));
+    }
+    encoded
+}
+
+/// Hash an in-memory buffer and render the digest as lowercase hexadecimal.
+///
+/// Every SHA-256 the workspace compares against an expected digest must be rendered
+/// identically, so callers use this rather than formatting a `sha2` output directly.
+#[must_use]
+pub fn sha256_hex(bytes: &[u8]) -> String {
+    hex_lower(&Sha256::digest(bytes))
+}
+
 /// Opaque identity of one opened regular file.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct FileIdentity {
@@ -391,7 +420,7 @@ pub fn sha256_bounded_open_file(
     }
     file.rewind()
         .with_context(|| format!("failed to rewind {}", path.display()))?;
-    Ok(format!("{:x}", hasher.finalize()))
+    Ok(hex_lower(&hasher.finalize()))
 }
 
 /// Fail if a path no longer identifies the previously opened regular file.
@@ -569,10 +598,59 @@ mod tests {
 
         assert_eq!(first, second);
         assert_eq!(bytes, b"authenticated bytes");
+        assert_eq!(first, sha256_hex(b"authenticated bytes"));
         assert_eq!(
             first,
-            format!("{:x}", Sha256::digest(b"authenticated bytes"))
+            "4a79516c84b8144eb7ba196298962abd826363a6481cb4a9dacba815610dacf7"
         );
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// Pin the digest rendering against vectors computed by an independent
+    /// implementation. A silently wrong encoder here would break every integrity
+    /// check in the workspace, so these must never be relaxed to self-comparison.
+    #[test]
+    fn sha256_hex_matches_known_answer_vectors() {
+        assert_eq!(
+            sha256_hex(b""),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+        assert_eq!(
+            sha256_hex(b"abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        // A digest whose leading byte is 0x00: catches an encoder that drops
+        // zero padding and would otherwise emit 63 characters.
+        let leading_zero = sha256_hex(b"manwe-131");
+        assert_eq!(
+            leading_zero,
+            "0098e64429590bbae80de3cd7430d4b8460bdf1f1335546e519877adb293d784"
+        );
+        assert_eq!(leading_zero.len(), 64);
+        assert!(leading_zero
+            .chars()
+            .all(|character| character.is_ascii_digit() || ('a'..='f').contains(&character)));
+    }
+
+    /// The streaming path must agree with the one-shot digest across the internal
+    /// 64 KiB buffer boundary, so a partial `update` loop cannot go unnoticed.
+    #[test]
+    fn streamed_hashing_matches_the_one_shot_digest_across_buffer_boundaries() {
+        let directory = test_directory("streaming-hash");
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir(&directory).unwrap();
+
+        for length in [1_usize, 65_535, 65_536, 65_537, 200_000] {
+            let path = directory.join(format!("artifact-{length}.bin"));
+            let contents: Vec<u8> = (0..length).map(|index| (index % 251) as u8).collect();
+            std::fs::write(&path, &contents).unwrap();
+
+            let (streamed, identity) = sha256_bounded_regular_file(&path, 1 << 20).unwrap();
+
+            assert_eq!(streamed, sha256_hex(&contents));
+            assert_eq!(identity.len(), length as u64);
+            std::fs::remove_file(&path).unwrap();
+        }
         std::fs::remove_dir_all(directory).unwrap();
     }
 

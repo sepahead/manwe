@@ -27,11 +27,10 @@ use manwe::model::{Multiples, YoloV8};
 use manwe::prepare_image;
 use manwe::secure_io::{
     open_bounded_regular_file, read_bounded_open_file, read_bounded_regular_file,
-    read_bounded_regular_file_with_identity, BoundDirectory, FileIdentity, MAX_ENCODED_IMAGE_BYTES,
-    MAX_MODEL_BYTES,
+    read_bounded_regular_file_with_identity, sha256_hex, BoundDirectory, FileIdentity,
+    MAX_ENCODED_IMAGE_BYTES, MAX_MODEL_BYTES,
 };
 use serde_json::json;
-use sha2::{Digest, Sha256};
 
 /// Benchmark configuration.
 const WARMUP_ITERATIONS: usize = 10;
@@ -111,7 +110,7 @@ fn load_selected_image(selected: &SelectedImage) -> anyhow::Result<Tensor> {
             selected.path.display()
         )
     }
-    let digest = format!("{:x}", Sha256::digest(&bytes));
+    let digest = sha256_hex(&bytes);
     if digest != selected.sha256 {
         anyhow::bail!(
             "benchmark input changed during the run: {}",
@@ -350,7 +349,7 @@ fn main() -> anyhow::Result<()> {
         anyhow::bail!("model must have a .safetensors extension")
     }
     let model_bytes = read_bounded_regular_file(&model_path, MAX_MODEL_BYTES)?;
-    let model_sha256 = format!("{:x}", Sha256::digest(&model_bytes));
+    let model_sha256 = sha256_hex(&model_bytes);
     if model_sha256 != args.model_sha256 {
         anyhow::bail!("model SHA-256 does not match the expected digest")
     }
@@ -402,7 +401,7 @@ fn main() -> anyhow::Result<()> {
         }
         images.push(SelectedImage {
             path,
-            sha256: format!("{:x}", Sha256::digest(&bytes)),
+            sha256: sha256_hex(&bytes),
             identity,
         });
     }

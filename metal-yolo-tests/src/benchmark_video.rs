@@ -17,10 +17,9 @@ use std::time::{Duration, Instant};
 use manwe::model::{Multiples, YoloV8};
 use manwe::secure_io::{
     ensure_file_identity, open_bounded_regular_file, read_bounded_open_file,
-    read_bounded_regular_file, resolve_executable, sha256_bounded_open_file, BoundDirectory,
-    FileIdentity, MAX_MODEL_BYTES, MAX_VIDEO_BYTES,
+    read_bounded_regular_file, resolve_executable, sha256_bounded_open_file, sha256_hex,
+    BoundDirectory, FileIdentity, MAX_MODEL_BYTES, MAX_VIDEO_BYTES,
 };
-use sha2::Digest;
 
 const NUM_CLASSES: usize = 80;
 const INPUT_W: usize = 640;
@@ -662,7 +661,7 @@ fn main() -> anyhow::Result<()> {
         anyhow::bail!("model must have a .safetensors extension")
     }
     let model_bytes = read_bounded_regular_file(model_path, MAX_MODEL_BYTES)?;
-    let model_sha256 = format!("{:x}", sha2::Sha256::digest(&model_bytes));
+    let model_sha256 = sha256_hex(&model_bytes);
     if model_sha256 != args.model_sha256 {
         anyhow::bail!("model SHA-256 does not match the expected digest")
     }

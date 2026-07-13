@@ -27,7 +27,7 @@ awareness), so failure modes and provenance matter as much as happy-path output.
 
 Use Python 3.10–3.14 for the core checks and `uv` 0.11.28, the exact resolver
 version pinned in CI. The optional heavy stack is conservatively documented for
-Python 3.11–3.12. Rust checks require Rust 1.88 or newer; Metal/viewer checks need
+Python 3.11–3.12. Rust checks require Rust 1.95 or newer; Metal/viewer checks need
 Apple tooling and CUDA checks need a target NVIDIA toolchain.
 
 ```bash
