@@ -56,7 +56,7 @@ def _build_contract(artifact, **overrides):
         opset=receipt.opset,
         source_classes=receipt.source_classes,
         inputs=(TensorSpec("images", [1, 3, 640, 640], "float32", "NCHW/RGB"),),
-        outputs=(TensorSpec("output", [1, 4 + num_classes, "A"], "float32"),),
+        outputs=(TensorSpec("output", [1, 4 + num_classes, 8400], "float32"),),
         preprocess="inspected fixture preprocessing",
         postprocess="inspected fixture postprocessing",
         failure_behavior="fixture-backed shape mismatch raises",

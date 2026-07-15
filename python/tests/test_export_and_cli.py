@@ -17,6 +17,66 @@ from manwe.export import (
     fidelity_report,
 )
 
+_SOURCE_CLASSES = ("drone", "bird", "aircraft", "helicopter", "unknown")
+
+
+def _export_pair(
+    tmp_path,
+    *,
+    manwe_format="onnx",
+    precision="float32",
+    embedded_nms=False,
+    end_to_end=False,
+    inputs=None,
+    outputs=None,
+):
+    suffix = {"onnx": ".onnx", "tensorrt": ".engine"}[manwe_format]
+    artifact = tmp_path / f"signature{suffix}"
+    artifact.write_bytes(b"signature fixture")
+    digest = hashlib.sha256(b"signature fixture").hexdigest()
+    receipt = ExportReceipt(
+        format=manwe_format,
+        artifact_path=str(artifact),
+        artifact_sha256=digest,
+        source_sha256="1" * 64,
+        source_suffix=".pt",
+        image_size=640,
+        precision=precision,
+        embedded_nms=embedded_nms,
+        opset=17,
+        class_count=len(_SOURCE_CLASSES),
+        source_classes=_SOURCE_CLASSES,
+        end_to_end=end_to_end,
+        calibration_manifest_sha256="2" * 64 if precision == "int8" else None,
+    )
+    signature = VerifiedArtifactSignature(
+        artifact_sha256=digest,
+        precision=precision,
+        embedded_nms=embedded_nms,
+        opset=17,
+        source_classes=_SOURCE_CLASSES,
+        inputs=inputs or (TensorSpec("images", [1, 3, 640, 640], "float32", "NCHW/RGB"),),
+        outputs=outputs or (TensorSpec("output", [1, 9, 8400], "float32"),),
+        preprocess="fixture-inspected letterbox contract",
+        postprocess="fixture-inspected external NMS contract",
+        failure_behavior="fixture-backed shape mismatch raises",
+        evidence="tests/fixtures/export-signature.json",
+    )
+    return receipt, signature
+
+
+def _build_test_contract(receipt, signature):
+    return build_export_contract(
+        model_name="manwe-aerial",
+        model_version="0.2.0",
+        source="test fixture",
+        rights="test fixture",
+        receipt=receipt,
+        signature=signature,
+        validation_data="tests/fixtures/*.png",
+        benchmark_context="test CPU",
+    )
+
 
 def test_build_export_contract_complete(tmp_path):
     artifact = tmp_path / "aerial.onnx"
@@ -44,7 +104,7 @@ def test_build_export_contract_complete(tmp_path):
         opset=17,
         source_classes=("drone", "bird", "aircraft", "helicopter", "unknown"),
         inputs=(TensorSpec("images", [1, 3, 640, 640], "float32", "NCHW/RGB"),),
-        outputs=(TensorSpec("output", [1, 9, "A"], "float32"),),
+        outputs=(TensorSpec("output", [1, 9, 8400], "float32"),),
         preprocess="fixture-inspected letterbox contract",
         postprocess="fixture-inspected external NMS contract",
         failure_behavior="fixture-backed shape mismatch raises",
@@ -64,6 +124,173 @@ def test_build_export_contract_complete(tmp_path):
     assert c.is_complete(), c.missing_fields()
     c.validate_class_map()
     assert c.class_map[0] == "drone"
+
+
+@pytest.mark.parametrize(
+    "tensor",
+    (
+        TensorSpec("bad name", [1, 3, 640, 640], "float32", "NCHW/RGB"),
+        TensorSpec("images", [1, 3, 640, 640], "bananas", "NCHW/RGB"),
+        TensorSpec("images", [1, 3, 640, 640], "float32", "NCHW/RGBA"),
+    ),
+)
+def test_verified_signature_rejects_noncanonical_tensor_metadata(tensor):
+    with pytest.raises(ValueError, match="invalid signature tensor metadata"):
+        VerifiedArtifactSignature(
+            artifact_sha256="a" * 64,
+            precision="float32",
+            embedded_nms=False,
+            opset=17,
+            source_classes=("drone",),
+            inputs=(tensor,),
+            outputs=(TensorSpec("output", [1, 5, "A"], "float32"),),
+            preprocess="fixture",
+            postprocess="fixture",
+            failure_behavior="fixture",
+            evidence="fixture",
+        )
+
+
+def test_verified_signature_rejects_unbounded_output_symbol():
+    with pytest.raises(ValueError, match="canonical symbols"):
+        VerifiedArtifactSignature(
+            artifact_sha256="a" * 64,
+            precision="float32",
+            embedded_nms=False,
+            opset=17,
+            source_classes=("drone",),
+            inputs=(TensorSpec("images", [1, 3, 640, 640], "float32", "NCHW/RGB"),),
+            outputs=(TensorSpec("output", [1, 5, "UNBOUNDED"], "float32"),),
+            preprocess="fixture",
+            postprocess="fixture",
+            failure_behavior="fixture",
+            evidence="fixture",
+        )
+
+
+def test_verified_signature_rejects_duplicate_interface_names():
+    duplicate = TensorSpec("tensor", [1, 3, 640, 640], "float32", "NCHW/RGB")
+    with pytest.raises(ValueError, match="duplicate tensor names"):
+        VerifiedArtifactSignature(
+            artifact_sha256="a" * 64,
+            precision="float32",
+            embedded_nms=False,
+            opset=17,
+            source_classes=("drone",),
+            inputs=(duplicate,),
+            outputs=(TensorSpec("tensor", [1, 5, "A"], "float32"),),
+            preprocess="fixture",
+            postprocess="fixture",
+            failure_behavior="fixture",
+            evidence="fixture",
+        )
+
+
+@pytest.mark.parametrize(
+    ("inputs", "outputs", "message"),
+    (
+        (
+            (TensorSpec("images", [99, 7, 13], "float32", "NCHW/RGB"),),
+            (TensorSpec("output", [1, 9, 8400], "float32"),),
+            "image input shape",
+        ),
+        (
+            (TensorSpec("images", [1, 3, 640, 640], "float32"),),
+            (TensorSpec("output", [1, 9, 8400], "float32"),),
+            "image input layout",
+        ),
+        (
+            (TensorSpec("images", [1, 640, 640, 3], "float32", "NHWC/RGB"),),
+            (TensorSpec("output", [1, 9, 8400], "float32"),),
+            "image input layout",
+        ),
+        (
+            (TensorSpec("images", [1, 3, 640, 640], "float32", "NCHW/RGB"),),
+            (TensorSpec("output", [1, 8, 8400], "float32"),),
+            "prediction output",
+        ),
+        (
+            (TensorSpec("images", [1, 3, 640, 640], "float32", "NCHW/RGB"),),
+            (
+                TensorSpec("output0", [1, 9, 8400], "float32"),
+                TensorSpec("output1", [1, 9, 8400], "float32"),
+            ),
+            "exactly one",
+        ),
+        (
+            (TensorSpec("images", [1, 3, 640, 640], "float32", "NCHW/RGB"),),
+            (TensorSpec("output", [1, 9, "A"], "float32"),),
+            "concrete integer",
+        ),
+        (
+            (TensorSpec("images", [1, 3, 640, 640], "float32", "NCHW/RGB"),),
+            (TensorSpec("output", [1, 9, 2_000_001], "float32"),),
+            "anchor dimension",
+        ),
+    ),
+)
+def test_build_contract_rejects_unbound_detect_signatures(tmp_path, inputs, outputs, message):
+    receipt, signature = _export_pair(tmp_path, inputs=inputs, outputs=outputs)
+    with pytest.raises(ValueError, match=message):
+        _build_test_contract(receipt, signature)
+
+
+@pytest.mark.parametrize(
+    ("embedded_nms", "end_to_end", "message"),
+    ((True, False, "embedded-NMS"), (False, True, "end-to-end")),
+)
+def test_build_contract_rejects_unmodeled_detect_output_variants(
+    tmp_path, embedded_nms, end_to_end, message
+):
+    receipt, signature = _export_pair(
+        tmp_path,
+        embedded_nms=embedded_nms,
+        end_to_end=end_to_end,
+    )
+    with pytest.raises(ValueError, match=message):
+        _build_test_contract(receipt, signature)
+
+
+@pytest.mark.parametrize("anchor_count", (1, 8400, 2_000_000))
+def test_build_contract_accepts_bounded_concrete_anchor_counts(tmp_path, anchor_count):
+    outputs = (TensorSpec("output", [1, 9, anchor_count], "float32"),)
+    receipt, signature = _export_pair(tmp_path, outputs=outputs)
+    contract = _build_test_contract(receipt, signature)
+    assert contract.outputs[0].shape[2] == anchor_count
+
+
+def test_int8_receipt_accepts_float32_engine_io(tmp_path):
+    receipt, signature = _export_pair(
+        tmp_path,
+        manwe_format="tensorrt",
+        precision="int8",
+    )
+    contract = _build_test_contract(receipt, signature)
+    assert contract.inputs[0].dtype == "float32"
+    assert contract.outputs[0].dtype == "float32"
+
+
+def test_build_contract_revalidates_mutated_signature_tensors(tmp_path):
+    receipt, signature = _export_pair(tmp_path)
+    signature.inputs[0].shape[1] = 99
+    with pytest.raises(ValueError, match="image input shape"):
+        _build_test_contract(receipt, signature)
+
+    receipt, signature = _export_pair(tmp_path)
+    signature.outputs[0].dtype = "bananas"
+    with pytest.raises(ValueError, match="invalid signature tensor metadata"):
+        _build_test_contract(receipt, signature)
+
+
+def test_verified_signature_and_built_contract_own_tensor_snapshots(tmp_path):
+    supplied_input = TensorSpec("images", [1, 3, 640, 640], "float32", "NCHW/RGB")
+    receipt, signature = _export_pair(tmp_path, inputs=(supplied_input,))
+    supplied_input.shape[1] = 99
+    assert signature.inputs[0].shape[1] == 3
+
+    contract = _build_test_contract(receipt, signature)
+    signature.inputs[0].shape[1] = 77
+    assert contract.inputs[0].shape[1] == 3
 
 
 def test_receipt_and_signature_reject_forged_public_values():

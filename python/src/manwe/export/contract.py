@@ -22,6 +22,10 @@ from ..common.contracts import (
 )
 from .backends import EXPORT_FORMATS, ExportReceipt
 
+# At the largest receipt image size (4096), a dense P2/P3/P4/P5 pyramid has
+# 1,392,640 cells.  Keep a conservative finite margin without accepting the
+# generic TensorSpec limit (2^31-1) as a plausible detector output allocation.
+_MAX_RAW_DETECT_ANCHORS = 2_000_000
 _MAX_STAGE_ATTEMPTS = 128
 _STAGE_JSON = "contract.json"
 _STAGE_MARKDOWN = "contract.md"
@@ -344,6 +348,11 @@ class VerifiedArtifactSignature:
             raise ValueError("signature inputs and outputs must each contain at most 64 tensors")
         if any(not isinstance(value, TensorSpec) for value in (*self.inputs, *self.outputs)):
             raise TypeError("signature tensors must be TensorSpec values")
+        copied_inputs = tuple(copy.deepcopy(self.inputs))
+        copied_outputs = tuple(copy.deepcopy(self.outputs))
+        tensor_errors = _signature_tensor_errors(copied_inputs, copied_outputs)
+        if tensor_errors:
+            raise ValueError("invalid signature tensor metadata: " + "; ".join(tensor_errors))
         for name in ("preprocess", "postprocess", "failure_behavior", "evidence"):
             value = getattr(self, name)
             if (
@@ -353,8 +362,84 @@ class VerifiedArtifactSignature:
                 or len(value) > 4096
             ):
                 raise ValueError(f"signature {name} must be a nonempty string")
-        object.__setattr__(self, "inputs", tuple(copy.deepcopy(self.inputs)))
-        object.__setattr__(self, "outputs", tuple(copy.deepcopy(self.outputs)))
+        object.__setattr__(self, "inputs", copied_inputs)
+        object.__setattr__(self, "outputs", copied_outputs)
+
+
+def _signature_tensor_errors(
+    inputs: tuple[TensorSpec, ...], outputs: tuple[TensorSpec, ...]
+) -> list[str]:
+    """Validate canonical tensor metadata, including names across both interfaces."""
+    errors: list[str] = []
+    names: list[str] = []
+    for collection_name, tensors in (("inputs", inputs), ("outputs", outputs)):
+        for index, tensor in enumerate(tensors):
+            errors.extend(tensor.validation_errors(f"signature.{collection_name}[{index}]"))
+            if isinstance(tensor.name, str):
+                names.append(tensor.name)
+    duplicate_names = sorted({name for name in names if names.count(name) > 1})
+    if duplicate_names:
+        errors.append(f"signature contains duplicate tensor names {duplicate_names}")
+    return errors
+
+
+def _validate_raw_detect_signature(
+    receipt: ExportReceipt,
+    inputs: tuple[TensorSpec, ...],
+    outputs: tuple[TensorSpec, ...],
+) -> None:
+    """Tie one supported raw Ultralytics detect interface to its export receipt.
+
+    Embedded-NMS and end-to-end heads have backend- and model-specific output
+    structures.  Until the receipt records enough facts to validate those
+    structures, rejecting them is safer than treating an arbitrary shape as
+    verified.
+    """
+    tensor_errors = _signature_tensor_errors(inputs, outputs)
+    if tensor_errors:
+        raise ValueError("invalid signature tensor metadata: " + "; ".join(tensor_errors))
+    if receipt.embedded_nms:
+        raise ValueError("embedded-NMS tensor signatures are not yet supported")
+    if receipt.end_to_end:
+        raise ValueError("end-to-end detector tensor signatures are not yet supported")
+    if len(inputs) != 1 or len(outputs) != 1:
+        raise ValueError(
+            "raw detect contracts require exactly one image input and one prediction output"
+        )
+
+    image = inputs[0]
+    if image.layout == "NCHW/RGB":
+        expected_image_shape: list[int | str] = [1, 3, receipt.image_size, receipt.image_size]
+    else:
+        raise ValueError("raw detect image input layout must be NCHW/RGB")
+    if image.shape != expected_image_shape:
+        raise ValueError(
+            f"raw detect image input shape must be {expected_image_shape} for "
+            f"image_size={receipt.image_size}, got {image.shape}"
+        )
+    if image.dtype not in {"float16", "float32", "uint8"}:
+        raise ValueError("raw detect image input dtype must be float16, float32, or uint8")
+
+    prediction = outputs[0]
+    expected_features = 4 + receipt.class_count
+    if len(prediction.shape) != 3:
+        raise ValueError("raw detect prediction output must have rank 3 [1, 4+classes, anchors]")
+    if prediction.shape[0] != 1 or prediction.shape[1] != expected_features:
+        raise ValueError(
+            "raw detect prediction output must have shape "
+            f"[1, {expected_features}, anchors], got {prediction.shape}"
+        )
+    anchor_count = prediction.shape[2]
+    if type(anchor_count) is not int:
+        raise ValueError("raw detect prediction anchor dimension must be a concrete integer")
+    if not 1 <= anchor_count <= _MAX_RAW_DETECT_ANCHORS:
+        raise ValueError(
+            f"raw detect prediction anchor dimension must be in [1, {_MAX_RAW_DETECT_ANCHORS}]"
+        )
+    if prediction.dtype not in {"float16", "float32"}:
+        raise ValueError("raw detect prediction output dtype must be float16 or float32")
+    if prediction.layout:
+        raise ValueError("raw detect prediction output layout must be empty")
 
 
 def build_export_contract(
@@ -383,6 +468,9 @@ def build_export_contract(
             raise ValueError(f"signature {field} does not match the export receipt")
     if signature.source_classes != receipt.source_classes:
         raise ValueError("signature source_classes do not match the export receipt")
+    signature_inputs = tuple(copy.deepcopy(signature.inputs))
+    signature_outputs = tuple(copy.deepcopy(signature.outputs))
+    _validate_raw_detect_signature(receipt, signature_inputs, signature_outputs)
 
     backend: Backend = EXPORT_FORMATS[receipt.format].crebain_backend  # type: ignore[assignment]
     artifact = pathlib.Path(receipt.artifact_path)
@@ -424,8 +512,8 @@ def build_export_contract(
         source_sha256=receipt.source_sha256.lower(),
         export_options=export_options,
         signature_evidence=signature.evidence,
-        inputs=copy.deepcopy(list(signature.inputs)),
-        outputs=copy.deepcopy(list(signature.outputs)),
+        inputs=list(signature_inputs),
+        outputs=list(signature_outputs),
         preprocess=signature.preprocess,
         postprocess=signature.postprocess,
         class_map=cmap,

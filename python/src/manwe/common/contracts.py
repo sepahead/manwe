@@ -98,6 +98,65 @@ BACKEND_EXTENSIONS: dict[str, tuple[str, ...]] = {
 }
 
 _SHA256_RE = re.compile(r"^[0-9a-fA-F]{64}$")
+_TENSOR_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_.:/-]{0,127}$")
+
+# Contract spellings are deliberately canonical rather than accepting arbitrary
+# backend display strings.  Inspectors must translate backend-specific names
+# (for example ONNX ``tensor(float)``) into this vocabulary before signing a
+# contract.  A bounded vocabulary prevents a typo from silently becoming an
+# apparent interface promise.
+TENSOR_DTYPES = frozenset(
+    {
+        "bool",
+        "bfloat16",
+        "float16",
+        "float32",
+        "float64",
+        "int8",
+        "int16",
+        "int32",
+        "int64",
+        "uint8",
+        "uint16",
+        "uint32",
+        "uint64",
+    }
+)
+TENSOR_LAYOUTS = frozenset(
+    {
+        "",
+        "CHW",
+        "CHW/BGR",
+        "CHW/RGB",
+        "HWC",
+        "HWC/BGR",
+        "HWC/RGB",
+        "NC",
+        "NCHW",
+        "NCHW/BGR",
+        "NCHW/RGB",
+        "NHWC",
+        "NHWC/BGR",
+        "NHWC/RGB",
+    }
+)
+TENSOR_DIMENSION_SYMBOLS = frozenset(
+    {
+        "A",
+        "B",
+        "C",
+        "H",
+        "N",
+        "W",
+        "anchors",
+        "batch",
+        "channels",
+        "detections",
+        "height",
+        "max_det",
+        "width",
+    }
+)
 
 
 def _has_required_value(value: object) -> bool:
@@ -131,10 +190,10 @@ class TensorSpec:
     def validation_errors(self, field_name: str) -> list[str]:
         """Return validation errors prefixed with ``field_name``."""
         errors: list[str] = []
-        if not isinstance(self.name, str) or not self.name.strip():
-            errors.append(f"{field_name}.name must be a nonempty string")
-        if not isinstance(self.dtype, str) or not self.dtype.strip():
-            errors.append(f"{field_name}.dtype must be a nonempty string")
+        if not isinstance(self.name, str) or not _TENSOR_NAME_RE.fullmatch(self.name):
+            errors.append(f"{field_name}.name must be a 1..128 character ASCII tensor identifier")
+        if not isinstance(self.dtype, str) or self.dtype not in TENSOR_DTYPES:
+            errors.append(f"{field_name}.dtype must be one of {tuple(sorted(TENSOR_DTYPES))}")
         if not isinstance(self.shape, list) or not self.shape:
             errors.append(f"{field_name}.shape must be a nonempty list")
         elif len(self.shape) > MAX_TENSOR_RANK:
@@ -144,18 +203,19 @@ class TensorSpec:
                 if isinstance(dim, bool) or not isinstance(dim, (int, str)):
                     errors.append(
                         f"{field_name}.shape[{index}] must be a positive integer "
-                        "or nonempty symbolic dimension"
+                        "or canonical symbolic dimension"
                     )
                 elif isinstance(dim, int) and dim <= 0:
                     errors.append(f"{field_name}.shape[{index}] must be positive")
                 elif isinstance(dim, int) and dim > MAX_TENSOR_DIMENSION:
                     errors.append(f"{field_name}.shape[{index}] exceeds {MAX_TENSOR_DIMENSION}")
-                elif isinstance(dim, str) and (
-                    not dim.strip() or len(dim.encode("utf-8")) > 128 or not dim.isprintable()
-                ):
-                    errors.append(f"{field_name}.shape[{index}] must be a bounded printable symbol")
-        if not isinstance(self.layout, str):
-            errors.append(f"{field_name}.layout must be a string")
+                elif isinstance(dim, str) and dim not in TENSOR_DIMENSION_SYMBOLS:
+                    errors.append(
+                        f"{field_name}.shape[{index}] must use one of the canonical "
+                        f"symbols {tuple(sorted(TENSOR_DIMENSION_SYMBOLS))}"
+                    )
+        if not isinstance(self.layout, str) or self.layout not in TENSOR_LAYOUTS:
+            errors.append(f"{field_name}.layout must be one of {tuple(sorted(TENSOR_LAYOUTS))}")
         if not isinstance(self.notes, str):
             errors.append(f"{field_name}.notes must be a string")
         for name in ("name", "dtype", "layout", "notes"):
@@ -381,7 +441,8 @@ class ModelContract:
                     errors.append(f"{field_name} must be a TensorSpec")
                     continue
                 errors.extend(tensor.validation_errors(field_name))
-                names.append(tensor.name)
+                if isinstance(tensor.name, str):
+                    names.append(tensor.name)
             duplicate_names = sorted({name for name in names if names.count(name) > 1})
             if duplicate_names:
                 errors.append(
