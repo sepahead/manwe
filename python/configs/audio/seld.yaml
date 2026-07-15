@@ -24,7 +24,9 @@ mic_positions:
 az_steps: 72
 el_steps: 19
 
-# Acoustic → fusion measurement uncertainty (good bearing, weak range).
+# Acoustic → fusion uncertainty, usable only after an independent range
+# observation. The single-array result deliberately cannot enter Cartesian
+# fusion with the display-only nominal range below.
 angle_std_rad: 0.05
 range_std_m: 30.0
-nominal_range_m: 100.0     # single array cannot triangulate range
+nominal_range_m: 100.0     # unobserved display prior; one array cannot range

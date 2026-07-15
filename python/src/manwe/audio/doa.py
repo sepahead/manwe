@@ -172,6 +172,49 @@ def _direction(azimuth: float, elevation: float) -> np.ndarray:
     )
 
 
+def _validate_search_observability(
+    baselines: dict[tuple[int, int], np.ndarray],
+    az_grid: np.ndarray,
+    el_grid: np.ndarray,
+) -> None:
+    """Require array steering to distinguish the requested direction space.
+
+    Let ``B`` contain the microphone baselines and let ``V`` be the linear span
+    of all differences between requested unit directions. Two candidates
+    ``u`` and ``v`` have the same ideal far-field delays exactly when
+    ``B @ (u - v) == 0``. Requiring ``B`` to have full column rank on ``V`` is
+    therefore a sufficient injectivity condition for the whole requested
+    direction space, not merely for the sampled peak that happened to win.
+    """
+    directions = np.array(
+        [
+            _direction(float(azimuth), float(elevation))
+            for elevation in el_grid
+            for azimuth in az_grid
+        ]
+    )
+    differences = directions - directions[0]
+    direction_scale = float(np.max(np.abs(differences)))
+    if direction_scale == 0.0:
+        return
+    normalized_differences = differences / direction_scale
+    _, singular_values, right_vectors = np.linalg.svd(
+        normalized_differences,
+        full_matrices=False,
+    )
+    search_rank = int(np.count_nonzero(singular_values > 1e-8))
+    search_basis = right_vectors[:search_rank].T
+
+    geometry = np.stack(tuple(baselines.values()))
+    geometry_scale = float(np.max(np.abs(geometry)))
+    normalized_geometry = geometry / geometry_scale
+    observed_rank = int(np.linalg.matrix_rank(normalized_geometry @ search_basis, tol=1e-8))
+    if observed_rank < search_rank:
+        raise ValueError(
+            "microphone geometry cannot uniquely observe the requested direction search"
+        )
+
+
 def srp_peak_prominence(power: np.ndarray) -> float:
     """Return a robust, dimensionless prominence score for an SRP map."""
     power = _real_array(power, "power")
@@ -267,17 +310,10 @@ def srp_phat(
         raise ValueError("az_grid values must lie in [-2pi, 2pi]")
     if np.any(np.abs(el_grid) > np.pi / 2.0 + 1e-12):
         raise ValueError("el_grid values must lie in [-pi/2, pi/2]")
-    if np.any(el_grid < -1e-12) and np.any(el_grid > 1e-12):
-        centered = microphones - np.mean(microphones, axis=0)
-        geometry_scale = float(np.max(np.abs(centered)))
-        normalized_geometry = centered / geometry_scale
-        if np.linalg.matrix_rank(normalized_geometry, tol=1e-8) < 3:
-            raise ValueError(
-                "signed elevation requires at least four non-coplanar microphone positions"
-            )
     grid_cells = int(az_grid.size) * int(el_grid.size)
     if grid_cells > MAX_SEARCH_CELLS:
         raise ValueError(f"search grid exceeds the {MAX_SEARCH_CELLS}-cell safety limit")
+    _validate_search_observability(baselines, az_grid, el_grid)
 
     nfft = 1 << (2 * n_samples - 1).bit_length()
     frequency_bins = nfft // 2 + 1

@@ -191,9 +191,15 @@ dets = [
 ]
 dets3d = correlate_and_triangulate(cams, dets, max_speed_mps=50.0)
 
-# Audio — array DOA → acoustic detection → fusion measurement
+# Audio — one array yields DOA, not range; fuse only after independent ranging
+from dataclasses import replace
 from manwe.audio import detect_from_array
 det = detect_from_array(signals, mic_positions, fs=16000)
+det = replace(
+    det,
+    range_estimate=independently_measured_range_m,
+    range_observed=True,
+)
 measurement = det.to_measurement(sensor_origin=array_xyz)
 
 # Export — a raw receipt plus separately inspected signature are required

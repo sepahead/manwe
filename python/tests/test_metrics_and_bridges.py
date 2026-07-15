@@ -1,5 +1,6 @@
 """OSPA/GOSPA metrics and the audio/radar → fusion bridges."""
 
+from dataclasses import replace
 from itertools import permutations
 
 import numpy as np
@@ -255,6 +256,11 @@ def test_acoustic_detect_from_array_end_to_end():
         abs(np.arctan2(np.sin(det.azimuth - az_true), np.cos(det.azimuth - az_true)))
     )
     assert az_err < 15.0, f"azimuth error {az_err:.1f}°"
-    # bridges into a Cartesian fusion measurement
+    with pytest.raises(ValueError, match="independently observed range"):
+        det.to_measurement(sensor_origin=np.zeros(3))
+
+    # An independent ranging sensor makes the Cartesian bridge well-defined.
+    det = replace(det, range_estimate=120.0, range_observed=True)
     m = det.to_measurement(sensor_origin=np.zeros(3))
     assert m.modality == "acoustic" and m.class_label == "drone"
+    assert np.linalg.norm(m.position) == pytest.approx(120.0)

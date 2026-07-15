@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 import numpy as np
@@ -88,7 +88,13 @@ def _bounded_class_label(value: str | None) -> str | None:
 
 @dataclass
 class AcousticDetection:
-    """A validated dominant acoustic source in the microphone-array frame."""
+    """A validated dominant acoustic source in the microphone-array frame.
+
+    ``range_observed`` is an explicit fusion-boundary attestation. Direction
+    finding from one array does not observe range, even when a nominal range is
+    useful for display. Callers may set the flag only after supplying an
+    independent range observation.
+    """
 
     azimuth: float
     elevation: float
@@ -97,6 +103,7 @@ class AcousticDetection:
     timestamp: float = 0.0
     confidence: float = 1.0
     class_label: str | None = None
+    range_observed: bool = field(default=False, kw_only=True)
 
     def __post_init__(self) -> None:
         self.azimuth = _finite_scalar(self.azimuth, "azimuth")
@@ -115,6 +122,8 @@ class AcousticDetection:
         if not 0.0 <= self.confidence <= 1.0:
             raise ValueError("confidence must be in [0, 1]")
         self.class_label = _bounded_class_label(self.class_label)
+        if type(self.range_observed) is not bool:
+            raise ValueError("range_observed must be a boolean")
 
     def direction(self) -> np.ndarray:
         azimuth = _finite_scalar(self.azimuth, "azimuth")
@@ -141,10 +150,19 @@ class AcousticDetection:
 
         ``sensor_rotation`` maps array-frame vectors into the world frame. Both
         the position and anisotropic covariance are rotated; omission preserves
-        the original identity-orientation behavior.
+        the original identity-orientation behavior. ``range_observed=True`` is
+        required because a single array's nominal range is not a Cartesian
+        position observation.
         """
         from manwe.fusion.tracker import Measurement
 
+        if type(self.range_observed) is not bool:
+            raise ValueError("range_observed must be a boolean")
+        if not self.range_observed:
+            raise ValueError(
+                "Cartesian fusion requires an independently observed range; "
+                "a single-array nominal range is not an observation"
+            )
         origin = (
             np.zeros(3) if sensor_origin is None else _finite_vector(sensor_origin, "sensor_origin")
         )
@@ -232,9 +250,12 @@ def detect_from_array(
 ) -> AcousticDetection:
     """Estimate one quality-gated dominant source with SRP-PHAT.
 
-    A single array cannot infer range, so ``nominal_range`` remains a weak prior.
-    The returned confidence is derived from SRP peak prominence rather than
-    defaulting every grid maximum to full confidence.
+    A single array cannot infer range, so ``nominal_range`` is retained only as
+    an unobserved display prior. The result therefore cannot be converted to a
+    Cartesian fusion measurement until a caller supplies an independent range
+    and explicitly sets ``range_observed=True``. The returned confidence is
+    derived from SRP peak prominence rather than defaulting every grid maximum
+    to full confidence.
     """
     azimuth, elevation, power = srp_phat(
         signals,
@@ -259,6 +280,7 @@ def detect_from_array(
         timestamp=timestamp,
         confidence=confidence,
         class_label=class_label,
+        range_observed=False,
     )
 
 

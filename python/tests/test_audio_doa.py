@@ -62,7 +62,13 @@ def test_log_mel_shape():
 
 
 def test_acoustic_detection_to_measurement_bridge():
-    det = AcousticDetection(azimuth=0.0, elevation=0.0, range_estimate=100.0, spl_db=70.0)
+    det = AcousticDetection(
+        azimuth=0.0,
+        elevation=0.0,
+        range_estimate=100.0,
+        spl_db=70.0,
+        range_observed=True,
+    )
     m = det.to_measurement(sensor_origin=np.zeros(3))
     assert m.modality == "acoustic"
     # az=el=0, range=100 → straight down +x
@@ -137,6 +143,8 @@ def test_acoustic_detection_validation():
         AcousticDetection(0.0, 0.0, 10.0, np.nan)
     with pytest.raises(ValueError, match="confidence"):
         AcousticDetection(0.0, 0.0, 10.0, 60.0, confidence=np.nan)
+    with pytest.raises(ValueError, match="range_observed"):
+        AcousticDetection(0.0, 0.0, 10.0, 60.0, range_observed=1)
     with pytest.raises(ValueError, match="class_label"):
         AcousticDetection(0.0, 0.0, 10.0, 60.0, class_label="")
     for class_label in ("line\nbreak", "x" * 257, "é" * 129):
@@ -149,7 +157,7 @@ def test_acoustic_detection_validation():
 
 
 def test_acoustic_bridge_rotates_position_and_covariance():
-    detection = AcousticDetection(0.0, 0.0, 10.0, 60.0)
+    detection = AcousticDetection(0.0, 0.0, 10.0, 60.0, range_observed=True)
     origin = np.array([1.0, 2.0, 3.0])
     rotation = np.array([[0.0, -1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]])
     array_measurement = detection.to_measurement()
@@ -300,7 +308,7 @@ def test_srp_phat_rejects_invalid_geometry_and_frequency_ranges():
 def test_signed_elevation_rejects_planar_microphone_geometry():
     planar = np.array([[0.0, 0.0, 0.0], [0.1, 0.0, 0.0], [0.0, 0.1, 0.0]])
     signals = np.random.default_rng(33).standard_normal((3, 64))
-    with pytest.raises(ValueError, match="non-coplanar"):
+    with pytest.raises(ValueError, match="cannot uniquely observe"):
         srp_phat(
             signals,
             planar,
@@ -308,6 +316,53 @@ def test_signed_elevation_rejects_planar_microphone_geometry():
             el_grid=np.array([-0.5, 0.5]),
             min_peak_prominence=None,
         )
+
+
+def test_srp_rejects_a_prominent_but_unobservable_collinear_array_peak():
+    fs = 16000
+    microphones = np.array([[-0.1, 0.0, 0.0], [0.1, 0.0, 0.0]])
+    direction = np.array([0.0, 1.0, 0.0])
+    signals = synth_plane_wave(direction, microphones, fs, duration=0.25, seed=20260715)
+    azimuths = np.deg2rad(np.arange(-180.0, 180.0, 1.0))
+
+    # For a baseline on x, delay is proportional to cos(azimuth), so the
+    # steering signatures at +90 and -90 degrees are exactly identical. Before
+    # the observability gate, both peaks had prominence 5.51 and passed the
+    # default threshold of 4 despite the unresolved front/back ambiguity.
+    baseline = microphones[0] - microphones[1]
+    positive = np.array([0.0, 1.0, 0.0])
+    negative = np.array([0.0, -1.0, 0.0])
+    assert float(baseline @ positive) == float(baseline @ negative)
+    with pytest.raises(ValueError, match="cannot uniquely observe"):
+        srp_phat(
+            signals,
+            microphones,
+            fs,
+            az_grid=azimuths,
+            el_grid=np.array([0.0]),
+        )
+
+
+def test_srp_allows_a_line_array_when_the_grid_encodes_a_two_direction_prior():
+    fs = 16000
+    microphones = np.array([[-0.1, 0.0, 0.0], [0.1, 0.0, 0.0]])
+    signals = synth_plane_wave(
+        np.array([1.0, 0.0, 0.0]),
+        microphones,
+        fs,
+        duration=0.05,
+        seed=20260715,
+    )
+    azimuth, elevation, _ = srp_phat(
+        signals,
+        microphones,
+        fs,
+        az_grid=np.array([0.0, np.pi / 2.0]),
+        el_grid=np.array([0.0]),
+        min_peak_prominence=None,
+    )
+    assert azimuth == 0.0
+    assert elevation == 0.0
 
 
 def test_synth_plane_wave_handles_large_direction_and_rejects_overflow():
@@ -333,11 +388,17 @@ def test_synth_plane_wave_handles_large_direction_and_rejects_overflow():
 
 
 def test_acoustic_bridge_rejects_nonfinite_position_and_covariance_math():
-    detection = AcousticDetection(0.0, 0.0, np.finfo(float).max, 60.0)
+    detection = AcousticDetection(
+        0.0,
+        0.0,
+        np.finfo(float).max,
+        60.0,
+        range_observed=True,
+    )
     with pytest.raises(FloatingPointError, match="position"):
         detection.to_measurement(sensor_origin=np.array([np.finfo(float).max, 0.0, 0.0]))
 
-    detection = AcousticDetection(0.0, 0.0, 10.0, 60.0)
+    detection = AcousticDetection(0.0, 0.0, 10.0, 60.0, range_observed=True)
     with pytest.raises(FloatingPointError, match="covariance"):
         detection.to_measurement(range_std=np.finfo(float).max)
     with pytest.raises(ValueError, match="real numeric"):
@@ -370,6 +431,9 @@ def test_detect_from_array_supports_negative_spl_and_silent_first_channel():
     )
     assert np.isfinite(detection.spl_db)
     assert detection.spl_db < 0
+    assert detection.range_observed is False
+    with pytest.raises(ValueError, match="independently observed range"):
+        detection.to_measurement()
 
 
 def test_gcc_phat_honours_subsample_max_tau():
@@ -394,7 +458,7 @@ def test_fft_frequency_grid_preserves_subnormal_but_resolvable_bins():
 
 
 def test_acoustic_covariance_rejects_positive_std_underflow():
-    detection = AcousticDetection(0.0, 0.0, 10.0, 60.0)
+    detection = AcousticDetection(0.0, 0.0, 10.0, 60.0, range_observed=True)
     tiny = np.nextafter(0.0, 1.0)
     with pytest.raises(FloatingPointError, match="underflowed"):
         detection.to_measurement(angle_std=tiny, range_std=tiny)
@@ -403,7 +467,7 @@ def test_acoustic_covariance_rejects_positive_std_underflow():
 
 
 def test_mutated_acoustic_detection_is_revalidated_at_public_boundaries():
-    detection = AcousticDetection(0.0, 0.0, 10.0, 60.0)
+    detection = AcousticDetection(0.0, 0.0, 10.0, 60.0, range_observed=True)
     detection.azimuth = np.inf
     with pytest.raises(ValueError, match="azimuth"):
         detection.direction()
@@ -418,6 +482,38 @@ def test_mutated_acoustic_detection_is_revalidated_at_public_boundaries():
     detection.class_label = "x" * 257
     with pytest.raises(ValueError, match="bounded printable"):
         detection.to_measurement()
+
+    detection.class_label = None
+    detection.range_observed = 1
+    with pytest.raises(ValueError, match="range_observed"):
+        detection.to_measurement()
+
+
+def test_single_array_nominal_range_cannot_be_repeated_as_an_observation():
+    fs = 16000
+    microphones = _tetrahedral_mics()
+    signals = synth_plane_wave(
+        np.array([1.0, 0.0, 0.0]),
+        microphones,
+        fs,
+        duration=0.05,
+        seed=20260715,
+    )
+    detections = [
+        detect_from_array(
+            signals,
+            microphones,
+            fs,
+            nominal_range=100.0,
+            min_peak_prominence=None,
+        )
+        for _ in range(2)
+    ]
+    for detection in detections:
+        assert detection.range_estimate == 100.0
+        assert detection.range_observed is False
+        with pytest.raises(ValueError, match="single-array nominal range"):
+            detection.to_measurement()
 
 
 def test_synth_plane_wave_rejects_negative_seed_explicitly():
