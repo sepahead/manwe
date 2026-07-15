@@ -1,5 +1,6 @@
 """Export contract + fidelity gate, and CLI smoke (numpy-only paths)."""
 
+import builtins
 import hashlib
 import tempfile
 
@@ -140,7 +141,15 @@ def test_fidelity_gate_pass_and_fail():
     assert not bad.passed and bad.delta_map > 0.005
 
 
-def test_cli_numpy_only_commands(capsys):
+def test_cli_numpy_only_commands(capsys, monkeypatch):
+    real_import = builtins.__import__
+
+    def import_without_rfdetr(name, *args, **kwargs):
+        if name == "rfdetr":
+            raise ImportError("simulated absent optional dependency")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", import_without_rfdetr)
     assert main(["doctor"]) == 0
     assert "manwe-perception[rfdetr]" in capsys.readouterr().out
     assert main(["models"]) == 0
