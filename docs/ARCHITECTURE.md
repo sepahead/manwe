@@ -79,9 +79,12 @@ manwe/
   angle origin/sign, frame transform, range observability, covariance, clock, and ID.
 - **multicam** → calibrated cameras + N-view triangulation producing local 3D
   detections and propagated uncertainty under declared pixel/time assumptions.
-  Camera YAML, units, distortion,
-  handedness, world frame, synchronization, and ID semantics are part of the
-  adapter contract, not inferred defaults.
+  Moving-target views must be physically simultaneous: equal zero-uncertainty
+  capture timestamps, or an explicit simultaneous-capture acknowledgement for
+  an untimestamped hardware-triggered batch. Bounded skew is accepted only for
+  a declared static target. Camera YAML, units, distortion, handedness, world
+  frame, synchronization, and ID semantics are part of the adapter contract,
+  not inferred defaults.
 - **fusion** → an independent Python implementation of 6-state filters,
   association, and M-of-N lifecycle. It is useful as a seeded reference, but it is
   not a numerical twin of crebain: defaults, association, process noise,

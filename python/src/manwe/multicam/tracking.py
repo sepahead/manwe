@@ -2,7 +2,9 @@
 
 The association contract is fail-closed: camera identities, capture timestamps,
 undistorted-pixel acknowledgements, uncertainty inputs, workload limits, forward
-range, and ray conditioning are checked before a 3D detection is emitted.
+range, and ray conditioning are checked before a 3D detection is emitted. Since
+asynchronous moving-target rays can intersect at an arbitrarily biased depth,
+they are never combined without a simultaneous-capture contract.
 """
 
 from __future__ import annotations
@@ -223,11 +225,12 @@ class Detection2D:
 class Detection3D:
     """A triangulated world-space detection at a declared time reference.
 
-    When ``timestamp`` is present, it is the latest contributing capture time and
-    the covariance includes motion uncertainty from earlier captures to that
-    reference. When absent, the capture time is unspecified and a caller-supplied
-    cycle timestamp is required by :func:`to_measurements`; the full configured
-    batch skew is already included in ``position_covariance``.
+    When ``timestamp`` is present, it is the common contributing capture time for
+    moving-target triangulation, or the latest contributing time for a declared
+    static target. For an untimestamped moving target, the producer has
+    acknowledged a simultaneous capture but not supplied its time; a declared
+    static target needs no simultaneity acknowledgement. In either case,
+    :func:`to_measurements` requires the applicable external time reference.
     """
 
     position: np.ndarray
@@ -437,10 +440,11 @@ def _cluster_time_reference(
     detections: list[Detection2D],
     *,
     stamped: bool,
+    simultaneous_capture: bool,
     max_time_skew: float,
 ) -> tuple[float | None, float]:
     if not stamped:
-        return None, max_time_skew
+        return None, 0.0 if simultaneous_capture else max_time_skew
     timestamped: list[tuple[Detection2D, float]] = []
     for index in chosen:
         detection = detections[index]
@@ -469,6 +473,7 @@ def _build_hypothesis(
     canonical_ranks: dict[int, int],
     edge_gaps: dict[tuple[int, int], float],
     stamped: bool,
+    simultaneous_capture: bool,
     max_reprojection: float,
     max_time_skew: float,
     min_ray_angle_deg: float,
@@ -506,12 +511,11 @@ def _build_hypothesis(
         list(members),
         detections,
         stamped=stamped,
+        simultaneous_capture=simultaneous_capture,
         max_time_skew=max_time_skew,
     )
     if time_uncertainty > max_time_skew + 1e-12:
         return None
-    motion_std = max_speed * time_uncertainty
-    covariance = covariance + np.eye(3) * motion_std**2
     if not np.isfinite(covariance).all():
         return None
 
@@ -747,6 +751,7 @@ def correlate_and_triangulate(
     min_ray_angle_deg: float = 1.0,
     max_range_m: float = 100_000.0,
     max_speed_mps: float | None = None,
+    simultaneous_capture: bool = False,
     max_cameras: int = 16,
     max_detections: int = 4096,
     max_candidate_pairs: int = 1_000_000,
@@ -755,10 +760,16 @@ def correlate_and_triangulate(
 ) -> list[Detection3D]:
     """Correlate a bounded synchronized batch and emit uncertainty-aware 3D points.
 
-    Timestamped output is referenced to the latest contributing image capture.
-    Untimestamped legacy batches use the full configured ``max_time_skew`` as
-    temporal uncertainty and leave the output timestamp unset. ``max_speed_mps``
-    is mandatory so time skew can be converted into spatial covariance.
+    A non-zero ``max_speed_mps`` makes asynchronous triangulation unsound: rays
+    captured at different target positions can intersect perfectly at a badly
+    biased depth, so reprojection error and isotropic speed/skew covariance do
+    not bound the error. Moving-target inputs must therefore either carry one
+    exactly equal capture timestamp with zero ``timestamp_std_s`` on every
+    detection, or be untimestamped with ``simultaneous_capture=True`` as an
+    explicit producer acknowledgement that every image shares one physical
+    exposure instant. The latter leaves the output timestamp unset; the
+    timestamp supplied to :func:`to_measurements` must be that shared capture
+    time. Static targets (``max_speed_mps=0``) may use bounded skew.
     """
 
     if not isinstance(cameras, (list, tuple)) or not cameras:
@@ -801,20 +812,36 @@ def correlate_and_triangulate(
         raise ValueError("min_ray_angle_deg must be in the open interval (0, 90)")
     max_range_m = _finite_scalar(max_range_m, "max_range_m", positive=True)
     if max_speed_mps is None:
-        raise ValueError("max_speed_mps is required for temporal uncertainty propagation")
+        raise ValueError("max_speed_mps is required for the capture-time contract")
     max_speed = _finite_scalar(
         max_speed_mps,
         "max_speed_mps",
         nonnegative=True,
         maximum=_MAX_SPEED_MPS,
     )
+    if not isinstance(simultaneous_capture, bool):
+        raise ValueError("simultaneous_capture must be a boolean")
     camera_ids = _resolve_camera_ids(camera_values, detection_values)
 
     stamped_flags = [detection.timestamp is not None for detection in detection_values]
     if any(stamped_flags) and not all(stamped_flags):
         raise ValueError("timestamped and untimestamped detections cannot be mixed")
     stamped = bool(stamped_flags and all(stamped_flags))
-    if stamped:
+    if stamped and max_speed > 0.0:
+        timestamps = [
+            float(detection.timestamp)
+            for detection in detection_values
+            if detection.timestamp is not None
+        ]
+        if any(detection.timestamp_std_s != 0.0 for detection in detection_values):
+            raise ValueError(
+                "moving-target triangulation requires zero relative timestamp uncertainty"
+            )
+        if timestamps and any(timestamp != timestamps[0] for timestamp in timestamps[1:]):
+            raise ValueError(
+                "moving-target triangulation requires exactly simultaneous capture timestamps"
+            )
+    elif stamped:
         lower = min(
             float(detection.timestamp) - detection.timestamp_std_s
             for detection in detection_values
@@ -827,6 +854,10 @@ def correlate_and_triangulate(
         )
         if upper - lower > max_time_skew:
             raise ValueError("detection capture timestamps and uncertainty exceed max_time_skew")
+    elif len(detection_values) >= 2 and max_speed > 0.0 and not simultaneous_capture:
+        raise ValueError(
+            "untimestamped moving-target triangulation requires simultaneous_capture=True"
+        )
 
     count = len(detection_values)
     if count < 2:
@@ -886,6 +917,7 @@ def correlate_and_triangulate(
             canonical_ranks=canonical_ranks,
             edge_gaps=edge_gaps,
             stamped=stamped,
+            simultaneous_capture=simultaneous_capture,
             max_reprojection=max_reprojection,
             max_time_skew=max_time_skew,
             min_ray_angle_deg=min_ray_angle_deg,
@@ -940,8 +972,9 @@ def to_measurements(detections: Sequence[Detection3D], timestamp: float | None =
     Per-detection covariance is preserved. An explicit cycle timestamp may move
     the reference away from ``latest_capture``; the covariance is then inflated
     by the stored speed bound and absolute time offset. For an untimestamped
-    detection, the explicit timestamp is the external batch reference and is
-    required.
+    moving-target detection, the explicit timestamp is the acknowledged shared
+    capture time. For a declared static detection it is the external batch
+    reference. It is required in both cases.
     """
 
     from manwe.fusion.tracker import Measurement

@@ -32,6 +32,12 @@ This is the first planned tagged alpha after the untagged Rust/Candle prototypes
 - Radar measurements and EKF updates now reject zero-range and vertical-axis
   polar singularities instead of silently consuming evidence with a zero
   Jacobian.
+- Moving-target triangulation now requires physically simultaneous captures.
+  Timestamped views must have exactly equal capture times with zero relative
+  uncertainty; untimestamped views require an explicit simultaneous-capture
+  acknowledgement. Static-scene skew remains supported. This removes an
+  unsound isotropic speed/skew covariance heuristic that could understate
+  geometry-amplified depth bias by orders of magnitude.
 - Tracker clock-gap budgeting no longer partitions the discrete per-cycle filter
   model: each call now applies acceleration noise and an IMM Markov transition
   exactly once, independent of the `max_dt` admission quantum. This intentionally

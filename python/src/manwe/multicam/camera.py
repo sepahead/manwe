@@ -456,10 +456,17 @@ class Camera:
 
 @dataclass(frozen=True, slots=True)
 class CameraRig:
-    """A validated multi-camera rig whose gates drive :meth:`correlate`."""
+    """A validated multi-camera rig whose gates drive :meth:`correlate`.
+
+    ``simultaneous_capture=True`` acknowledges that untimestamped images from
+    this rig share one physical exposure instant. It is required before
+    untimestamped detections may triangulate a target with a non-zero speed
+    bound; synchronized clocks alone are not this acknowledgement.
+    """
 
     cameras: tuple[Camera, ...]
     max_speed_mps: float = field(kw_only=True)
+    simultaneous_capture: bool = field(default=False, kw_only=True)
     max_ray_gap_m: float = 8.0
     max_reprojection_px: float = 12.0
     max_time_skew_s: float = 0.05
@@ -503,6 +510,8 @@ class CameraRig:
             raise ValueError("every rig camera requires a stable, non-empty name")
         if len(set(names)) != len(names):
             raise ValueError("rig camera names must be unique")
+        if not isinstance(self.simultaneous_capture, bool):
+            raise ValueError("simultaneous_capture must be a boolean")
 
         object.__setattr__(self, "cameras", cameras)
         object.__setattr__(
@@ -575,6 +584,7 @@ class CameraRig:
             min_ray_angle_deg=self.min_ray_angle_deg,
             max_range_m=self.max_range_m,
             max_speed_mps=self.max_speed_mps,
+            simultaneous_capture=self.simultaneous_capture,
             max_cameras=self.max_cameras,
             max_detections=self.max_detections,
             max_candidate_pairs=self.max_candidate_pairs,
@@ -590,6 +600,7 @@ class CameraRig:
             "schema_version",
             "cameras",
             "max_speed_mps",
+            "simultaneous_capture",
             "max_ray_gap_m",
             "max_reprojection_px",
             "max_time_skew_s",
@@ -610,7 +621,7 @@ class CameraRig:
         ):
             raise ValueError(f"unsupported rig schema_version {version!r}")
         if "max_speed_mps" not in data:
-            raise ValueError("rig record requires max_speed_mps for temporal uncertainty")
+            raise ValueError("rig record requires max_speed_mps for the capture-time contract")
         max_cameras = _bounded_positive_integer(
             data.get("max_cameras", 16), "max_cameras", _MAX_RIG_CAMERAS
         )
@@ -628,6 +639,7 @@ class CameraRig:
                 nonnegative=True,
                 maximum=_MAX_SPEED_MPS,
             ),
+            simultaneous_capture=data.get("simultaneous_capture", False),
             max_ray_gap_m=_finite_scalar(
                 data.get("max_ray_gap_m", 8.0), "max_ray_gap_m", positive=True
             ),

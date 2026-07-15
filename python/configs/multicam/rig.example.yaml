@@ -3,7 +3,9 @@
 # C_i = -R_iᵀ t_i, ray d_i = normalize(R_iᵀ K_i⁻¹ [u,v,1]ᵀ).
 # No reviewed consumer automatically shares it; an adapter must pin and transform
 # frames, axes, units, timestamps, and covariance explicitly.
-# NOTE: triangulation across cameras REQUIRES hardware time-sync (trigger/PTP).
+# NOTE: moving-target triangulation REQUIRES physically simultaneous/frame-aligned
+# exposures (normally a shared hardware trigger). Clock synchronization such as
+# PTP alone does not make exposures simultaneous.
 # Detection2D producers must explicitly assert pixels_undistorted=true, provide
 # pixel_std_px, and stamp image exposure/capture time (not inference completion).
 # fov_deg is the vertical field of view; focal length is derived from image height.
@@ -36,12 +38,20 @@ cameras:
 # Cross-camera correlation + triangulation gates
 max_ray_gap_m: 8.0
 max_reprojection_px: 12.0
-max_time_skew_s: 0.05
+# Moving targets reject every non-zero relative timestamp or timestamp
+# uncertainty. A positive skew is supported only when max_speed_mps is exactly 0.
+max_time_skew_s: 0.0
 min_ray_angle_deg: 1.0
 max_range_m: 100000.0
 
-# Required temporal uncertainty model. This is a conservative target-speed
-# bound used to turn capture skew into spatial covariance.
+# Explicit producer acknowledgement for untimestamped batches: every image in a
+# batch shares one physical exposure instant. If false, moving-target inputs must
+# all provide one exactly equal capture timestamp and zero timestamp_std_s.
+simultaneous_capture: true
+
+# Required target-speed bound. A positive value activates the simultaneous-only
+# contract; it cannot make asynchronous triangulation safe through covariance
+# inflation because depth bias is amplified by camera geometry.
 max_speed_mps: 100.0
 
 # Per-call resource ceilings. Candidate-pair cost is O(detections^2); exact

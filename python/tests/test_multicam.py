@@ -16,6 +16,7 @@ from manwe.multicam import (
     to_measurements,
     triangulate_dlt,
     triangulate_midpoint,
+    triangulation_covariance,
 )
 
 
@@ -53,6 +54,9 @@ def _detection(
 
 def _correlate(cameras, detections, **kwargs):
     kwargs.setdefault("max_speed_mps", 100.0)
+    # Geometry-only fixtures omit timestamps but are generated from one shared
+    # synthetic instant; acknowledge that contract explicitly.
+    kwargs.setdefault("simultaneous_capture", True)
     return correlate_and_triangulate(cameras, detections, **kwargs)
 
 
@@ -137,19 +141,77 @@ def test_cross_camera_correlation_recovers_two_targets_with_covariance():
         assert not detection.position_covariance.flags.writeable
 
 
-def test_legacy_untimestamped_batch_uses_full_skew_uncertainty():
+def test_untimestamped_moving_batch_requires_simultaneous_capture_acknowledgement():
     cameras = _rig()[:2]
     target = np.array([3.0, -2.0, 1.0])
     detections = [_detection(index, camera.project(target)) for index, camera in enumerate(cameras)]
-    fused = _correlate(cameras, detections, max_time_skew=0.04, max_speed_mps=25.0)
+    with pytest.raises(ValueError, match="simultaneous_capture=True"):
+        correlate_and_triangulate(
+            cameras,
+            detections,
+            max_time_skew=0.04,
+            max_speed_mps=25.0,
+        )
+
+    fused = _correlate(
+        cameras,
+        detections,
+        max_time_skew=0.04,
+        max_speed_mps=25.0,
+        simultaneous_capture=True,
+    )
     assert len(fused) == 1
     assert fused[0].timestamp is None
     assert fused[0].timestamp_reference == "external_batch_reference"
-    assert fused[0].time_uncertainty_s == 0.04
+    assert fused[0].time_uncertainty_s == 0.0
     with pytest.raises(ValueError, match="timestamp is required"):
         to_measurements(fused)
     measurements = to_measurements(fused, timestamp=50.0)
     assert measurements[0].timestamp == 50.0
+
+
+def test_static_untimestamped_batch_may_retain_bounded_skew():
+    cameras = _rig()[:2]
+    target = np.array([3.0, -2.0, 1.0])
+    detections = [_detection(index, camera.project(target)) for index, camera in enumerate(cameras)]
+    fused = correlate_and_triangulate(
+        cameras,
+        detections,
+        max_time_skew=0.04,
+        max_speed_mps=0.0,
+    )
+    assert len(fused) == 1
+    assert fused[0].time_uncertainty_s == 0.04
+    assert fused[0].motion_speed_bound_mps == 0.0
+
+    stamped = [
+        _detection(
+            index,
+            camera.project(target),
+            timestamp=1.0 + index * 0.02,
+            timestamp_std_s=0.005,
+        )
+        for index, camera in enumerate(cameras)
+    ]
+    stamped_fused = correlate_and_triangulate(
+        cameras,
+        stamped,
+        max_time_skew=0.04,
+        max_speed_mps=0.0,
+    )
+    assert len(stamped_fused) == 1
+    assert stamped_fused[0].timestamp == 1.02
+    assert stamped_fused[0].time_uncertainty_s == pytest.approx(0.03)
+    with pytest.raises(ValueError, match="max_time_skew"):
+        correlate_and_triangulate(
+            cameras,
+            [
+                _detection(0, cameras[0].project(target), timestamp=1.0),
+                _detection(1, cameras[1].project(target), timestamp=1.1),
+            ],
+            max_time_skew=0.04,
+            max_speed_mps=0.0,
+        )
 
 
 def test_camera_rejects_invalid_calibration_dimensions_fov_and_extremes():
@@ -221,10 +283,11 @@ def test_committed_rig_example_loads_and_binds_all_gates():
     assert [camera.name for camera in rig.cameras] == ["cam0", "cam1", "cam2"]
     assert rig.max_ray_gap_m == 8.0
     assert rig.max_reprojection_px == 12.0
-    assert rig.max_time_skew_s == 0.05
+    assert rig.max_time_skew_s == 0.0
     assert rig.min_ray_angle_deg == 1.0
     assert rig.max_range_m == 100_000.0
     assert rig.max_speed_mps == 100.0
+    assert rig.simultaneous_capture is True
     assert rig.max_cameras == 16
     assert rig.max_detections == 4096
     assert rig.max_candidate_pairs == 1_000_000
@@ -236,20 +299,35 @@ def test_committed_rig_example_loads_and_binds_all_gates():
         _detection(
             index,
             camera.project(target),
-            timestamp=10.0 + index * 0.001,
+            timestamp=10.0,
             camera_id=camera.name,
         )
         for index, camera in enumerate(rig.cameras)
     ]
     fused = rig.correlate(detections)
     assert len(fused) == 1
-    assert fused[0].timestamp == 10.002
+    assert fused[0].timestamp == 10.0
     assert fused[0].timestamp_reference == "latest_capture"
+
+    untimestamped = [
+        _detection(index, camera.project(target), camera_id=camera.name)
+        for index, camera in enumerate(rig.cameras)
+    ]
+    assert len(rig.correlate(untimestamped)) == 1
+    unacknowledged = CameraRig(rig.cameras[:2], max_speed_mps=100.0)
+    with pytest.raises(ValueError, match="simultaneous_capture=True"):
+        unacknowledged.correlate(untimestamped[:2])
 
     with pytest.raises(ValueError, match="unique"):
         CameraRig((rig.cameras[0], rig.cameras[0]), max_speed_mps=100.0)
     with pytest.raises(ValueError, match="max_time_skew"):
         CameraRig(rig.cameras[:2], max_speed_mps=100.0, max_time_skew_s=-0.1)
+    with pytest.raises(ValueError, match="simultaneous_capture must be a boolean"):
+        CameraRig(
+            rig.cameras[:2],
+            max_speed_mps=100.0,
+            simultaneous_capture="yes",  # type: ignore[arg-type]
+        )
 
 
 def test_rig_yaml_rejects_ambiguous_and_symlinked_inputs(tmp_path):
@@ -342,7 +420,7 @@ def test_detection_validation_identity_image_bounds_and_immutability():
         _correlate(cameras, outside)
 
 
-def test_capture_timestamp_uncertainty_is_enforced_and_propagated():
+def test_moving_capture_timestamps_are_exact_and_measurement_offset_is_propagated():
     cameras = _rig()[:2]
     target = np.array([2.0, 3.0, 4.0])
     mixed = [
@@ -352,14 +430,14 @@ def test_capture_timestamp_uncertainty_is_enforced_and_propagated():
     with pytest.raises(ValueError, match="cannot be mixed"):
         _correlate(cameras, mixed)
 
-    stale = [
+    asynchronous = [
         _detection(0, cameras[0].project(target), timestamp=10.0, camera_id="cam0"),
         _detection(1, cameras[1].project(target), timestamp=10.2, camera_id="cam1"),
     ]
-    with pytest.raises(ValueError, match="max_time_skew"):
-        _correlate(cameras, stale, max_time_skew=0.05)
+    with pytest.raises(ValueError, match="exactly simultaneous"):
+        _correlate(cameras, asynchronous, max_time_skew=0.5)
 
-    synchronized = [
+    uncertain = [
         _detection(
             0,
             cameras[0].project(target),
@@ -370,21 +448,33 @@ def test_capture_timestamp_uncertainty_is_enforced_and_propagated():
         _detection(
             1,
             cameras[1].project(target),
-            timestamp=10.01,
+            timestamp=10.0,
             camera_id="cam1",
             timestamp_std_s=0.001,
         ),
     ]
-    fused = _correlate(cameras, synchronized, max_time_skew=0.05, max_speed_mps=20.0)
+    with pytest.raises(ValueError, match="zero relative timestamp uncertainty"):
+        _correlate(cameras, uncertain, max_time_skew=0.5)
+
+    synchronized = [
+        _detection(
+            index,
+            camera.project(target),
+            timestamp=10.0,
+            camera_id=camera.name,
+        )
+        for index, camera in enumerate(cameras)
+    ]
+    fused = _correlate(cameras, synchronized, max_time_skew=0.0, max_speed_mps=20.0)
     assert len(fused) == 1
-    assert fused[0].timestamp == 10.01
-    assert fused[0].time_uncertainty_s == pytest.approx(0.012)
+    assert fused[0].timestamp == 10.0
+    assert fused[0].time_uncertainty_s == 0.0
     assert fused[0].camera_ids == ("cam0", "cam1")
     measurements = to_measurements(fused)
-    assert measurements[0].timestamp == 10.01
+    assert measurements[0].timestamp == 10.0
     assert np.allclose(measurements[0].covariance, fused[0].position_covariance)
 
-    later = to_measurements(fused, timestamp=10.02)[0]
+    later = to_measurements(fused, timestamp=10.01)[0]
     expected_added_variance = (20.0 * 0.01) ** 2
     assert np.allclose(
         later.covariance - measurements[0].covariance,
@@ -392,16 +482,67 @@ def test_capture_timestamp_uncertainty_is_enforced_and_propagated():
     )
 
 
-def test_pixel_and_time_uncertainty_increase_output_covariance():
+def test_asynchronous_far_target_perfect_fit_is_rejected_despite_small_legacy_covariance():
+    intrinsics = np.diag([1000.0, 1000.0, 1.0])
+    cameras = [
+        Camera(intrinsics, np.eye(3), np.zeros(3), name="cam0"),
+        Camera(intrinsics, np.eye(3), [-10.0, 0.0, 0.0], name="cam1"),
+    ]
+    first_position = np.array([0.0, 0.0, 500.0])
+    second_position = np.array([1.0, 0.0, 500.0])
+    pixels = [
+        cameras[0].project(first_position),
+        cameras[1].project(second_position),
+    ]
+
+    # For rectified baseline B, depth Z, and between-view lateral motion dx,
+    # static triangulation gives Z_hat = B*Z/(B-dx), hence depth error
+    # Z*dx/(B-dx). Here that is 500/9 = 55.56 m even though the two asynchronous
+    # rays intersect exactly. The former speed*skew covariance heuristic
+    # reported only about 1.1 m depth sigma.
+    aliased = triangulate_dlt(cameras, pixels, min_ray_angle_deg=1.0)
+    geometric_covariance = triangulation_covariance(
+        cameras,
+        pixels,
+        [0.01, 0.01],
+        min_ray_angle_deg=1.0,
+    )
+    legacy_covariance = geometric_covariance + np.eye(3) * (100.0 * 0.01) ** 2
+    assert np.linalg.norm(aliased - second_position) == pytest.approx(55.56455, rel=1e-6)
+    assert reprojection_error(cameras, pixels, aliased) < 1e-12
+    assert np.sqrt(legacy_covariance[2, 2]) == pytest.approx(1.0911, rel=1e-3)
+
+    detections = [
+        _detection(
+            index,
+            pixel,
+            timestamp=index * 0.01,
+            camera_id=camera.name,
+            pixel_std_px=0.01,
+        )
+        for index, (camera, pixel) in enumerate(zip(cameras, pixels))
+    ]
+    for ordered in (detections, list(reversed(detections))):
+        with pytest.raises(ValueError, match="exactly simultaneous"):
+            correlate_and_triangulate(
+                cameras,
+                ordered,
+                max_time_skew=0.02,
+                max_speed_mps=100.0,
+                min_ray_angle_deg=1.0,
+            )
+
+
+def test_pixel_uncertainty_increases_output_covariance():
     cameras = _rig()[:2]
     target = np.array([2.0, 3.0, 4.0])
 
-    def fuse(pixel_std: float, second_timestamp: float):
+    def fuse(pixel_std: float):
         detections = [
             _detection(
                 index,
                 camera.project(target),
-                timestamp=second_timestamp if index else 20.0,
+                timestamp=20.0,
                 pixel_std_px=pixel_std,
             )
             for index, camera in enumerate(cameras)
@@ -413,11 +554,9 @@ def test_pixel_and_time_uncertainty_increase_output_covariance():
             max_speed_mps=50.0,
         )[0]
 
-    low_pixel = fuse(0.25, 20.0)
-    high_pixel = fuse(2.0, 20.0)
-    skewed = fuse(0.25, 20.02)
+    low_pixel = fuse(0.25)
+    high_pixel = fuse(2.0)
     assert np.trace(high_pixel.position_covariance) > np.trace(low_pixel.position_covariance)
-    assert np.all(np.diag(skewed.position_covariance) > np.diag(low_pixel.position_covariance))
 
 
 def test_uncertainty_and_work_inputs_fail_closed_when_absent_or_exceeded():
@@ -426,6 +565,13 @@ def test_uncertainty_and_work_inputs_fail_closed_when_absent_or_exceeded():
     detections = [_detection(index, camera.project(target)) for index, camera in enumerate(cameras)]
     with pytest.raises(ValueError, match="max_speed_mps is required"):
         correlate_and_triangulate(cameras, detections)
+    with pytest.raises(ValueError, match="simultaneous_capture must be a boolean"):
+        correlate_and_triangulate(
+            cameras,
+            detections,
+            max_speed_mps=100.0,
+            simultaneous_capture=1,  # type: ignore[arg-type]
+        )
     with pytest.raises(ValueError, match="camera count"):
         _correlate(cameras, detections, max_cameras=2)
     with pytest.raises(ValueError, match="detection count"):
@@ -639,7 +785,7 @@ def test_correlation_is_deterministic_under_input_reversal():
             camera.project(target),
             label,
             0.9,
-            timestamp=20.0 + camera_index * 0.001,
+            timestamp=20.0,
             camera_id=camera.name,
         )
         for camera_index, camera in enumerate(cameras)

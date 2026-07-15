@@ -203,6 +203,15 @@ from manwe.export import (
 )
 ```
 
+For a non-zero multi-camera target-speed bound, all timestamped detections in a
+batch must have exactly the same capture timestamp and zero relative timestamp
+uncertainty. Untimestamped batches additionally require the explicit
+`simultaneous_capture=True` acknowledgement. This is a physical exposure-time
+contract, not merely clock synchronization: asynchronous rays can intersect with
+near-zero reprojection error at a badly biased depth, so isotropic speed/skew
+covariance cannot make moving-target triangulation sound. Static-scene callers
+may set `max_speed_mps=0` and opt into bounded `max_time_skew`.
+
 ## Consumer integration status
 
 No reviewed consumer is currently a zero-adaptation target. In particular,
