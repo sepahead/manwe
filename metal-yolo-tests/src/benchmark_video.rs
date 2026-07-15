@@ -20,10 +20,14 @@ use manwe::secure_io::{
     read_bounded_regular_file, resolve_executable, sha256_bounded_open_file, sha256_hex,
     BoundDirectory, FileIdentity, MAX_MODEL_BYTES, MAX_VIDEO_BYTES,
 };
+use manwe::{validate_coco_detection_output_schema, validate_coco_model_output};
 
 const NUM_CLASSES: usize = 80;
 const INPUT_W: usize = 640;
 const INPUT_H: usize = 640;
+const EXPECTED_COCO_PREDICTIONS: usize = (INPUT_W / 8) * (INPUT_H / 8)
+    + (INPUT_W / 16) * (INPUT_H / 16)
+    + (INPUT_W / 32) * (INPUT_H / 32);
 const MAX_VIDEO_FRAMES: u64 = 1_000_000;
 const MAX_PREDICTIONS: usize = 100_000;
 const MAX_CANDIDATES: usize = 2_000;
@@ -680,7 +684,9 @@ fn main() -> anyhow::Result<()> {
     {
         let dummy = Tensor::zeros((1, 3, INPUT_H, INPUT_W), DType::F32, &device)?;
         let prediction = model.forward(&dummy)?;
-        let _ = prediction.i((0, 0, 0))?.to_scalar::<f32>()?;
+        validate_coco_detection_output_schema(&prediction, EXPECTED_COCO_PREDICTIONS)?;
+        device.synchronize()?;
+        let _validated_prediction = validate_coco_model_output(&prediction)?;
     }
 
     // 2. Setup Input Pipe (FFmpeg -> Rust)
@@ -909,7 +915,7 @@ fn main() -> anyhow::Result<()> {
                 .unsqueeze(0)?
                 .to_dtype(DType::F32)?;
             let tensor = (tensor * (1.0 / 255.0))?;
-            let _ = tensor.i((0, 0, 0, 0))?.to_scalar::<f32>()?;
+            device.synchronize()?;
             let t_preprocess_end = Instant::now();
             let preprocess_upload_sync_ms = t_preprocess_end
                 .duration_since(t_preprocess_start)
@@ -917,11 +923,14 @@ fn main() -> anyhow::Result<()> {
                 * 1000.0;
             preprocess_upload_sync_times.push(preprocess_upload_sync_ms);
 
-            // 2. Model forward, synchronized without copying the full output.
+            // 2. Time model forward through a transfer-free device synchronization barrier.
             let t_forward_start = Instant::now();
             let preds = model.forward(&tensor)?;
-            let _ = preds.i((0, 0, 0))?.to_scalar::<f32>()?;
+            validate_coco_detection_output_schema(&preds, EXPECTED_COCO_PREDICTIONS)?;
+            device.synchronize()?;
             let t_forward_end = Instant::now();
+            // A full validation copy gates the run but is not part of model-forward latency.
+            let preds_host = validate_coco_model_output(&preds)?;
             let model_forward_sync_ms =
                 t_forward_end.duration_since(t_forward_start).as_secs_f64() * 1000.0;
             model_forward_sync_times.push(model_forward_sync_ms);
@@ -942,9 +951,10 @@ fn main() -> anyhow::Result<()> {
 
             // Video Writing (Optional)
             if let Some(ref mut writer) = output_stdin {
-                use candle_transformers::object_detection::{non_maximum_suppression, Bbox};
+                use candle_transformers::object_detection::Bbox;
+                use manwe::class_aware_non_maximum_suppression;
 
-                let pred = preds.i(0)?;
+                let pred = preds_host.i(0)?;
                 let (pred_size, npreds) = pred.dims2()?;
                 if pred_size != 4 + NUM_CLASSES {
                     anyhow::bail!("video renderer requires the COCO-80 detection schema")
@@ -952,15 +962,14 @@ fn main() -> anyhow::Result<()> {
                 if npreds > MAX_PREDICTIONS {
                     anyhow::bail!("prediction count exceeds the renderer limit")
                 }
-                let pred_host = pred.to_device(&Device::Cpu)?;
                 let nclasses = NUM_CLASSES;
                 let mut bboxes: Vec<Vec<Bbox<Vec<()>>>> = (0..nclasses).map(|_| vec![]).collect();
                 let mut candidate_count = 0_usize;
 
                 for index in 0..npreds {
-                    let p_vec = Vec::<f32>::try_from(pred_host.i((.., index))?)?;
+                    let p_vec = Vec::<f32>::try_from(pred.i((.., index))?)?;
                     if p_vec.iter().any(|value| !value.is_finite()) {
-                        continue;
+                        anyhow::bail!("model output must contain only finite values")
                     }
                     let Some(confidence) = p_vec[4..].iter().copied().max_by(f32::total_cmp) else {
                         continue;
@@ -987,7 +996,7 @@ fn main() -> anyhow::Result<()> {
                         candidate_count += 1;
                     }
                 }
-                non_maximum_suppression(&mut bboxes, 0.45);
+                class_aware_non_maximum_suppression(&mut bboxes, 0.45)?;
 
                 let mut img_buf = ImageBuffer::<Rgb<u8>, _>::from_raw(
                     INPUT_W as u32,
@@ -1162,9 +1171,9 @@ fn main() -> anyhow::Result<()> {
         "max_frames": args.max_frames,
         "max_duration_seconds": args.max_duration_seconds,
         "frame_limit_reached": frame_limit_reached.load(Ordering::Relaxed),
-        "inference_scope": "preprocess/upload through model-forward completion with a scalar synchronization barrier after each stage",
-        "latency_scope": "selected raw-frame pipe read call start through synchronized model-forward completion; source capture and NMS/rendering/encoding excluded",
-        "processed_fps_scope": "reader-start to final processed frame; includes producer pacing, frame drops, and optional rendering/encoder-pipe writes but excludes encoder finalization",
+        "inference_scope": "preprocess/upload through model-forward completion with transfer-free device synchronization after each stage; metadata-only fixed [1,84,8400] COCO output schema validation included, full-output device compaction, CPU readback, and finite-value validation excluded",
+        "latency_scope": "selected raw-frame pipe read call start through synchronized model-forward completion; source capture, full-output device compaction, CPU readback, finite-value validation, and NMS/rendering/encoding excluded",
+        "processed_fps_scope": "reader-start to final processed frame; includes producer pacing, frame drops, full-output device compaction, CPU readback, finite-value validation, and optional rendering/encoder-pipe writes but excludes encoder finalization",
         "producer_pacing": "reader thread paced at target_fps; 0 means unthrottled",
         "save_video": args.save_video,
         "output_video": evidence.output_path(),
@@ -1204,6 +1213,11 @@ mod tests {
             .spawn()
             .unwrap();
         ChildGuard::new(child)
+    }
+
+    #[test]
+    fn fixed_video_input_has_the_expected_yolov8_prediction_count() {
+        assert_eq!(EXPECTED_COCO_PREDICTIONS, 8_400);
     }
 
     #[test]

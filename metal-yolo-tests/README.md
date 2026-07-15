@@ -63,10 +63,14 @@ images, hashes their bytes into an ordered manifest, and rechecks each digest wh
 the input is decoded. Images are processed one at a time rather than retained as a
 large tensor collection.
 
-The timed boundary includes CPU-to-device upload, model forward execution, and a
-scalar device readback used for synchronization. It excludes model loading, image
-decode, letterboxing, raw-output decode, confidence filtering, NMS, and annotation.
-The JSON records that scope explicitly.
+The timed boundary includes CPU-to-device upload, model forward execution, a
+metadata-only check for the fixed `[1, 84, 8400]` COCO output schema, and a
+transfer-free device synchronization barrier. It excludes model loading, image
+decode, letterboxing, full-output device compaction, CPU readback, finite-value
+validation, confidence filtering, NMS, and annotation. Reported static FPS is
+derived from those timed samples and therefore has the same exclusions. The JSON
+records that scope explicitly. Every output is still fully validated before
+evidence is published.
 
 The run identifier is reserved before model work begins. Results are written,
 synced, and verified inside a private
@@ -96,10 +100,14 @@ when an annotated artifact is needed. The result includes the source-video diges
 model digest, FFmpeg path and digest, selected demuxer, presented/processed counts,
 drop rate, selected-frame raw-pipe read wait, synchronized preprocess/upload and
 model-forward stage times, raw-pipe-to-forward latency, and (when requested) the
-output-video digest. The stage split uses a scalar synchronization barrier after
-normalized input preparation and another after model forward. Latency starts when
-the reader requests a selected raw frame and ends when model forward synchronizes;
-it excludes source capture plus optional NMS, rendering, and encoding.
+output-video digest. The stage split uses transfer-free device synchronization
+after normalized input preparation and model forward; the fixed 8,400-prediction
+COCO schema check precedes the latter barrier. Latency starts when the reader
+requests a selected raw frame and ends when model forward synchronizes. It
+excludes source capture, the subsequent full-output device compaction, CPU
+readback, and finite-value validation, plus optional NMS, rendering, and encoding.
+Wall-clock processed FPS does include that full-output validation and optional
+rendering/encoder-pipe writes.
 FFmpeg decode and output failures are surfaced; output paths are reserved before
 work begins and final names are published only after verification. Failures before
 the first final link clean staging. Once either the optional video or result link

@@ -50,8 +50,18 @@ This is the first planned tagged alpha after the untagged Rust/Candle prototypes
 - Rust inference now requires local digest-bound safetensors, validates tensor and
   image bounds, preserves aspect ratio with letterboxing, and fails closed at
   unsupported filesystem boundaries.
+- Rust YOLO postprocessing now uses continuous-coordinate IoU instead of
+  Candle's inclusive integer-pixel convention, validates every raw output value
+  before any visible result, and uses the canonical Ultralytics COCO labels.
+- SPPF max pooling now pads with negative infinity like PyTorch instead of zero;
+  non-zero odd kernels and a full-grid production-kernel oracle pin the shape and
+  border semantics.
+- Export contracts now accept only bounded canonical tensor metadata tied to the
+  receipt's static image size and class count. Export preflight rejects stride-
+  rounded image sizes and unsupported end-to-end heads before artifact creation.
 - The Metal benchmark harness now reuses the root model implementation, records
-  immutable evidence, bounds work, and removes incomparable legacy runners.
+  digest-verified no-replace evidence, bounds work, validates the fixed COCO
+  schema and every finite output value, and removes incomparable legacy runners.
 - Camera URLs and model paths are supplied at runtime; credential-bearing values
   are no longer embedded or echoed by current source.
 - Raised the Rust floor from 1.88 to 1.95 across both crates, CI, and the docs.

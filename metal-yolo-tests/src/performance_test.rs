@@ -20,21 +20,25 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use anyhow::Context;
-use candle::{DType, Device, IndexOp, Tensor};
+use candle::{DType, Device, Tensor};
 use candle_nn::{Module, VarBuilder};
 use clap::Parser;
 use manwe::model::{Multiples, YoloV8};
-use manwe::prepare_image;
 use manwe::secure_io::{
     open_bounded_regular_file, read_bounded_open_file, read_bounded_regular_file,
     read_bounded_regular_file_with_identity, sha256_hex, BoundDirectory, FileIdentity,
     MAX_ENCODED_IMAGE_BYTES, MAX_MODEL_BYTES,
 };
+use manwe::{prepare_image, validate_coco_detection_output_schema, validate_coco_model_output};
 use serde_json::json;
 
 /// Benchmark configuration.
 const WARMUP_ITERATIONS: usize = 10;
 const NUM_COCO_CLASSES: usize = 80;
+const INPUT_SIZE: usize = 640;
+const EXPECTED_COCO_PREDICTIONS: usize = (INPUT_SIZE / 8) * (INPUT_SIZE / 8)
+    + (INPUT_SIZE / 16) * (INPUT_SIZE / 16)
+    + (INPUT_SIZE / 32) * (INPUT_SIZE / 32);
 const MAX_DIRECTORY_ENTRIES: usize = 100_000;
 const MAX_RESULT_BYTES: usize = 64 * 1024 * 1024;
 
@@ -118,7 +122,7 @@ fn load_selected_image(selected: &SelectedImage) -> anyhow::Result<Tensor> {
         )
     }
     let original = decode_image_bytes(&bytes)?;
-    let (tensor, _) = prepare_image(&original, 640, 32, &Device::Cpu)?;
+    let (tensor, _) = prepare_image(&original, INPUT_SIZE, 32, &Device::Cpu)?;
     Ok(tensor)
 }
 
@@ -301,13 +305,6 @@ fn timing_summary(latencies_ms: &[f64]) -> anyhow::Result<(f64, f64, f64)> {
     Ok((total_ms / 1000.0, 1000.0 / average_ms, average_ms))
 }
 
-/// Force GPU synchronization by reading a value back to CPU.
-fn sync_metal(tensor: &Tensor) -> anyhow::Result<()> {
-    // Pull a single scalar instead of the whole tensor to avoid large GPU->CPU copies.
-    let _ = tensor.flatten_all()?.i(0)?.to_scalar::<f32>()?;
-    Ok(())
-}
-
 fn run_dir() -> anyhow::Result<PathBuf> {
     let dir = env::var("RUN_DIR").unwrap_or_else(|_| ".".to_string());
     let path = PathBuf::from(dir);
@@ -424,7 +421,9 @@ fn main() -> anyhow::Result<()> {
     for _ in 0..WARMUP_ITERATIONS {
         let img_dev = first_img.to_device(&device)?;
         let pred = model.forward(&img_dev)?;
-        sync_metal(&pred)?;
+        validate_coco_detection_output_schema(&pred, EXPECTED_COCO_PREDICTIONS)?;
+        device.synchronize()?;
+        let _validated_pred = validate_coco_model_output(&pred)?;
     }
     println!("Warmup complete.");
     println!();
@@ -439,9 +438,12 @@ fn main() -> anyhow::Result<()> {
 
         let img_dev = img.to_device(&device)?;
         let pred = model.forward(&img_dev)?;
-        sync_metal(&pred)?;
+        validate_coco_detection_output_schema(&pred, EXPECTED_COCO_PREDICTIONS)?;
+        device.synchronize()?;
 
         let frame_time = frame_start.elapsed();
+        // Full output validation gates evidence without changing the inference sample.
+        let _validated_pred = validate_coco_model_output(&pred)?;
         latencies_ms.push(frame_time.as_secs_f64() * 1000.0);
     }
 
@@ -488,12 +490,12 @@ fn main() -> anyhow::Result<()> {
 
     let results = json!({
         "model": "YOLOv8s",
-        "implementation": "Rust (Candle 0.9.2)",
+        "implementation": "Rust (Candle 0.11.0)",
         "device": "Metal GPU",
         "precision": "FP32",
         "model_sha256": model_sha256,
-        "timing_scope": "host-to-device upload + model forward + synchronization",
-        "excluded_from_timing": ["image decode", "resize/letterbox", "normalization", "NMS/postprocess", "rendering"],
+        "timing_scope": "host-to-device upload + model forward + metadata-only fixed [1,84,8400] COCO output schema validation + transfer-free device synchronization",
+        "excluded_from_timing": ["full-output device compaction, CPU readback, and finite-value validation", "image decode", "resize/letterbox", "normalization", "NMS/postprocess", "rendering"],
         "input_selection": "lexicographically sorted file names, first N valid images",
         "input_manifest": input_manifest,
         "image_dir": image_dir,
@@ -533,6 +535,11 @@ mod tests {
             std::process::id(),
             std::thread::current().id()
         ))
+    }
+
+    #[test]
+    fn fixed_static_input_has_the_expected_yolov8_prediction_count() {
+        assert_eq!(EXPECTED_COCO_PREDICTIONS, 8_400);
     }
 
     #[test]
