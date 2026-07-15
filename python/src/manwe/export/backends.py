@@ -8,6 +8,7 @@ supported conversion target here.
 
 from __future__ import annotations
 
+import math
 import os
 import shutil
 import stat
@@ -30,6 +31,50 @@ from ..common.logging import get_logger
 from ..common.ultralytics import harden_ultralytics_runtime, verify_ultralytics_policy
 
 log = get_logger("manwe.export")
+
+_MAX_MODEL_STRIDES = 64
+_MAX_MODEL_STRIDE_NODES = 128
+
+
+def _checkpoint_max_stride(value: object) -> int:
+    """Return a bounded positive integer stride from backend model metadata."""
+    if hasattr(value, "tolist"):
+        try:
+            value = value.tolist()
+        except Exception as exc:
+            raise ValueError("checkpoint stride metadata could not be inspected") from exc
+
+    flattened: list[object] = []
+    pending = [value]
+    visited_nodes = 0
+    while pending:
+        item = pending.pop()
+        visited_nodes += 1
+        if visited_nodes > _MAX_MODEL_STRIDE_NODES:
+            raise ValueError("checkpoint stride metadata exceeds the bounded structure limit")
+        if isinstance(item, (list, tuple)):
+            pending.extend(reversed(item))
+            continue
+        flattened.append(item)
+        if len(flattened) > _MAX_MODEL_STRIDES:
+            raise ValueError(
+                f"checkpoint stride metadata exceeds the {_MAX_MODEL_STRIDES}-value limit"
+            )
+    if not flattened:
+        raise ValueError("checkpoint stride metadata must not be empty")
+    strides: list[int] = []
+    for item in flattened:
+        if (
+            isinstance(item, bool)
+            or not isinstance(item, (int, float))
+            or not math.isfinite(item)
+            or item <= 0
+            or not float(item).is_integer()
+            or item > 4096
+        ):
+            raise ValueError("checkpoint strides must be positive integers no greater than 4096")
+        strides.append(int(item))
+    return max(strides)
 
 
 @dataclass(frozen=True)
@@ -517,9 +562,21 @@ def export_model(
             raise ValueError(
                 f"checkpoint task must be 'detect', got {getattr(model, 'task', None)!r}"
             )
-        end_to_end = bool(getattr(getattr(model, "model", None), "end2end", False))
-        if nms and end_to_end:
-            raise ValueError("embedded NMS is incompatible with an end-to-end detector head")
+        model_graph = getattr(model, "model", None)
+        end_to_end = getattr(model_graph, "end2end", None)
+        if type(end_to_end) is not bool:
+            raise ValueError("checkpoint must expose a boolean end2end model flag")
+        if end_to_end:
+            raise ValueError(
+                "end-to-end detector exports are not supported until their output graph "
+                "can be independently inspected"
+            )
+        max_stride = _checkpoint_max_stride(getattr(model_graph, "stride", None))
+        if imgsz % max_stride != 0:
+            raise ValueError(
+                f"imgsz={imgsz} must be divisible by checkpoint max stride {max_stride}; "
+                "the exporter otherwise rounds the graph shape and falsifies the receipt"
+            )
         source_classes = _ordered_class_names(getattr(model, "names", None))
         class_count = len(source_classes)
 
@@ -571,7 +628,7 @@ def export_model(
             opset=opset if export_format in {"onnx", "tensorrt"} else None,
             class_count=class_count,
             source_classes=source_classes,
-            end_to_end=end_to_end,
+            end_to_end=False,
             calibration_manifest_sha256=calibration_sha256,
         )
     finally:

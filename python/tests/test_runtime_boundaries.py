@@ -315,7 +315,7 @@ def test_int8_export_uses_digest_bound_private_snapshot_and_fails_closed(
 
     class FakeModel:
         task = "detect"
-        model = SimpleNamespace(end2end=False)
+        model = SimpleNamespace(end2end=False, stride=[8, 16, 32])
         names = {0: "drone"}
 
         def __init__(self, model_path):
@@ -731,7 +731,7 @@ def test_export_uses_pinned_backend_kwargs_and_validates_model_task(tmp_path, mo
 
     class FakeModel:
         task = "detect"
-        model = SimpleNamespace(end2end=False)
+        model = SimpleNamespace(end2end=False, stride=[8, 16, 32])
         names = {0: "drone"}
 
         def __init__(self, model_path):
@@ -777,6 +777,74 @@ def test_export_uses_pinned_backend_kwargs_and_validates_model_task(tmp_path, mo
             allow_pickle_checkpoint=True,
             device="cpu",
         )
+
+
+@pytest.mark.parametrize(
+    ("end2end", "stride", "imgsz", "message"),
+    (
+        (False, [8, 16, 32], 641, "divisible"),
+        (False, None, 640, "strides"),
+        (False, [], 640, "must not be empty"),
+        (False, [8.5, 32], 640, "positive integers"),
+        (False, [0, 32], 640, "positive integers"),
+        (True, [8, 16, 32], 640, "end-to-end"),
+    ),
+)
+def test_export_rejects_receipt_shape_ambiguity_before_backend_export(
+    tmp_path, monkeypatch, end2end, stride, imgsz, message
+):
+    backends = importlib.import_module("manwe.export.backends")
+    monkeypatch.setattr(backends, "harden_ultralytics_runtime", lambda: None)
+    monkeypatch.setattr(backends, "verify_ultralytics_policy", lambda: None)
+    checkpoint = tmp_path / "ambiguous.pt"
+    checkpoint.write_bytes(b"fixture")
+    digest = hashlib.sha256(b"fixture").hexdigest()
+    output = tmp_path / "ambiguous.onnx"
+    export_calls = 0
+
+    class FakeModel:
+        task = "detect"
+        names = {0: "drone"}
+
+        def __init__(self, _model_path):
+            self.model = SimpleNamespace(end2end=end2end, stride=stride)
+
+        def export(self, **_kwargs):
+            nonlocal export_calls
+            export_calls += 1
+            raise AssertionError("backend export must not run after a failed preflight")
+
+    monkeypatch.setitem(sys.modules, "ultralytics", SimpleNamespace(YOLO=FakeModel))
+    with pytest.raises(ValueError, match=message):
+        export_model(
+            str(checkpoint),
+            ["onnx"],
+            output=str(output),
+            weights_sha256=digest,
+            allow_pickle_checkpoint=True,
+            imgsz=imgsz,
+            device="cpu",
+        )
+
+    assert export_calls == 0
+    assert not output.exists()
+
+
+def test_checkpoint_stride_metadata_has_bounded_nonrecursive_traversal():
+    from manwe.export.backends import _checkpoint_max_stride
+
+    assert _checkpoint_max_stride((8, [16, 32.0])) == 32
+    cycle = []
+    cycle.append(cycle)
+    with pytest.raises(ValueError, match="bounded structure"):
+        _checkpoint_max_stride(cycle)
+
+    class BrokenStride:
+        def tolist(self):
+            raise OSError("unloadable device metadata")
+
+    with pytest.raises(ValueError, match="could not be inspected"):
+        _checkpoint_max_stride(BrokenStride())
 
 
 def test_training_config_rejects_nonfinite_and_ambiguous_values(tmp_path, monkeypatch):
