@@ -2,6 +2,7 @@
 all-features = true
 
 [advisories]
+yanked = "deny"
 ignore = [
   { id = "RUSTSEC-2024-0436", reason = "Transitive through Candle/gemm; no fixed release is available. Monitor upstream replacement of paste." },
   { id = "RUSTSEC-2026-0192", reason = "Transitive through ab_glyph/imageproc; no fixed release is available. No untrusted font parser API is exposed." },

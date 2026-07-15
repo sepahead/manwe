@@ -32,6 +32,9 @@ This is the first planned tagged alpha after the untagged Rust/Candle prototypes
 - Radar measurements and EKF updates now reject zero-range and vertical-axis
   polar singularities instead of silently consuming evidence with a zero
   Jacobian.
+- Updated the optional viewer graph from yanked `spin` 0.10.0 to 0.10.1, which
+  fixes unsound consuming operations, and made future yanked crates a
+  dependency-policy error.
 - Rust inference now requires local digest-bound safetensors, validates tensor and
   image bounds, preserves aspect ratio with letterboxing, and fails closed at
   unsupported filesystem boundaries.
