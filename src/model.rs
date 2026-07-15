@@ -212,8 +212,42 @@ struct Sppf {
     span: tracing::Span,
 }
 
+fn pad_for_max_pool(xs: &Tensor, dim: usize, left: usize, right: usize) -> Result<Tensor> {
+    if left == 0 && right == 0 {
+        return Ok(xs.clone());
+    }
+
+    xs.dim(dim)?;
+    let padding = |length| {
+        let mut dims = xs.dims().to_vec();
+        dims[dim] = length;
+        // PyTorch's MaxPool2d treats implicit padding as negative infinity, so
+        // padding can never replace a finite activation in the maximum.
+        Tensor::full(f32::NEG_INFINITY, dims.as_slice(), xs.device())?.to_dtype(xs.dtype())
+    };
+
+    match (left, right) {
+        (0, right) => Tensor::cat(&[xs, &padding(right)?], dim),
+        (left, 0) => Tensor::cat(&[&padding(left)?, xs], dim),
+        (left, right) => Tensor::cat(&[&padding(left)?, xs, &padding(right)?], dim),
+    }
+}
+
+fn max_pool2d_with_same_padding(xs: &Tensor, kernel_size: usize) -> Result<Tensor> {
+    if kernel_size == 0 || kernel_size.is_multiple_of(2) {
+        candle::bail!("same-padded max pooling requires a non-zero odd kernel size")
+    }
+    let padding = kernel_size / 2;
+    let xs = pad_for_max_pool(xs, 2, padding, padding)?;
+    let xs = pad_for_max_pool(&xs, 3, padding, padding)?;
+    xs.max_pool2d_with_stride(kernel_size, 1)
+}
+
 impl Sppf {
     fn load(vb: VarBuilder, c1: usize, c2: usize, k: usize) -> Result<Self> {
+        if k == 0 || k.is_multiple_of(2) {
+            candle::bail!("SPPF requires a non-zero odd pooling kernel size")
+        }
         let c_ = c1 / 2;
         let cv1 = ConvBlock::load(vb.pp("cv1"), c1, c_, 1, 1, None)?;
         let cv2 = ConvBlock::load(vb.pp("cv2"), c_ * 4, c2, 1, 1, None)?;
@@ -231,18 +265,9 @@ impl Module for Sppf {
         let _enter = self.span.enter();
         let (_, _, _, _) = xs.dims4()?;
         let xs = self.cv1.forward(xs)?;
-        let xs2 = xs
-            .pad_with_zeros(2, self.k / 2, self.k / 2)?
-            .pad_with_zeros(3, self.k / 2, self.k / 2)?
-            .max_pool2d_with_stride(self.k, 1)?;
-        let xs3 = xs2
-            .pad_with_zeros(2, self.k / 2, self.k / 2)?
-            .pad_with_zeros(3, self.k / 2, self.k / 2)?
-            .max_pool2d_with_stride(self.k, 1)?;
-        let xs4 = xs3
-            .pad_with_zeros(2, self.k / 2, self.k / 2)?
-            .pad_with_zeros(3, self.k / 2, self.k / 2)?
-            .max_pool2d_with_stride(self.k, 1)?;
+        let xs2 = max_pool2d_with_same_padding(&xs, self.k)?;
+        let xs3 = max_pool2d_with_same_padding(&xs2, self.k)?;
+        let xs4 = max_pool2d_with_same_padding(&xs3, self.k)?;
         self.cv2.forward(&Tensor::cat(&[&xs, &xs2, &xs3, &xs4], 1)?)
     }
 }
@@ -855,6 +880,147 @@ impl Module for YoloV8Pose {
 mod tests {
     use super::*;
     use candle::Device;
+
+    fn sppf_selecting_first_pool(device: &Device, kernel_size: usize) -> Result<Sppf> {
+        let cv1_weight = Tensor::from_slice(&[1f32, 0.], (1, 2, 1, 1), device)?;
+        let cv2_weight = Tensor::from_slice(&[0f32, 1., 0., 0.], (1, 4, 1, 1), device)?;
+        Ok(Sppf {
+            cv1: ConvBlock {
+                conv: Conv2d::new(cv1_weight, None, Conv2dConfig::default()),
+                span: tracing::Span::none(),
+            },
+            cv2: ConvBlock {
+                conv: Conv2d::new(cv2_weight, None, Conv2dConfig::default()),
+                span: tracing::Span::none(),
+            },
+            k: kernel_size,
+            span: tracing::Span::none(),
+        })
+    }
+
+    #[test]
+    fn sppf_keeps_all_negative_border_activations_negative() -> Result<()> {
+        let device = Device::Cpu;
+        let sppf = sppf_selecting_first_pool(&device, 5)?;
+        let xs = Tensor::full(-1f32, (1, 2, 3, 3), &device)?;
+
+        let edge = sppf.forward(&xs)?.i((0, 0, 0, 0))?.to_scalar::<f32>()?;
+
+        assert!(edge < 0., "SPPF border activation was {edge}");
+        Ok(())
+    }
+
+    #[cfg(all(feature = "metal", target_os = "macos"))]
+    #[test]
+    fn sppf_keeps_all_negative_border_activations_negative_on_metal() -> Result<()> {
+        let device = Device::new_metal(0)?;
+        let sppf = sppf_selecting_first_pool(&device, 5)?;
+        let xs = Tensor::full(-1f32, (1, 2, 3, 3), &device)?;
+
+        let edge = sppf.forward(&xs)?.i((0, 0, 0, 0))?.to_scalar::<f32>()?;
+
+        assert!(edge < 0., "SPPF border activation was {edge}");
+        Ok(())
+    }
+
+    #[cfg(all(feature = "metal", target_os = "macos"))]
+    #[test]
+    fn sppf_pool_padding_is_negative_for_supported_metal_float_dtypes() -> Result<()> {
+        let device = Device::new_metal(0)?;
+        for dtype in [DType::F16, DType::BF16, DType::F32] {
+            let xs = Tensor::full(-1f32, (1, 1, 1, 1), &device)?.to_dtype(dtype)?;
+            let edge = max_pool2d_with_same_padding(&xs, 3)?
+                .to_dtype(DType::F32)?
+                .i((0, 0, 0, 0))?
+                .to_scalar::<f32>()?;
+            assert_eq!(edge, -1., "unexpected {dtype:?} pooled edge");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn sppf_pool_padding_is_negative_for_supported_cpu_float_dtypes() -> Result<()> {
+        let device = Device::Cpu;
+        for dtype in [DType::F16, DType::BF16, DType::F32, DType::F64] {
+            let xs = Tensor::full(-1f32, (1, 1, 1, 1), &device)?.to_dtype(dtype)?;
+            let edge = max_pool2d_with_same_padding(&xs, 3)?
+                .to_dtype(DType::F32)?
+                .i((0, 0, 0, 0))?
+                .to_scalar::<f32>()?;
+            assert_eq!(edge, -1., "unexpected {dtype:?} pooled edge");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn sppf_preserves_non_square_spatial_shape() -> Result<()> {
+        let device = Device::Cpu;
+        let sppf = sppf_selecting_first_pool(&device, 5)?;
+        let xs = Tensor::ones((2, 2, 4, 6), DType::F32, &device)?;
+
+        let shape = sppf.forward(&xs)?.dims4()?;
+
+        assert_eq!(shape, (2, 1, 4, 6));
+        Ok(())
+    }
+
+    #[test]
+    fn sppf_keeps_positive_border_activations_positive() -> Result<()> {
+        let device = Device::Cpu;
+        let sppf = sppf_selecting_first_pool(&device, 5)?;
+        let xs = Tensor::ones((1, 2, 3, 3), DType::F32, &device)?;
+
+        let edge = sppf.forward(&xs)?.i((0, 0, 0, 0))?.to_scalar::<f32>()?;
+
+        assert!(edge > 0., "SPPF border activation was {edge}");
+        Ok(())
+    }
+
+    #[test]
+    fn sppf_same_pool_rejects_zero_and_even_kernels() {
+        let device = Device::Cpu;
+        let xs = Tensor::zeros((1, 1, 3, 3), DType::F32, &device).unwrap();
+        assert!(max_pool2d_with_same_padding(&xs, 0).is_err());
+        assert!(max_pool2d_with_same_padding(&xs, 4).is_err());
+
+        let vb = VarBuilder::zeros(DType::F32, &device);
+        assert!(Sppf::load(vb.clone(), 2, 1, 0).is_err());
+        assert!(Sppf::load(vb, 2, 1, 4).is_err());
+    }
+
+    #[test]
+    fn sppf_same_pool_matches_a_full_grid_oracle_for_production_kernel() -> Result<()> {
+        let device = Device::Cpu;
+        let (height, width, kernel_size) = (4, 6, 5);
+        let values = vec![
+            -23., -11., -19., -7., -17., -13., -5., -29., -3., -31., -2., -37., -41., -43., -47.,
+            -53., -59., -61., -67., -71., -73., -79., -83., -89.,
+        ];
+        let xs = Tensor::from_vec(values.clone(), (1, 1, height, width), &device)?;
+
+        let actual = max_pool2d_with_same_padding(&xs, kernel_size)?
+            .i((0, 0))?
+            .to_vec2::<f32>()?;
+        let radius = kernel_size / 2;
+        let mut expected = vec![vec![f32::NEG_INFINITY; width]; height];
+        for (row, expected_row) in expected.iter_mut().enumerate() {
+            let row_start = row.saturating_sub(radius);
+            let row_end = (row + radius + 1).min(height);
+            for (column, expected_value) in expected_row.iter_mut().enumerate() {
+                let column_start = column.saturating_sub(radius);
+                let column_end = (column + radius + 1).min(width);
+                for source_row in row_start..row_end {
+                    for source_column in column_start..column_end {
+                        *expected_value =
+                            expected_value.max(values[source_row * width + source_column]);
+                    }
+                }
+            }
+        }
+
+        assert_eq!(actual, expected);
+        Ok(())
+    }
 
     #[test]
     fn public_loaders_reject_unbounded_head_dimensions_before_loading_weights() {
