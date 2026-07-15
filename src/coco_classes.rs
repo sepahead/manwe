@@ -2,8 +2,8 @@ pub const NAMES: [&str; 80] = [
     "person",
     "bicycle",
     "car",
-    "motorbike",
-    "aeroplane",
+    "motorcycle",
+    "airplane",
     "bus",
     "train",
     "truck",
@@ -56,12 +56,12 @@ pub const NAMES: [&str; 80] = [
     "donut",
     "cake",
     "chair",
-    "sofa",
-    "pottedplant",
+    "couch",
+    "potted plant",
     "bed",
-    "diningtable",
+    "dining table",
     "toilet",
-    "tvmonitor",
+    "tv",
     "laptop",
     "mouse",
     "remote",
@@ -80,3 +80,26 @@ pub const NAMES: [&str; 80] = [
     "hair drier",
     "toothbrush",
 ];
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashSet;
+
+    use super::NAMES;
+
+    #[test]
+    fn names_match_the_canonical_ultralytics_coco_categories() {
+        assert_eq!(
+            [NAMES[3], NAMES[4], NAMES[57], NAMES[58], NAMES[60], NAMES[62]],
+            [
+                "motorcycle",
+                "airplane",
+                "couch",
+                "potted plant",
+                "dining table",
+                "tv",
+            ]
+        );
+        assert_eq!(HashSet::<&str>::from(NAMES).len(), NAMES.len());
+    }
+}
