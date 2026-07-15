@@ -192,6 +192,61 @@ def test_birth_clustering_never_merges_two_hits_from_the_same_modality():
     assert len(tracker.tracks) == 2
 
 
+def test_birth_clustering_is_invariant_to_sensor_names_across_an_ambiguous_chain():
+    def births(sensor_ids, order=(0, 1, 2)):
+        tracker = MultiSensorTracker(
+            TrackerConfig(confirm_hits=1, init_merge_dist=1.1, sigma_a=0.0)
+        )
+        measurements = [
+            Measurement(
+                "visual",
+                [position, 0.0, 0.0],
+                [1.0, 1.0, 1.0],
+                0.0,
+                sensor_id=sensor_id,
+            )
+            for position, sensor_id in zip((0.0, 1.0, 2.0), sensor_ids)
+        ]
+        tracker.step(
+            [measurements[index] for index in order],
+            0.0,
+        )
+        return sorted(tuple(track.filt.state.position) for track in tracker.tracks)
+
+    alphabetical = births(("a", "b", "c"))
+    renamed = births(("b", "a", "c"))
+    reordered = births(("c", "a", "b"), order=(2, 0, 1))
+    assert (
+        alphabetical
+        == renamed
+        == reordered
+        == [
+            (0.0, 0.0, 0.0),
+            (1.0, 0.0, 0.0),
+            (2.0, 0.0, 0.0),
+        ]
+    )
+
+
+def test_birth_clustering_merges_a_complete_cross_sensor_component():
+    tracker = MultiSensorTracker(TrackerConfig(confirm_hits=1, init_merge_dist=1.1))
+    tracker.step(
+        [
+            Measurement(
+                "visual",
+                [position, 0.0, 0.0],
+                [1.0, 1.0, 1.0],
+                0.0,
+                sensor_id=sensor_id,
+            )
+            for position, sensor_id in zip((0.0, 0.5, 1.0), ("left", "middle", "right"))
+        ],
+        0.0,
+    )
+    assert len(tracker.tracks) == 1
+    assert np.allclose(tracker.tracks[0].filt.state.position, [0.5, 0.0, 0.0])
+
+
 def test_generator_measurements_are_materialized_once_and_revalidated():
     tracker = MultiSensorTracker()
     measurement = Measurement("visual", [1.0, 2.0, 3.0], [1.0, 1.0, 1.0], 0.0)

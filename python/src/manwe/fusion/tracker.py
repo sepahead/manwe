@@ -15,7 +15,7 @@ import math
 from collections import deque
 from collections.abc import Iterable
 from dataclasses import dataclass, field
-from itertools import islice
+from itertools import combinations, islice
 
 import numpy as np
 
@@ -502,30 +502,64 @@ class MultiSensorTracker:
         measurements: list[Measurement],
         positions: np.ndarray,
     ) -> list[list[int]]:
-        """Group nearby unmatched hits without ever mixing concrete classes."""
+        """Merge only unambiguous, fully compatible components of unmatched hits.
+
+        A chain such as ``A—B—C`` with ``A`` outside ``C``'s merge radius has
+        two equally plausible pairings.  Selecting one greedily makes track
+        births depend on producer order or sensor names, so every member of an
+        accepted component must be pairwise compatible.  Ambiguous components
+        are conservatively returned as singleton births.
+        """
+
+        def can_merge(left: int, right: int) -> bool:
+            return (
+                self._labels_compatible(
+                    measurements[left].class_label,
+                    measurements[right].class_label,
+                )
+                and self._sensor_key(measurements[left]) != self._sensor_key(measurements[right])
+                and math.dist(positions[left], positions[right]) <= self.cfg.init_merge_dist
+            )
+
+        def order_key(index: int) -> tuple:
+            measurement = measurements[index]
+            velocity = () if measurement.velocity is None else tuple(measurement.velocity)
+            return (
+                tuple(positions[index]),
+                tuple(measurement.covariance.ravel()),
+                velocity,
+                measurement.modality,
+                measurement.class_label or "",
+            )
+
+        ordered = sorted(idxs, key=order_key)
+        parent = {index: index for index in ordered}
+
+        def find(index: int) -> int:
+            while parent[index] != index:
+                parent[index] = parent[parent[index]]
+                index = parent[index]
+            return index
+
+        def union(left: int, right: int) -> None:
+            left_root, right_root = find(left), find(right)
+            if left_root != right_root:
+                parent[right_root] = left_root
+
+        for left, right in combinations(ordered, 2):
+            if can_merge(left, right):
+                union(left, right)
+
+        components: dict[int, list[int]] = {}
+        for index in ordered:
+            components.setdefault(find(index), []).append(index)
+
         groups: list[list[int]] = []
-        for j in idxs:
-            for g in groups:
-                compatible = all(
-                    self._labels_compatible(
-                        measurements[j].class_label,
-                        measurements[index].class_label,
-                    )
-                    for index in g
-                )
-                independent_sources = all(
-                    self._sensor_key(measurements[j]) != self._sensor_key(measurements[index])
-                    for index in g
-                )
-                if (
-                    compatible
-                    and independent_sources
-                    and math.dist(positions[j], positions[g[0]]) <= self.cfg.init_merge_dist
-                ):
-                    g.append(j)
-                    break
+        for component in components.values():
+            if all(can_merge(left, right) for left, right in combinations(component, 2)):
+                groups.append(component)
             else:
-                groups.append([j])
+                groups.extend([index] for index in component)
         return groups
 
     def _update_track(
