@@ -1,5 +1,7 @@
 """OSPA/GOSPA metrics and the audio/radar → fusion bridges."""
 
+from itertools import permutations
+
 import numpy as np
 import pytest
 
@@ -38,6 +40,60 @@ def test_gospa_can_leave_expensive_admissible_pairs_unassigned(p):
     assert result["localization"] == 0.0
     assert result["cardinality"] == pytest.approx(10.0)
     assert result["gospa"] == pytest.approx(10.0)
+
+
+@pytest.mark.parametrize("alpha", [0.5, 1.0, 1.5])
+def test_gospa_general_alpha_applies_the_cutoff_to_equal_cardinality_sets(alpha):
+    result = gospa(
+        np.array([[0.0]]),
+        np.array([[20.0]]),
+        c=10.0,
+        p=2.0,
+        alpha=alpha,
+    )
+    assert result == pytest.approx({"gospa": 10.0, "localization": 10.0, "cardinality": 0.0})
+
+
+def test_gospa_alpha_one_equals_unnormalized_ospa_on_bounded_point_sets():
+    rng = np.random.default_rng(20260715)
+    for p in (1.0, 2.0, 3.0):
+        for truth_count in range(5):
+            for estimate_count in range(5):
+                truth = rng.normal(size=(truth_count, 3))
+                estimate = rng.normal(size=(estimate_count, 3))
+                normalized = ospa(truth, estimate, c=2.5, p=p)["ospa"]
+                expected = normalized * max(truth_count, estimate_count, 1) ** (1.0 / p)
+                assert gospa(truth, estimate, c=2.5, p=p, alpha=1.0)["gospa"] == pytest.approx(
+                    expected
+                )
+
+
+def _gospa_definition_one(truth, estimate, *, c, p, alpha):
+    if len(truth) > len(estimate):
+        truth, estimate = estimate, truth
+    smaller, larger = len(truth), len(estimate)
+    assignment_cost = min(
+        sum(
+            min(float(np.linalg.norm(truth[index] - estimate[target])), c) ** p
+            for index, target in enumerate(assignment)
+        )
+        for assignment in permutations(range(larger), smaller)
+    )
+    return (assignment_cost + c**p * (larger - smaller) / alpha) ** (1.0 / p)
+
+
+@pytest.mark.parametrize("alpha", [0.5, 1.0, 1.5, 2.0])
+@pytest.mark.parametrize("p", [1.0, 2.0, 3.0])
+def test_gospa_matches_primary_definition_on_small_bounded_sets(alpha, p):
+    rng = np.random.default_rng(20260715)
+    for truth_count in range(4):
+        for estimate_count in range(4):
+            truth = rng.normal(scale=8.0, size=(truth_count, 2))
+            estimate = rng.normal(scale=8.0, size=(estimate_count, 2))
+            expected = _gospa_definition_one(truth, estimate, c=2.5, p=p, alpha=alpha)
+            assert gospa(truth, estimate, c=2.5, p=p, alpha=alpha)["gospa"] == pytest.approx(
+                expected
+            )
 
 
 def test_numpy_assignment_is_globally_optimal_not_greedy():

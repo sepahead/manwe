@@ -236,9 +236,16 @@ def gospa(
     p: float = 2.0,
     alpha: float = 2.0,
 ) -> dict[str, float]:
-    """Generalised OSPA (unnormalised). With ``alpha=2`` it decomposes into
-    localisation error on assigned pairs plus a ``c^p/alpha`` penalty per
-    missed/false target — the variant that rewards correct cardinality."""
+    """Generalised OSPA (unnormalised).
+
+    With ``alpha=2`` it decomposes into localisation error on assigned pairs
+    plus a ``c^p/alpha`` penalty per missed/false target — the variant that
+    rewards correct cardinality.  For other ``alpha`` values the returned
+    components follow Definition 1 of Rahmathullah et al.: every point in the
+    smaller set is assigned through the cut-off metric, and ``cardinality`` is
+    the remaining set-size penalty.  The partial-assignment decomposition is
+    equivalent to that definition only when ``alpha=2``.
+    """
     c, p = _metric_parameters(c, p)
     if isinstance(alpha, bool) or not np.isfinite(alpha) or not 0.0 < alpha <= 2.0:
         raise ValueError("alpha must be finite and in (0, 2]")
@@ -252,6 +259,28 @@ def gospa(
         return {
             "gospa": card,
             "localization": 0.0,
+            "cardinality": card,
+        }
+
+    if alpha != 2.0:
+        # Definition 1 assigns every member of the smaller set using the
+        # cut-off distance.  In particular, equal-cardinality sets farther than
+        # ``c`` remain exactly ``c`` apart for every alpha; representing them as
+        # two unassigned points would incorrectly introduce alpha dependence.
+        if m > n:
+            truth, est, m, n = est, truth, n, m
+        if m * m * n > _MAX_ASSIGNMENT_WORK:
+            raise ValueError("GOSPA exceeds the assignment-work safety limit")
+        distances = np.minimum(_pairwise(truth, est), c)
+        costs = _stable_nonnegative_power(distances, p, "GOSPA assignment")
+        assignment = linear_assignment(costs)
+        matched_distances = np.array([distances[i, j] for i, j in assignment], dtype=float)
+        loc = _stable_p_norm(matched_distances, p, "GOSPA localization")
+        card = _scaled_fraction_root(c, n - m, alpha, p, "GOSPA cardinality")
+        total = _stable_p_norm(np.array([loc, card]), p, "GOSPA")
+        return {
+            "gospa": total,
+            "localization": loc,
             "cardinality": card,
         }
 
