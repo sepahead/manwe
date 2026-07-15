@@ -29,6 +29,9 @@ This is the first planned tagged alpha after the untagged Rust/Candle prototypes
 - New-track clustering is invariant to producer order and sensor-ID renaming;
   ambiguous distance chains remain separate instead of selecting an arbitrary
   anchor-dependent merge.
+- Radar measurements and EKF updates now reject zero-range and vertical-axis
+  polar singularities instead of silently consuming evidence with a zero
+  Jacobian.
 - Rust inference now requires local digest-bound safetensors, validates tensor and
   image bounds, preserves aspect ratio with letterboxing, and fails closed at
   unsupported filesystem boundaries.

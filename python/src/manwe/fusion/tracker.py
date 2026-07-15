@@ -20,7 +20,13 @@ from itertools import combinations, islice
 import numpy as np
 
 from .association import CHI2_99, GATE_INF, linear_assignment
-from .filters import FILTERS, POS_DIM, IMMEstimator, ParticleFilter
+from .filters import (
+    FILTERS,
+    MIN_POLAR_HORIZONTAL_RANGE,
+    POS_DIM,
+    IMMEstimator,
+    ParticleFilter,
+)
 
 Modality = str  # "visual" | "thermal" | "acoustic" | "radar" | "lidar" | "rf"
 CARTESIAN_MODALITIES = {"visual", "thermal", "acoustic", "lidar", "rf"}
@@ -133,14 +139,19 @@ class Measurement:
         if self.velocity is not None:
             self.velocity = _as_finite_vector(self.velocity, "velocity")
         if self.modality == "radar":
-            if self.position[0] < 0:
-                raise ValueError("radar range must be >= 0")
+            if self.position[0] <= MIN_POLAR_HORIZONTAL_RANGE:
+                raise ValueError(f"radar range must be > {MIN_POLAR_HORIZONTAL_RANGE:g} m")
             if abs(self.position[1]) > 1_000_000.0:
                 raise ValueError("radar azimuth magnitude is too large to canonicalize reliably")
             azimuth = math.remainder(float(self.position[1]), 2.0 * math.pi)
             self.position[1] = -math.pi if azimuth == math.pi else azimuth
             if not -math.pi / 2 <= self.position[2] <= math.pi / 2:
                 raise ValueError("radar elevation must be in [-pi/2, pi/2]")
+            if (
+                self.position[0] * abs(math.cos(float(self.position[2])))
+                <= MIN_POLAR_HORIZONTAL_RANGE
+            ):
+                raise ValueError("radar azimuth is singular on the sensor's vertical axis")
         if self.class_label is not None:
             if not isinstance(self.class_label, str):
                 raise ValueError("class_label must be a bounded printable non-empty string or None")

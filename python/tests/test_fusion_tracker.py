@@ -62,9 +62,16 @@ def test_measurement_rejects_malformed_numeric_contract(kwargs):
         Measurement(**values)
 
 
-def test_measurement_rejects_negative_radar_range():
+@pytest.mark.parametrize("radar_range", [-1.0, 0.0, 1e-7])
+def test_measurement_rejects_singular_radar_range(radar_range):
     with pytest.raises(ValueError, match="range"):
-        Measurement("radar", [-1.0, 0.0, 0.0], [1.0, 1e-3, 1e-3], 0.0)
+        Measurement("radar", [radar_range, 0.0, 0.0], [1.0, 1e-3, 1e-3], 0.0)
+
+
+@pytest.mark.parametrize("elevation", [-np.pi / 2, np.pi / 2])
+def test_measurement_rejects_radar_azimuth_singularity(elevation):
+    with pytest.raises(ValueError, match="singular"):
+        Measurement("radar", [1.0, 0.0, elevation], [1.0, 1e-3, 1e-3], 0.0)
 
 
 @pytest.mark.parametrize("elevation", [-np.pi / 2 - 1e-12, np.pi / 2 + 1e-12, 1e300])

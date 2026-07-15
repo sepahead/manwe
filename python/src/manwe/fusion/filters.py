@@ -27,6 +27,7 @@ POS_DIM = 3
 STATE_DIM = 6
 MAX_FILTER_DIMENSION = 64
 MAX_FILTER_PARTICLES = 100_000
+MIN_POLAR_HORIZONTAL_RANGE = 1e-6
 
 
 # ---------------------------------------------------------------------------
@@ -334,13 +335,15 @@ def _polar_measurement_inputs(
     z: np.ndarray, R: np.ndarray, dim: int
 ) -> tuple[np.ndarray, np.ndarray]:
     z, R = _measurement_inputs(z, R, dim)
-    if z[0] < 0:
-        raise ValueError("polar range must be >= 0")
+    if z[0] <= MIN_POLAR_HORIZONTAL_RANGE:
+        raise ValueError(f"polar range must be > {MIN_POLAR_HORIZONTAL_RANGE:g} m")
     if abs(z[1]) > 1_000_000.0:
         raise ValueError("polar azimuth magnitude is too large to canonicalize reliably")
     z[1] = wrap_angle(z[1])
     if not -np.pi / 2.0 <= z[2] <= np.pi / 2.0:
         raise ValueError("polar elevation must be in [-pi/2, pi/2]")
+    if z[0] * abs(float(np.cos(z[2]))) <= MIN_POLAR_HORIZONTAL_RANGE:
+        raise ValueError("polar azimuth is singular on the sensor's vertical axis")
     return z, R
 
 
@@ -496,18 +499,18 @@ class ExtendedKalmanFilter(KalmanFilter):
         # Jacobian as products of unit-vector components avoids squaring them.
         rho = float(np.hypot(dx, dy))
         r = float(np.hypot(rho, dz))
-        rho_safe = max(rho, 1e-6)
-        r_safe = max(r, 1e-6)
+        if r <= MIN_POLAR_HORIZONTAL_RANGE or rho <= MIN_POLAR_HORIZONTAL_RANGE:
+            raise ValueError("predicted polar geometry is singular at the sensor origin or axis")
         h = np.array([r, np.arctan2(dy, dx), np.arctan2(dz, rho)])
         H = np.zeros((3, 2 * self.dim))
         # d range
-        H[0, 0], H[0, 1], H[0, 2] = dx / r_safe, dy / r_safe, dz / r_safe
+        H[0, 0], H[0, 1], H[0, 2] = dx / r, dy / r, dz / r
         # d azimuth
-        H[1, 0], H[1, 1] = -(dy / rho_safe) / rho_safe, (dx / rho_safe) / rho_safe
+        H[1, 0], H[1, 1] = -(dy / rho) / rho, (dx / rho) / rho
         # d elevation
-        H[2, 0] = -(dx / rho_safe) * (dz / r_safe) / r_safe
-        H[2, 1] = -(dy / rho_safe) * (dz / r_safe) / r_safe
-        H[2, 2] = (rho / r_safe) / r_safe
+        H[2, 0] = -(dx / rho) * (dz / r) / r
+        H[2, 1] = -(dy / rho) * (dz / r) / r
+        H[2, 2] = (rho / r) / r
         if not np.isfinite(h).all() or not np.isfinite(H).all():
             raise FloatingPointError("polar measurement geometry is not finite")
         return h, H
@@ -1188,6 +1191,7 @@ FILTERS = {
 __all__ = [
     "POS_DIM",
     "STATE_DIM",
+    "MIN_POLAR_HORIZONTAL_RANGE",
     "GaussianState",
     "KalmanFilter",
     "ExtendedKalmanFilter",

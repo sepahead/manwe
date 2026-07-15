@@ -415,12 +415,16 @@ def test_nonfinite_likelihood_math_does_not_partially_apply_update(factory):
         estimator.gating_distance(np.full(3, 1e308), np.eye(3))
 
 
-def test_ekf_polar_boundaries_and_origin_singularity_are_safe():
+def test_ekf_polar_boundaries_and_origin_singularity_fail_explicitly():
     ekf = ExtendedKalmanFilter(np.zeros(6), np.eye(6))
     R = np.diag([1.0, 0.01, 0.01])
-    ekf.update_polar(np.zeros(3), R, np.zeros(3))
-    assert np.isfinite(ekf.state.x).all()
-    assert np.isfinite(ekf.state.P).all()
+    before = ekf.state.copy()
+    with pytest.raises(ValueError, match="range"):
+        ekf.update_polar(np.zeros(3), R, np.zeros(3))
+    with pytest.raises(ValueError, match="singular"):
+        ekf.update_polar(np.array([100.0, 0.0, 0.0]), R, np.zeros(3))
+    assert np.array_equal(ekf.state.x, before.x)
+    assert np.array_equal(ekf.state.P, before.P)
 
     invalid_calls = [
         (np.array([-1.0, 0.0, 0.0]), R, None),
@@ -457,7 +461,7 @@ def test_ekf_polar_geometry_avoids_large_coordinate_overflow():
     overflowing_origin = np.array([-1e308, 0.0, 0.0])
     overflow_ekf = ExtendedKalmanFilter(np.array([1e308, 0.0, 0.0, 0.0, 0.0, 0.0]), np.eye(6))
     with pytest.raises(FloatingPointError, match="relative radar position"):
-        overflow_ekf.update_polar(np.zeros(3), np.eye(3), overflowing_origin)
+        overflow_ekf.update_polar(np.array([1.0, 0.0, 0.0]), np.eye(3), overflowing_origin)
 
 
 @pytest.mark.parametrize(

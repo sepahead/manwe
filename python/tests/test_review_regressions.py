@@ -50,10 +50,13 @@ def test_imm_update_before_predict_does_not_crash():
 def test_imm_bank_honours_radar_polar():
     """default_cv_bank uses EKFs, so update_polar exists on the bank."""
     x0 = np.zeros(6)
+    x0[:3] = [90.0, 1.0, 1.0]
     P0 = np.diag([25.0] * 3 + [100.0] * 3)
     imm = IMMEstimator.default_cv_bank(x0, P0)
     assert hasattr(imm, "update_polar")
+    before = imm.state.x.copy()
     imm.update_polar(np.array([100.0, 0.0, 0.0]), np.diag([9.0, 1e-4, 1e-4]), np.zeros(3))
+    assert not np.array_equal(imm.state.x, before)
 
 
 def test_parallel_ray_gap_is_perpendicular_distance():
