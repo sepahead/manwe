@@ -119,11 +119,11 @@ scenario — mean OSPA (lower is better) over 41 frames:
 
 ```
 filter           OSPA  localization  cardinality
-kalman           4.29          1.77         2.95
-ekf              4.29          1.77         2.95
-ukf              4.29          1.77         2.95
-particle         7.06          2.77         5.48
-imm              9.34          1.93         8.89
+kalman           4.30          1.78         2.95
+ekf              4.30          1.78         2.95
+ukf              4.30          1.78         2.95
+particle         9.46          2.56         8.22
+imm              9.33          1.88         8.89
 ```
 
 These are deterministic synthetic-regression results for the command's current

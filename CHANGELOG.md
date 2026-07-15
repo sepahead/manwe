@@ -21,6 +21,9 @@ This is the first planned tagged alpha after the untagged Rust/Candle prototypes
 
 ### Changed
 
+- Corrected general-alpha GOSPA to follow its cut-off-metric definition and
+  corrected the synthetic scenario's constant-acceleration position step; the
+  deterministic `fusion-sim` reference values now reflect the exact kinematics.
 - Rust inference now requires local digest-bound safetensors, validates tensor and
   image bounds, preserves aspect ratio with letterboxing, and fails closed at
   unsupported filesystem boundaries.

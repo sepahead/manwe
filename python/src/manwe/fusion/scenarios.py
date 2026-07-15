@@ -44,6 +44,18 @@ class Scenario:
         return np.array(pts) if pts else np.empty((0, 3))
 
 
+def _constant_acceleration_step(
+    position: np.ndarray,
+    velocity: np.ndarray,
+    acceleration: np.ndarray,
+    dt: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Integrate one interval whose sampled acceleration is held constant."""
+    next_position = position + velocity * dt + 0.5 * acceleration * dt * dt
+    next_velocity = velocity + acceleration * dt
+    return next_position, next_velocity
+
+
 def make_scenario(
     n_targets: int = 3,
     duration: float = 20.0,
@@ -148,8 +160,7 @@ def make_scenario(
                         continue
                     if k > birth:
                         accel = rng.normal(0, 0.5, size=3)
-                        vel = vel + accel * dt
-                        p = p + vel * dt
+                        p, vel = _constant_acceleration_step(p, vel, accel, dt)
                     if not np.all(np.isfinite(p)):
                         raise FloatingPointError
                     traj[k] = p

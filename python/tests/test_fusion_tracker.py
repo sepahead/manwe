@@ -6,7 +6,7 @@ import numpy as np
 import pytest
 
 from manwe.fusion.association import associate
-from manwe.fusion.scenarios import make_scenario, score_tracker
+from manwe.fusion.scenarios import _constant_acceleration_step, make_scenario, score_tracker
 from manwe.fusion.tracker import (
     Measurement,
     MultiSensorTracker,
@@ -631,6 +631,17 @@ def test_short_scenario_cannot_report_a_perfect_empty_score():
     scenario = make_scenario(duration=1.0, dt=0.5, modalities=("visual",), clutter_rate=0.0)
     with pytest.raises(ValueError, match="at least one frame is scored"):
         score_tracker(MultiSensorTracker(), scenario)
+
+
+def test_scenario_motion_uses_the_exact_constant_acceleration_step():
+    position, velocity = _constant_acceleration_step(
+        np.array([1.0, 2.0, 3.0]),
+        np.array([4.0, 5.0, 6.0]),
+        np.array([0.5, -1.0, 2.0]),
+        2.0,
+    )
+    assert np.array_equal(position, [10.0, 10.0, 19.0])
+    assert np.array_equal(velocity, [5.0, 3.0, 10.0])
 
 
 def test_scenario_generation_rejects_invalid_boundaries():
