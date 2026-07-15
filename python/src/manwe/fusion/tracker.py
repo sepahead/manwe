@@ -392,8 +392,17 @@ class MultiSensorTracker:
         if f == "imm":
             return IMMEstimator.default_cv_bank(x0, P0, sigma_a=self.cfg.sigma_a)
         if f == "particle":
+            # A filter owns its stochastic stream.  Drawing only the child seed
+            # from the tracker stream prevents a later, unrelated track birth
+            # from changing existing tracks' future process-noise samples.
+            seed_words = self.rng.integers(0, 1 << 32, size=4, dtype=np.uint32)
+            filter_rng = np.random.default_rng(seed_words)
             return ParticleFilter(
-                x0, P0, sigma_a=self.cfg.sigma_a, n_particles=self.cfg.n_particles, rng=self.rng
+                x0,
+                P0,
+                sigma_a=self.cfg.sigma_a,
+                n_particles=self.cfg.n_particles,
+                rng=filter_rng,
             )
         cls = FILTERS[f]
         return cls(x0, P0, sigma_a=self.cfg.sigma_a)
@@ -662,8 +671,6 @@ class MultiSensorTracker:
         self.tracks = tracks
         for track in self.tracks:
             track.cfg = self.cfg
-            if isinstance(track.filt, ParticleFilter):
-                track.filt.rng = self.rng
 
     @staticmethod
     def _measurement_order_key(index: int, measurement: Measurement) -> tuple:

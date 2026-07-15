@@ -485,7 +485,7 @@ def test_failed_cycle_rolls_back_filter_lifecycle_ids_and_time():
     assert tracker._last_t == before["last_t"]
 
 
-def test_failed_particle_cycle_restores_population_and_shared_rng():
+def test_failed_particle_cycle_restores_population_and_independent_rng():
     tracker = MultiSensorTracker(
         TrackerConfig(filter="particle", n_particles=32), rng=np.random.default_rng(42)
     )
@@ -496,7 +496,8 @@ def test_failed_particle_cycle_restores_population_and_shared_rng():
     particle_filter = tracker.tracks[0].filt
     before_particles = particle_filter.particles.copy()
     before_weights = particle_filter.weights.copy()
-    before_rng = copy.deepcopy(tracker.rng.bit_generator.state)
+    before_tracker_rng = copy.deepcopy(tracker.rng.bit_generator.state)
+    before_filter_rng = copy.deepcopy(particle_filter.rng.bit_generator.state)
 
     with pytest.raises((FloatingPointError, ValueError), match="gating|finite"):
         tracker.step(
@@ -507,9 +508,41 @@ def test_failed_particle_cycle_restores_population_and_shared_rng():
     restored_filter = tracker.tracks[0].filt
     assert np.array_equal(restored_filter.particles, before_particles)
     assert np.array_equal(restored_filter.weights, before_weights)
-    assert tracker.rng.bit_generator.state == before_rng
-    assert restored_filter.rng is tracker.rng
+    assert tracker.rng.bit_generator.state == before_tracker_rng
+    assert restored_filter.rng.bit_generator.state == before_filter_rng
+    assert restored_filter.rng is not tracker.rng
     assert tracker._last_t == 0.0
+
+
+def test_later_unrelated_birth_does_not_change_existing_particle_stream():
+    def run(*, add_unrelated_birth):
+        tracker = MultiSensorTracker(
+            TrackerConfig(
+                filter="particle",
+                n_particles=32,
+                confirm_hits=1,
+                init_merge_dist=0.0,
+            ),
+            rng=np.random.default_rng(123),
+        )
+        tracker.step(
+            [Measurement("visual", [0.0, 0.0, 0.0], [1.0, 1.0, 1.0], 0.0)],
+            0.0,
+        )
+        initial = tracker.tracks[0].filt.particles.copy()
+        births = (
+            [Measurement("visual", [10_000.0, 0.0, 0.0], [1.0, 1.0, 1.0], 0.5)]
+            if add_unrelated_birth
+            else []
+        )
+        tracker.step(births, 0.5)
+        tracker.step([], 1.0)
+        return initial, tracker.tracks[0].filt.particles.copy()
+
+    baseline_initial, baseline_predicted = run(add_unrelated_birth=False)
+    extra_initial, extra_predicted = run(add_unrelated_birth=True)
+    assert np.array_equal(baseline_initial, extra_initial)
+    assert np.array_equal(baseline_predicted, extra_predicted)
 
 
 def test_failure_after_births_rolls_back_tracks_ids_time_and_rng(monkeypatch):

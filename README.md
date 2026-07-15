@@ -122,7 +122,7 @@ filter           OSPA  localization  cardinality
 kalman           4.30          1.78         2.95
 ekf              4.30          1.78         2.95
 ukf              4.30          1.78         2.95
-particle         9.46          2.56         8.22
+particle         9.90          2.03         9.23
 imm              9.33          1.88         8.89
 ```
 
