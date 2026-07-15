@@ -237,7 +237,16 @@ def _read_candidate(path: Path) -> tuple[str | None, str | None]:
 
 
 def _safe_location(value: str) -> str:
-    if len(value) > 512 or any(not character.isprintable() for character in value):
+    # Paths are attacker-controlled input too. A credential can be placed in a
+    # perfectly printable filename and would otherwise be echoed when a finding
+    # in that file is reported. Apply the same conservative rules to the display
+    # value and replace suspicious or unsafe paths with a stable opaque digest.
+    path_contains_secret = bool(scan_text("<path>", value))
+    if (
+        len(value) > 512
+        or any(not character.isprintable() for character in value)
+        or path_contains_secret
+    ):
         digest = hashlib.sha256(value.encode("utf-8", errors="surrogateescape")).hexdigest()
         return f"worktree-path/{digest}"
     return value

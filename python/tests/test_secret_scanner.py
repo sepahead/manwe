@@ -120,6 +120,24 @@ def test_worktree_scan_checks_bounded_binary_content(tmp_path: Path) -> None:
     assert credential not in repr(findings)
 
 
+def test_worktree_scan_never_echoes_a_secret_bearing_filename(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    filename_credential = "filename" + "-credential-must-not-leak"
+    content_credential = "content" + "-credential-must-not-leak"
+    path = tmp_path / f"{'client' + '_secret'}={filename_credential}.env"
+    path.write_text(f"{'pass' + 'word'}={content_credential}\n", encoding="utf-8")
+
+    result = main([str(path)], root=tmp_path)
+    captured = capsys.readouterr()
+
+    assert result == 1
+    assert "worktree-path/" in captured.err
+    assert "literal-secret-assignment" in captured.err
+    assert filename_credential not in captured.err
+    assert content_credential not in captured.err
+
+
 @pytest.mark.parametrize(
     "scheme",
     [
