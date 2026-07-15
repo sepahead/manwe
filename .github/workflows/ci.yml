@@ -371,6 +371,14 @@ jobs:
         run: cargo test --locked --offline --all-targets --no-default-features
       - name: Clippy CPU build offline
         run: cargo clippy --locked --offline --all-targets --no-default-features -- -D warnings
+      - name: Build optimized CPU targets offline
+        if: matrix.toolchain == 'stable'
+        run: cargo build --release --locked --offline --all-targets --no-default-features
+      - name: Check CPU rustdoc warnings offline
+        if: matrix.toolchain == 'stable'
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --locked --offline --no-deps --no-default-features
       - name: Check formatting
         if: matrix.toolchain == 'stable'
         run: cargo fmt --all --check
@@ -407,6 +415,14 @@ jobs:
         run: cargo test --locked --offline --all-targets --features metal,viewer
       - name: Clippy root Metal and viewer targets offline
         run: cargo clippy --locked --offline --all-targets --features metal,viewer -- -D warnings
+      - name: Build optimized root Metal and viewer binaries offline
+        if: matrix.os == 'macos-15' && matrix.toolchain == 'stable'
+        run: cargo build --release --locked --offline --bins --features metal,viewer
+      - name: Check root Metal and viewer rustdoc warnings offline
+        if: matrix.os == 'macos-15' && matrix.toolchain == 'stable'
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --locked --offline --no-deps --features metal,viewer
       - name: Check root formatting
         if: matrix.toolchain == 'stable'
         run: cargo fmt --all --check
@@ -422,6 +438,16 @@ jobs:
       - name: Clippy benchmark targets offline
         working-directory: metal-yolo-tests
         run: cargo clippy --locked --offline --all-targets -- -D warnings
+      - name: Build optimized benchmark binaries offline
+        if: matrix.os == 'macos-15' && matrix.toolchain == 'stable'
+        working-directory: metal-yolo-tests
+        run: cargo build --release --locked --offline --bins
+      - name: Check benchmark rustdoc warnings offline
+        if: matrix.os == 'macos-15' && matrix.toolchain == 'stable'
+        working-directory: metal-yolo-tests
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --locked --offline --no-deps
       - name: Check benchmark formatting
         if: matrix.toolchain == 'stable'
         working-directory: metal-yolo-tests
