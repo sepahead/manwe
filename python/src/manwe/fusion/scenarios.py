@@ -293,7 +293,7 @@ def score_tracker(
             if gap > tracker.cfg.max_prediction_gap:
                 raise ValueError("scenario prediction gap exceeds the tracker configuration")
             if gap > tracker.cfg.max_dt * tracker.cfg.max_substeps:
-                raise ValueError("scenario prediction requires too many tracker substeps")
+                raise ValueError("scenario prediction exceeds the tracker gap budget")
         previous_time = timestamp
         for measurement in frame:
             if abs(measurement.timestamp - timestamp) > TIMESTAMP_ATOL:

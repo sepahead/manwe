@@ -32,6 +32,12 @@ This is the first planned tagged alpha after the untagged Rust/Candle prototypes
 - Radar measurements and EKF updates now reject zero-range and vertical-axis
   polar singularities instead of silently consuming evidence with a zero
   Jacobian.
+- Tracker clock-gap budgeting no longer partitions the discrete per-cycle filter
+  model: each call now applies acceleration noise and an IMM Markov transition
+  exactly once, independent of the `max_dt` admission quantum. This intentionally
+  changes long-gap covariance, seeded particle trajectories/RNG consumption, and
+  IMM mode probabilities from the earlier numerical-substep behavior; changing
+  the actual caller cycle cadence still changes this event-indexed model.
 - Updated the optional viewer graph from yanked `spin` 0.10.0 to 0.10.1, which
   fixes unsound consuming operations, and made future yanked crates a
   dependency-policy error.
@@ -51,11 +57,12 @@ This is the first planned tagged alpha after the untagged Rust/Candle prototypes
   components, the `Message` split, `Sprite`/`Camera2d`, and the `bevy_sprite_render`
   feature split). `camera_view` now exits non-zero when Bevy reports
   `AppExit::Error` instead of discarding it.
-- Upgraded Candle (core/nn/transformers) 0.9.2 to 0.11.0. No inference source
-  changed. Candle 0.11 rewrote its Metal backend onto `objc2-metal`; a full YOLOv8
-  forward pass was revalidated on the Metal device and is bit-identical to CPU.
-  Candle 0.11 takes a non-optional `tokenizers`/Oniguruma dependency that no feature
-  gate can drop, so builds now require a C toolchain and a larger cold build.
+- Upgraded Candle (core/nn/transformers) 0.9.2 to 0.11.0. Candle 0.11 rewrote its
+  Metal backend onto `objc2-metal`. This repository has no digest-bound golden
+  model-forward fixture, so it does not establish CPU/Metal numerical
+  equivalence or unchanged inference behavior across the upgrade. Candle 0.11
+  takes a non-optional `tokenizers`/Oniguruma dependency that no feature gate can
+  drop, so builds now require a C toolchain and a larger cold build.
 - Upgraded imageproc 0.25.1 to 0.27.0 (text drawing moved behind a `text` feature,
   now enabled explicitly) and clap 4.5.57 to 4.6.1. The exact clap pin is retained:
   clap raised its own MSRV in a minor release, so a caret range could move the

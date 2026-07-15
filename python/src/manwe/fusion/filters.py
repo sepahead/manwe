@@ -47,6 +47,9 @@ def cv_process_noise(dt: float, sigma_a: float, dim: int = POS_DIM) -> np.ndarra
     """Discrete white-noise-acceleration process covariance ``Q``.
 
     ``sigma_a`` is the standard deviation of the un-modelled acceleration (m/s²).
+    One acceleration draw is defined per ``predict`` call. This is a discrete,
+    event-indexed model, not continuous white acceleration: callers must not
+    introduce numerical substeps and expect an equivalent covariance.
     """
     dim = _validate_dim(dim)
     dt = _validate_dt(dt)
@@ -858,6 +861,11 @@ class IMMEstimator:
     standard maneuver-adaptive configuration. A coordinated-turn model can
     approximate the same model-family choice used elsewhere, but parity still
     requires full configuration and intermediate-state fixtures.
+
+    ``transition`` is a discrete probability matrix applied once per non-zero
+    ``predict`` call; it is scan/event indexed rather than a continuous-time
+    transition rate. Changing the caller's prediction cadence therefore changes
+    the mode prior by design.
     """
 
     def __init__(

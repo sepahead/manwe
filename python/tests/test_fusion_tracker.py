@@ -105,7 +105,6 @@ def test_measurement_rejects_noncanonical_radar_elevation(elevation):
         {"max_measurements": 10_001},
         {"n_particles": 100_001},
         {"max_tracks": 1000, "max_measurements": 1000},
-        {"max_tracks": 2000, "max_substeps": 6000, "max_measurements": 1},
         {
             "filter": "particle",
             "max_tracks": 100,
@@ -402,7 +401,7 @@ def test_radar_angles_are_canonical_and_extreme_values_fail_closed():
         Measurement("radar", [10.0, 1e300, 0.0], [1.0, 0.1, 0.1], 0.0)
 
 
-def test_tracker_integrates_long_gap_in_bounded_substeps_and_rejects_time_reversal():
+def test_tracker_integrates_long_gap_with_bounded_admission_and_rejects_time_reversal():
     tracker = MultiSensorTracker(
         TrackerConfig(
             confirm_hits=1,
@@ -420,6 +419,72 @@ def test_tracker_integrates_long_gap_in_bounded_substeps_and_rejects_time_revers
     with pytest.raises(ValueError, match="monotonic"):
         tracker.step([], 9.0)
     assert tracker._last_t == 10.0
+
+
+@pytest.mark.parametrize("filter_name", ["kalman", "ekf", "ukf", "particle", "imm"])
+def test_prediction_is_invariant_to_internal_gap_budget_partition(filter_name):
+    """A safety-budget knob must not alter the discrete per-cycle filter model."""
+
+    common = dict(
+        filter=filter_name,
+        sigma_a=1.5,
+        confirm_hits=1,
+        confirm_window=10,
+        coast_after_misses=10,
+        max_missed_in_window=10,
+        max_position_cov_volume=1e100,
+        max_prediction_gap=10.0,
+        max_substeps=20,
+        n_particles=128,
+    )
+    whole = MultiSensorTracker(TrackerConfig(max_dt=10.0, **common))
+    partitioned_budget = MultiSensorTracker(TrackerConfig(max_dt=0.25, **common))
+    measurement = Measurement(
+        "visual",
+        [3.0, -2.0, 7.0],
+        [1.0, 2.0, 3.0],
+        0.0,
+        velocity=[4.0, -1.0, 0.5],
+    )
+
+    whole.step([measurement], 0.0)
+    partitioned_budget.step([measurement], 0.0)
+    whole.step([], 4.0)
+    partitioned_budget.step([], 4.0)
+
+    left = whole.tracks[0].filt.state
+    right = partitioned_budget.tracks[0].filt.state
+    np.testing.assert_array_equal(left.x, right.x)
+    np.testing.assert_array_equal(left.P, right.P)
+    if filter_name == "imm":
+        np.testing.assert_array_equal(
+            whole.tracks[0].filt.mode_probs,
+            partitioned_budget.tracks[0].filt.mode_probs,
+        )
+        np.testing.assert_array_equal(
+            whole.tracks[0].filt._cbar,
+            partitioned_budget.tracks[0].filt._cbar,
+        )
+        for left_model, right_model in zip(
+            whole.tracks[0].filt.models,
+            partitioned_budget.tracks[0].filt.models,
+            strict=True,
+        ):
+            np.testing.assert_array_equal(left_model.state.x, right_model.state.x)
+            np.testing.assert_array_equal(left_model.state.P, right_model.state.P)
+    if filter_name == "particle":
+        np.testing.assert_array_equal(
+            whole.tracks[0].filt.particles,
+            partitioned_budget.tracks[0].filt.particles,
+        )
+        np.testing.assert_array_equal(
+            whole.tracks[0].filt.weights,
+            partitioned_budget.tracks[0].filt.weights,
+        )
+        assert (
+            whole.tracks[0].filt.rng.bit_generator.state
+            == partitioned_budget.tracks[0].filt.rng.bit_generator.state
+        )
 
 
 def test_tracker_rejects_same_timestamp_replays_without_advancing_lifecycle():
@@ -486,11 +551,11 @@ def test_measurement_rejects_unbounded_or_nonprintable_class_labels(class_label)
         (
             TrackerConfig(max_prediction_gap=10.0, max_dt=1.0, max_substeps=2),
             3.0,
-            "substeps",
+            "gap budget",
         ),
     ],
 )
-def test_prediction_work_bounds_reject_before_mutation(config, timestamp, message):
+def test_prediction_gap_admission_bounds_reject_before_mutation(config, timestamp, message):
     tracker = MultiSensorTracker(config)
     tracker.step(
         [Measurement("visual", [0.0, 0.0, 0.0], [1.0, 1.0, 1.0], 0.0, class_label="drone")],
@@ -507,6 +572,28 @@ def test_prediction_work_bounds_reject_before_mutation(config, timestamp, messag
     assert tracker.tracks[0].age == before_age
     assert np.array_equal(tracker.tracks[0].filt.state.x, before_x)
     assert np.array_equal(tracker.tracks[0].filt.state.P, before_P)
+
+
+def test_prediction_gap_budget_accepts_its_floating_point_product_boundary():
+    config = TrackerConfig(
+        confirm_hits=1,
+        confirm_window=10,
+        coast_after_misses=10,
+        max_missed_in_window=10,
+        max_dt=0.1,
+        max_substeps=3,
+        max_prediction_gap=1.0,
+    )
+    tracker = MultiSensorTracker(config)
+    tracker.step(
+        [Measurement("visual", [0.0, 0.0, 0.0], np.eye(3), 0.0)],
+        0.0,
+    )
+
+    boundary = config.max_dt * config.max_substeps
+    tracker.step([], boundary)
+
+    assert tracker._last_t == boundary
 
 
 def test_failed_cycle_rolls_back_filter_lifecycle_ids_and_time():

@@ -39,7 +39,6 @@ MAX_SUBSTEPS = 10_000
 MAX_MEASUREMENTS = 10_000
 MAX_PARTICLES = 100_000
 MAX_ASSIGNMENT_WORK = 100_000_000
-MAX_PREDICTION_WORK = 10_000_000
 MAX_PARTICLE_POPULATION = 2_000_000
 MAX_CLASS_LABEL_BYTES = 256
 
@@ -225,6 +224,12 @@ class TrackerConfig:
     max_tracks: int = 200
     init_vel_var: float = 100.0
     init_merge_dist: float = 15.0  # cluster simultaneous new measurements within this radius
+    # Gap-budget quantum.  It bounds accepted clock gaps together with
+    # ``max_substeps`` but must not partition the discrete per-cycle model:
+    # acceleration noise and an IMM Markov transition are defined once per call
+    # to ``step``, not once per numerical implementation detail. Consequently,
+    # callers changing the actual step cadence are changing the event-indexed
+    # stochastic model; this knob only admits or rejects a given clock gap.
     max_dt: float = 1.0
     max_prediction_gap: float = 60.0
     max_substeps: int = 120
@@ -270,8 +275,6 @@ class TrackerConfig:
             raise ValueError(
                 "max_tracks and max_measurements exceed the assignment-work safety limit"
             )
-        if self.max_tracks * self.max_substeps > MAX_PREDICTION_WORK:
-            raise ValueError("max_tracks and max_substeps exceed the prediction-work safety limit")
         if (
             self.filter == "particle"
             and self.max_tracks * self.n_particles > MAX_PARTICLE_POPULATION
@@ -762,14 +765,8 @@ class MultiSensorTracker:
         max_integrated_gap = float(self.cfg.max_dt) * self.cfg.max_substeps
         if dt > max_integrated_gap:
             raise ValueError(
-                f"prediction requires more than {self.cfg.max_substeps} substeps at "
-                f"max_dt={self.cfg.max_dt}"
-            )
-        n_steps = 0 if dt == 0 else max(1, math.ceil(dt / self.cfg.max_dt))
-        if n_steps > self.cfg.max_substeps:
-            raise ValueError(
-                f"prediction requires {n_steps} substeps, exceeding configured maximum "
-                f"{self.cfg.max_substeps}"
+                f"prediction gap {dt} exceeds the configured gap budget "
+                f"{self.cfg.max_dt} * {self.cfg.max_substeps}"
             )
 
         # Project and validate every copied measurement before mutable tracker state
@@ -783,11 +780,14 @@ class MultiSensorTracker:
         snapshot = self._snapshot()
         try:
             # 1. PREDICT
-            if n_steps:
-                substep = dt / n_steps
-                for _ in range(n_steps):
-                    for track in self.tracks:
-                        track.filt.predict(substep)
+            if dt:
+                # Advance the discrete, event-indexed model once per cycle.
+                # Repeating predict(dt / n) changes the current discrete-
+                # acceleration covariance (Q is not a semigroup) and repeats an
+                # IMM's Markov transition n times.  ``max_dt`` is therefore an
+                # admission/safety budget only, never a hidden model parameter.
+                for track in self.tracks:
+                    track.filt.predict(dt)
 
             # 2. PLAN ALL ASSOCIATIONS FROM THE SAME PREDICTED PRIOR. A track may
             # accept one independent update per modality, but incompatible classes

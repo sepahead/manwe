@@ -21,8 +21,8 @@ max_position_cov_volume: 1.0e+9  # determinant in m^6
 max_tracks: 200
 init_vel_var: 100.0
 init_merge_dist: 15.0      # cluster simultaneous new measurements within this radius
-max_dt: 1.0                # maximum duration of one numerical prediction step
+max_dt: 1.0                # clock-gap budget quantum; does not partition the filter model
 max_prediction_gap: 60.0   # reject larger clock gaps instead of integrating indefinitely
-max_substeps: 120          # hard work bound for one cycle
+max_substeps: 120          # maximum gap-budget units admitted in one cycle
 max_measurements: 1024     # hard association/input bound for one cycle
 n_particles: 512           # particle filter only
