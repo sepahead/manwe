@@ -148,6 +148,41 @@ jobs:
               if dated_heading.search(changelog) is None:
                   raise SystemExit("tagged changelog entry needs an ISO release date")
           PY
+      - name: Verify structured research claim joins
+        run: |
+          python - <<'PY'
+          import json
+          from pathlib import Path
+
+          sections = json.loads(
+              Path("docs/research/sota-2026-structured.json").read_text(encoding="utf-8")
+          )
+          for section in sections:
+              topic = section["topic"]
+              claims = [entry["claim"] for entry in section["keyClaims"]]
+              verifications = {
+                  entry["claim"]: entry for entry in section["verifications"]
+              }
+              if len(claims) != len(set(claims)):
+                  raise SystemExit(f"duplicate key claim in {topic!r}")
+              if len(verifications) != len(section["verifications"]):
+                  raise SystemExit(f"duplicate verification claim in {topic!r}")
+              orphaned = sorted(set(verifications) - set(claims))
+              if orphaned:
+                  raise SystemExit(
+                      f"verification claims do not exactly match key claims in {topic!r}: "
+                      f"{orphaned!r}"
+                  )
+              for key_claim in section["keyClaims"]:
+                  if "verificationVerdict" not in key_claim:
+                      continue
+                  verification = verifications.get(key_claim["claim"])
+                  if verification is None:
+                      raise SystemExit(
+                          f"annotated key claim has no exact verification in {topic!r}: "
+                          f"{key_claim['claim']!r}"
+                      )
+          PY
       - name: Scan the current worktree for credential material
         env:
           EVENT_NAME: ${{ github.event_name }}

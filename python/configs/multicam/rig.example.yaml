@@ -6,6 +6,7 @@
 # NOTE: triangulation across cameras REQUIRES hardware time-sync (trigger/PTP).
 # Detection2D producers must explicitly assert pixels_undistorted=true, provide
 # pixel_std_px, and stamp image exposure/capture time (not inference completion).
+# fov_deg is the vertical field of view; focal length is derived from image height.
 #
 # Build cameras in code with manwe.multicam.Camera.from_lookat(...) or load this
 # complete file with CameraRig.from_yaml(...). Calibrate real cameras: Zhang/OpenCV (intrinsics) →

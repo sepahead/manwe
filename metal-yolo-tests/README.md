@@ -26,7 +26,7 @@ Both remaining executables:
 
 - require a local, nonempty, regular, non-symlink `.safetensors` model;
 - require the expected SHA-256 and fail before inference on a mismatch;
-- use Candle 0.9.2 with the Metal backend and fail if Metal is unavailable;
+- use Candle 0.11.0 with the Metal backend and fail if Metal is unavailable;
 - use FP32 and a 640×640 isotropic letterbox input;
 - bound input dimensions, decoded allocation, requested work, FPS, and identifiers;
 - hash the model and inputs used by the run;

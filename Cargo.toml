@@ -28,8 +28,9 @@ anyhow = "1.0"
 # carries a native build step and every build environment needs a C toolchain.
 # Candle's aarch64 NEON path uses `float16x8_t` (`stdarch_neon_f16`), stable since
 # 1.94 and therefore below the 1.95 floor Bevy already sets. Candle 0.11 rewrote
-# its Metal backend onto objc2-metal; a full YOLOv8 forward pass was revalidated on
-# the Metal device and is bit-identical to CPU.
+# its Metal backend onto objc2-metal. This repository has no digest-bound golden
+# model-forward fixture, so it makes no CPU/Metal numerical-equivalence claim for
+# this upgrade; validate the exact graph and artifact on each target device.
 candle = { package = "candle-core", version = "0.11.0", default-features = false }
 candle-nn = { version = "0.11.0", default-features = false }
 candle-transformers = { version = "0.11.0", default-features = false }
