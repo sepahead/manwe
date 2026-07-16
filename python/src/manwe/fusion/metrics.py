@@ -11,6 +11,7 @@ References: Schuhmacher et al. 2008 (OSPA); Rahmathullah et al. 2017 (GOSPA).
 from __future__ import annotations
 
 import math
+from typing import Literal
 
 import numpy as np
 
@@ -24,6 +25,9 @@ _MAX_POINT_CELLS = 262_144
 _MAX_PAIR_CELLS = 4_000_000
 _MAX_PAIR_COMPONENTS = 12_000_000
 _MAX_ASSIGNMENT_WORK = 50_000_000
+_MAX_EXACT_FLOAT64_INTEGER = 1 << 53
+_REAL_NUMERIC_KINDS = frozenset("biuf")
+_FLOAT64_DTYPE = np.dtype(np.float64)
 
 
 def _pairwise(a: np.ndarray, b: np.ndarray) -> np.ndarray:
@@ -33,23 +37,51 @@ def _pairwise(a: np.ndarray, b: np.ndarray) -> np.ndarray:
     return np.hypot.reduce(np.abs(diff), axis=2)
 
 
-def _point_set(value: np.ndarray, name: str) -> np.ndarray:
+def _raw_real_array(value: object, name: str) -> np.ndarray:
+    """Admit an array container without invoking element coercion."""
     try:
-        array = np.asarray(value, dtype=float)
-    except (TypeError, ValueError) as exc:
+        array = np.asarray(value)
+    except (TypeError, ValueError, OverflowError) as exc:
         raise ValueError(f"{name} must be a numeric point set") from exc
+    if array.dtype.kind not in _REAL_NUMERIC_KINDS:
+        raise ValueError(f"{name} must be a real numeric point set")
+    return array
+
+
+def _point_set_shape(array: np.ndarray, name: str) -> tuple[int, int]:
     if array.shape == (0,):
-        return np.empty((0, 0))
+        return 0, 0
     if array.ndim == 1:
-        array = array.reshape(1, -1)
-    if array.ndim != 2 or array.shape[1] == 0:
+        shape = (1, array.shape[0])
+    elif array.ndim == 2:
+        shape = array.shape
+    else:
         raise ValueError(f"{name} must have shape (N, D), got {array.shape}")
-    if array.shape[1] > _MAX_POINT_DIMENSION:
+    if shape[1] == 0:
+        raise ValueError(f"{name} must have shape (N, D), got {array.shape}")
+    if shape[1] > _MAX_POINT_DIMENSION:
         raise ValueError(f"{name} exceeds the {_MAX_POINT_DIMENSION}-coordinate dimension limit")
-    if len(array) > _MAX_POINTS:
+    if shape[0] > _MAX_POINTS:
         raise ValueError(f"{name} exceeds the {_MAX_POINTS}-point safety limit")
     if array.size > _MAX_POINT_CELLS:
         raise ValueError(f"{name} exceeds the {_MAX_POINT_CELLS}-coordinate safety limit")
+    return shape
+
+
+def _validate_exact_float64_integers(array: np.ndarray, name: str) -> None:
+    if array.size == 0 or array.dtype.kind not in "iu":
+        return
+    minimum = int(np.min(array))
+    maximum = int(np.max(array))
+    if minimum < -_MAX_EXACT_FLOAT64_INTEGER or maximum > _MAX_EXACT_FLOAT64_INTEGER:
+        raise ValueError(
+            f"{name} contains integers outside the consecutive exact float64 range "
+            f"[-{_MAX_EXACT_FLOAT64_INTEGER}, {_MAX_EXACT_FLOAT64_INTEGER}]"
+        )
+
+
+def _validate_point_values(array: np.ndarray, name: str) -> None:
+    _validate_exact_float64_integers(array, name)
     if not np.all(np.isfinite(array)):
         raise ValueError(f"{name} must contain only finite coordinates")
     if np.any(np.abs(array) > _MAX_COORDINATE_MAGNITUDE):
@@ -57,20 +89,112 @@ def _point_set(value: np.ndarray, name: str) -> np.ndarray:
             f"{name} coordinate magnitude exceeds the float64 metric limit "
             f"{_MAX_COORDINATE_MAGNITUDE:g}"
         )
-    return array
 
 
-def _validate_sets(truth: np.ndarray, est: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    truth_set = _point_set(truth, "truth")
-    estimate_set = _point_set(est, "est")
-    if truth_set.shape[1] and estimate_set.shape[1] and truth_set.shape[1] != estimate_set.shape[1]:
+def _float64_array(array: np.ndarray, name: str) -> np.ndarray:
+    with np.errstate(over="ignore", invalid="ignore"):
+        converted = np.asarray(array, dtype=np.float64)
+    if array.dtype.kind == "f":
+        finite_before = np.isfinite(array)
+        if np.any(finite_before & ~np.isfinite(converted)):
+            raise ValueError(f"{name} contains values outside the finite float64 range")
+        if array.dtype.itemsize > _FLOAT64_DTYPE.itemsize:
+            restored = np.asarray(converted, dtype=array.dtype)
+            if np.any(finite_before & (restored != array)):
+                raise ValueError(f"{name} loses numeric precision when converted to float64")
+    return converted
+
+
+def _converted_point_set(
+    array: np.ndarray,
+    shape: tuple[int, int],
+    name: str,
+) -> np.ndarray:
+    return _float64_array(array, name).reshape(shape)
+
+
+def _validate_assignment_work(
+    truth_shape: tuple[int, int],
+    estimate_shape: tuple[int, int],
+    assignment: Literal["rectangular", "augmented"],
+    metric_name: str,
+) -> None:
+    m, n = truth_shape[0], estimate_shape[0]
+    if m == 0 or n == 0:
+        return
+    if assignment == "rectangular":
+        smaller, larger = sorted((m, n))
+        work = smaller * smaller * larger
+    else:
+        work = (m + n) ** 3
+    if work > _MAX_ASSIGNMENT_WORK:
+        raise ValueError(f"{metric_name} exceeds the assignment-work safety limit")
+
+
+def _validate_sets(
+    truth: np.ndarray,
+    est: np.ndarray,
+    *,
+    assignment: Literal["rectangular", "augmented"],
+    metric_name: str,
+) -> tuple[np.ndarray, np.ndarray]:
+    raw_truth = _raw_real_array(truth, "truth")
+    raw_estimate = _raw_real_array(est, "est")
+    truth_shape = _point_set_shape(raw_truth, "truth")
+    estimate_shape = _point_set_shape(raw_estimate, "est")
+    if truth_shape[1] and estimate_shape[1] and truth_shape[1] != estimate_shape[1]:
         raise ValueError("truth and est points must have the same dimensionality")
-    if len(truth_set) * len(estimate_set) > _MAX_PAIR_CELLS:
+    if truth_shape[0] * estimate_shape[0] > _MAX_PAIR_CELLS:
         raise ValueError(f"metric exceeds the {_MAX_PAIR_CELLS}-pair safety limit")
-    dimension = max(truth_set.shape[1], estimate_set.shape[1])
-    if len(truth_set) * len(estimate_set) * dimension > _MAX_PAIR_COMPONENTS:
+    dimension = max(truth_shape[1], estimate_shape[1])
+    if truth_shape[0] * estimate_shape[0] * dimension > _MAX_PAIR_COMPONENTS:
         raise ValueError(f"metric exceeds the {_MAX_PAIR_COMPONENTS}-pair-coordinate safety limit")
+    _validate_assignment_work(truth_shape, estimate_shape, assignment, metric_name)
+
+    _validate_point_values(raw_truth, "truth")
+    _validate_point_values(raw_estimate, "est")
+    truth_set = _converted_point_set(raw_truth, truth_shape, "truth")
+    estimate_set = _converted_point_set(raw_estimate, estimate_shape, "est")
     return truth_set, estimate_set
+
+
+def _validate_aligned_sets(truth: np.ndarray, est: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    raw_truth = _raw_real_array(truth, "truth")
+    raw_estimate = _raw_real_array(est, "est")
+    truth_shape = _point_set_shape(raw_truth, "truth")
+    estimate_shape = _point_set_shape(raw_estimate, "est")
+    if truth_shape != estimate_shape:
+        raise ValueError(
+            f"truth and est must have equal shapes, got {truth_shape} and {estimate_shape}"
+        )
+
+    _validate_point_values(raw_truth, "truth")
+    _validate_point_values(raw_estimate, "est")
+    truth_set = _converted_point_set(raw_truth, truth_shape, "truth")
+    estimate_set = _converted_point_set(raw_estimate, estimate_shape, "est")
+    return truth_set, estimate_set
+
+
+def _float64_scalar(value: object, name: str) -> float:
+    """Convert a real scalar without invoking ``__float__`` on object values."""
+    try:
+        array = np.asarray(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(f"{name} must be a real numeric scalar") from exc
+    if array.ndim != 0 or array.dtype.kind not in _REAL_NUMERIC_KINDS or array.dtype.kind == "b":
+        raise ValueError(f"{name} must be a real numeric scalar")
+    _validate_exact_float64_integers(array, name)
+    result = float(array)
+    if array.dtype.kind == "f" and np.isfinite(array) and not math.isfinite(result):
+        raise ValueError(f"{name} is outside the finite float64 range")
+    if (
+        array.dtype.kind == "f"
+        and array.dtype.itemsize > _FLOAT64_DTYPE.itemsize
+        and np.isfinite(array)
+        and np.asarray(result, dtype=array.dtype) != array
+    ):
+        raise ValueError(f"{name} loses numeric precision when converted to float64")
+    return result
 
 
 def _stable_nonnegative_power(values: np.ndarray, p: float, name: str) -> np.ndarray:
@@ -148,11 +272,18 @@ def _gospa_assignment_costs(
 
 
 def _metric_parameters(c: float, p: float) -> tuple[float, float]:
-    if isinstance(c, bool) or not np.isfinite(c) or c <= 0:
+    try:
+        c = _float64_scalar(c, "c")
+    except ValueError as exc:
+        raise ValueError("c must be finite and positive") from exc
+    if not math.isfinite(c) or c <= 0:
         raise ValueError("c must be finite and positive")
-    if isinstance(p, bool) or not np.isfinite(p) or p < 1:
+    try:
+        p = _float64_scalar(p, "p")
+    except ValueError as exc:
+        raise ValueError("p must be finite and at least 1") from exc
+    if not math.isfinite(p) or p < 1:
         raise ValueError("p must be finite and at least 1")
-    c, p = float(c), float(p)
     try:
         scale = c**p
     except OverflowError as exc:
@@ -204,7 +335,12 @@ def ospa(truth: np.ndarray, est: np.ndarray, c: float = 20.0, p: float = 2.0) ->
     ``c`` is the cutoff (max per-object penalty); ``p`` the order.
     """
     c, p = _metric_parameters(c, p)
-    truth, est = _validate_sets(truth, est)
+    truth, est = _validate_sets(
+        truth,
+        est,
+        assignment="rectangular",
+        metric_name="OSPA",
+    )
     m, n = len(truth), len(est)
     if m == 0 and n == 0:
         return {"ospa": 0.0, "localization": 0.0, "cardinality": 0.0}
@@ -214,8 +350,6 @@ def ospa(truth: np.ndarray, est: np.ndarray, c: float = 20.0, p: float = 2.0) ->
     # Order so that m <= n.
     if m > n:
         truth, est, m, n = est, truth, n, m
-    if m * m * n > _MAX_ASSIGNMENT_WORK:
-        raise ValueError("OSPA exceeds the assignment-work safety limit")
     D = np.minimum(_pairwise(truth, est), c)
     # Keep representable subnormal distances intact. Infinity, rather than a
     # large finite sentinel, denotes forbidden assignment edges, so raw powered
@@ -247,10 +381,21 @@ def gospa(
     equivalent to that definition only when ``alpha=2``.
     """
     c, p = _metric_parameters(c, p)
-    if isinstance(alpha, bool) or not np.isfinite(alpha) or not 0.0 < alpha <= 2.0:
+    try:
+        alpha = _float64_scalar(alpha, "alpha")
+    except ValueError as exc:
+        raise ValueError("alpha must be finite and in (0, 2]") from exc
+    if not math.isfinite(alpha) or not 0.0 < alpha <= 2.0:
         raise ValueError("alpha must be finite and in (0, 2]")
-    alpha = float(alpha)
-    truth, est = _validate_sets(truth, est)
+    assignment_kind: Literal["rectangular", "augmented"] = (
+        "augmented" if alpha == 2.0 else "rectangular"
+    )
+    truth, est = _validate_sets(
+        truth,
+        est,
+        assignment=assignment_kind,
+        metric_name="GOSPA",
+    )
     m, n = len(truth), len(est)
     if m == 0 and n == 0:
         return {"gospa": 0.0, "localization": 0.0, "cardinality": 0.0}
@@ -269,8 +414,6 @@ def gospa(
         # two unassigned points would incorrectly introduce alpha dependence.
         if m > n:
             truth, est, m, n = est, truth, n, m
-        if m * m * n > _MAX_ASSIGNMENT_WORK:
-            raise ValueError("GOSPA exceeds the assignment-work safety limit")
         distances = np.minimum(_pairwise(truth, est), c)
         costs = _stable_nonnegative_power(distances, p, "GOSPA assignment")
         assignment = linear_assignment(costs)
@@ -285,8 +428,6 @@ def gospa(
         }
 
     assignment_size = m + n
-    if assignment_size**3 > _MAX_ASSIGNMENT_WORK:
-        raise ValueError("GOSPA exceeds the assignment-work safety limit")
     D = _pairwise(truth, est)
     positive = D > 0.0
     log_cost = np.full_like(D, -np.inf)
@@ -329,10 +470,7 @@ def gospa(
 
 def rmse(truth: np.ndarray, est: np.ndarray) -> float:
     """Position RMSE for equal-length, index-aligned trajectories."""
-    truth = _point_set(truth, "truth")
-    est = _point_set(est, "est")
-    if truth.shape != est.shape:
-        raise ValueError(f"truth and est must have equal shapes, got {truth.shape} and {est.shape}")
+    truth, est = _validate_aligned_sets(truth, est)
     if truth.size == 0:
         raise ValueError("truth and est must not be empty")
     differences = np.abs(truth - est)

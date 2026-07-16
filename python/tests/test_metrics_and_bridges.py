@@ -6,6 +6,8 @@ from itertools import permutations
 import numpy as np
 import pytest
 
+import manwe.fusion.association as association_module
+import manwe.fusion.metrics as metrics_module
 from manwe.audio import detect_from_array, synth_plane_wave
 from manwe.eval.benchmark import benchmark
 from manwe.fusion import gospa, ospa, rmse
@@ -122,6 +124,152 @@ def test_assignment_preserves_subnormal_differences_beside_large_edges():
             ]
         )
         assert linear_assignment(cost) == [(0, 0), (1, 2), (2, 1)]
+
+
+def test_fusion_numeric_boundaries_reject_object_and_complex_without_coercion():
+    float_calls = 0
+
+    class FloatBomb:
+        def __float__(self):
+            nonlocal float_calls
+            float_calls += 1
+            raise AssertionError("object element coercion must not run")
+
+    bomb = FloatBomb()
+    object_matrix = np.array([[bomb]], dtype=object)
+    complex_matrix = np.array([[1.0 + 0.0j]])
+
+    for matrix in (object_matrix, complex_matrix):
+        with pytest.raises(ValueError, match="real numeric"):
+            linear_assignment(matrix)
+        with pytest.raises(ValueError, match="real numeric"):
+            ospa(matrix, np.zeros((1, 1)))
+        with pytest.raises(ValueError, match="real numeric"):
+            ospa(np.zeros((1, 1)), matrix)
+        with pytest.raises(ValueError, match="real numeric"):
+            associate([], matrix, np.ones((1, 1)))
+        with pytest.raises(ValueError, match="real numeric"):
+            associate([], np.zeros((1, 1)), matrix)
+
+    with pytest.raises(ValueError, match="c must be"):
+        ospa(np.zeros((1, 1)), np.zeros((1, 1)), c=bomb)  # type: ignore[arg-type]
+
+    class Track:
+        def gating_distance(self, _position, _covariance):
+            return bomb
+
+    with pytest.raises(ValueError, match="invalid gating distance"):
+        associate([Track()], np.zeros((1, 1)), np.ones((1, 1)))
+    assert float_calls == 0
+
+
+def test_assignment_and_association_preflight_broadcast_views_before_widening(monkeypatch):
+    def unexpected_widening(_array, _name):
+        raise AssertionError("float64 widening ran before admission")
+
+    monkeypatch.setattr(association_module, "_float64_array", unexpected_widening)
+
+    oversized_cost = np.broadcast_to(
+        np.array(1, dtype=np.int8),
+        (1, association_module.MAX_ASSIGNMENT_CELLS + 1),
+    )
+    assert oversized_cost.strides == (0, 0)
+    with pytest.raises(ValueError, match="assignment-work"):
+        linear_assignment(oversized_cost)
+
+    oversized_positions = np.broadcast_to(
+        np.array(1, dtype=np.int8),
+        (association_module.MAX_ASSOCIATION_ITEMS + 1, 40),
+    )
+    oversized_covariances = np.broadcast_to(
+        np.array(1, dtype=np.int8),
+        oversized_positions.shape,
+    )
+    with pytest.raises(ValueError, match="measurements exceed"):
+        associate([], oversized_positions, oversized_covariances)
+
+    positions = np.broadcast_to(np.array(0, dtype=np.int8), (1000, 64))
+    diagonal_covariances = np.broadcast_to(np.array(1, dtype=np.int8), (1000, 64))
+    with pytest.raises(ValueError, match="covariances exceed"):
+        associate([], positions, diagonal_covariances)
+
+    too_many_tracks = [None] * (association_module.MAX_ASSOCIATION_ITEMS + 1)
+    with pytest.raises(ValueError, match="tracks exceed"):
+        associate(too_many_tracks, np.empty((0, 1)), np.empty((0, 1)))
+
+
+def test_set_metrics_preflight_all_broadcast_inputs_and_work_before_widening(monkeypatch):
+    def unexpected_widening(_array, _name):
+        raise AssertionError("float64 widening ran before aggregate admission")
+
+    monkeypatch.setattr(metrics_module, "_float64_array", unexpected_widening)
+
+    valid_truth = np.array([[0]], dtype=np.int8)
+    oversized_estimate = np.broadcast_to(
+        np.array(0, dtype=np.int8),
+        (metrics_module._MAX_POINTS + 1, metrics_module._MAX_POINT_DIMENSION),
+    )
+    assert oversized_estimate.strides == (0, 0)
+    with pytest.raises(ValueError, match="point safety limit"):
+        ospa(valid_truth, oversized_estimate)
+
+    rectangular = np.broadcast_to(np.array(0, dtype=np.int8), (400, 1))
+    with pytest.raises(ValueError, match="assignment-work"):
+        ospa(rectangular, rectangular)
+
+    augmented = np.broadcast_to(np.array(0, dtype=np.int8), (200, 1))
+    with pytest.raises(ValueError, match="assignment-work"):
+        gospa(augmented, augmented, alpha=2.0)
+
+
+def test_exact_integer_admission_prevents_uint64_objective_collapse():
+    exact_limit = 2**53
+    # The exact off-diagonal objective is one smaller. Legacy eager float64
+    # conversion merged the two uint64 costs and selected the diagonal tie.
+    counterexample = np.array(
+        [[exact_limit + 1, exact_limit], [0, 0]],
+        dtype=np.uint64,
+    )
+    with pytest.raises(ValueError, match="consecutive exact float64 range"):
+        linear_assignment(counterexample)
+
+    accepted_boundary = np.array(
+        [[exact_limit, exact_limit - 1], [0, 0]],
+        dtype=np.uint64,
+    )
+    assert linear_assignment(accepted_boundary) == [(0, 1), (1, 0)]
+
+    # Every input remains individually exact here, but subtracting the negative
+    # minimum in float64 merges the two first-row costs at 2**54. The solver
+    # must detect that preprocessing loss and preserve the exact -1 objective.
+    signed_boundary = np.array(
+        [[exact_limit, exact_limit - 1], [-exact_limit, -exact_limit]],
+        dtype=np.int64,
+    )
+    assert linear_assignment(signed_boundary) == [(0, 1), (1, 0)]
+
+    truth = np.array([[exact_limit]], dtype=np.uint64)
+    estimate = np.array([[exact_limit + 1]], dtype=np.uint64)
+    # These points differ by exactly one, but eager float64 conversion made
+    # them identical and previously returned zero OSPA/GOSPA/RMSE.
+    for metric in (ospa, gospa, rmse):
+        with pytest.raises(ValueError, match="consecutive exact float64 range"):
+            metric(truth, estimate)
+    assert rmse(truth, np.array([[exact_limit - 1]], dtype=np.uint64)) == 1.0
+
+    with pytest.raises(ValueError, match="consecutive exact float64 range"):
+        associate([], estimate, np.ones((1, 1), dtype=np.uint8))
+
+    if np.finfo(np.longdouble).nmant > np.finfo(np.float64).nmant:
+        extended = np.longdouble(str(exact_limit + 1))
+        extended_cost = np.array([[extended, exact_limit], [0, 0]], dtype=np.longdouble)
+        with pytest.raises(ValueError, match="loses numeric precision"):
+            linear_assignment(extended_cost)
+        with pytest.raises(ValueError, match="loses numeric precision"):
+            rmse(
+                np.array([[np.longdouble(exact_limit)]], dtype=np.longdouble),
+                np.array([[extended]], dtype=np.longdouble),
+            )
 
 
 def test_empty_association_accepts_diagonal_and_full_covariance_shapes():
