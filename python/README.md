@@ -17,6 +17,12 @@ release target because artifact/config publication currently relies on POSIX
 descriptor-relative I/O. Training and raw conversion dependencies are lazy
 optional extras; platform runtimes such as TensorRT are installed separately.
 
+Multi-camera position covariance currently propagates detection-pixel
+localization noise conditional on analytically exact camera intrinsics and
+extrinsics. It does not model calibration-parameter uncertainty or bias. The
+correlation boundary therefore requires `calibration_is_exact=True`; real
+estimated rigs fail closed until that covariance is supported.
+
 The distribution is named `manwe-perception`; the import package and CLI command
 remain `manwe`. Alpha artifacts are built for source/GitHub release validation and
 are not published under the unrelated `manwe` project on PyPI. That legacy project

@@ -54,6 +54,8 @@ def _detection(
 
 def _correlate(cameras, detections, **kwargs):
     kwargs.setdefault("max_speed_mps", 100.0)
+    # Test rigs use analytically generated exact geometry.
+    kwargs.setdefault("calibration_is_exact", True)
     # Geometry-only fixtures omit timestamps but are generated from one shared
     # synthetic instant; acknowledge that contract explicitly.
     kwargs.setdefault("simultaneous_capture", True)
@@ -151,6 +153,7 @@ def test_untimestamped_moving_batch_requires_simultaneous_capture_acknowledgemen
             detections,
             max_time_skew=0.04,
             max_speed_mps=25.0,
+            calibration_is_exact=True,
         )
 
     fused = _correlate(
@@ -179,6 +182,7 @@ def test_static_untimestamped_batch_may_retain_bounded_skew():
         detections,
         max_time_skew=0.04,
         max_speed_mps=0.0,
+        calibration_is_exact=True,
     )
     assert len(fused) == 1
     assert fused[0].time_uncertainty_s == 0.04
@@ -198,6 +202,7 @@ def test_static_untimestamped_batch_may_retain_bounded_skew():
         stamped,
         max_time_skew=0.04,
         max_speed_mps=0.0,
+        calibration_is_exact=True,
     )
     assert len(stamped_fused) == 1
     assert stamped_fused[0].timestamp == 1.02
@@ -211,6 +216,7 @@ def test_static_untimestamped_batch_may_retain_bounded_skew():
             ],
             max_time_skew=0.04,
             max_speed_mps=0.0,
+            calibration_is_exact=True,
         )
 
 
@@ -273,12 +279,40 @@ def test_camera_and_rig_schema_reject_unknown_keys():
         )
     with pytest.raises(ValueError, match="unknown keys"):
         CameraRig.from_dict({"schema_version": 1, "cameras": [], "max_speed_mps": 1, "typo": 1})
+    cameras = _rig()[:2]
+    with pytest.raises(ValueError, match="calibration_is_exact"):
+        CameraRig.from_dict(
+            {
+                "schema_version": 2,
+                "cameras": [camera.to_dict() for camera in cameras],
+                "max_speed_mps": 1,
+            }
+        )
+    with pytest.raises(ValueError, match="calibration_is_exact"):
+        CameraRig.from_dict(
+            {
+                "schema_version": 2,
+                "cameras": [camera.to_dict() for camera in cameras],
+                "max_speed_mps": 1,
+                "calibration_is_exact": False,
+            }
+        )
+    with pytest.raises(ValueError, match="unsupported rig schema_version 1"):
+        CameraRig.from_dict(
+            {
+                "schema_version": 1,
+                "cameras": [camera.to_dict() for camera in cameras],
+                "max_speed_mps": 1,
+                "calibration_is_exact": True,
+            }
+        )
 
 
 def test_committed_rig_example_loads_and_binds_all_gates():
     pytest.importorskip("yaml")
     path = Path(__file__).resolve().parents[1] / "configs" / "multicam" / "rig.example.yaml"
     rig = CameraRig.from_yaml(path)
+    assert "schema_version: 2" in path.read_text(encoding="utf-8")
     assert len(rig.cameras) == 3
     assert [camera.name for camera in rig.cameras] == ["cam0", "cam1", "cam2"]
     assert rig.max_ray_gap_m == 8.0
@@ -287,6 +321,7 @@ def test_committed_rig_example_loads_and_binds_all_gates():
     assert rig.min_ray_angle_deg == 1.0
     assert rig.max_range_m == 100_000.0
     assert rig.max_speed_mps == 100.0
+    assert rig.calibration_is_exact is True
     assert rig.simultaneous_capture is True
     assert rig.max_cameras == 16
     assert rig.max_detections == 4096
@@ -314,19 +349,47 @@ def test_committed_rig_example_loads_and_binds_all_gates():
         for index, camera in enumerate(rig.cameras)
     ]
     assert len(rig.correlate(untimestamped)) == 1
-    unacknowledged = CameraRig(rig.cameras[:2], max_speed_mps=100.0)
+    unacknowledged = CameraRig(
+        rig.cameras[:2],
+        max_speed_mps=100.0,
+        calibration_is_exact=True,
+    )
     with pytest.raises(ValueError, match="simultaneous_capture=True"):
         unacknowledged.correlate(untimestamped[:2])
 
     with pytest.raises(ValueError, match="unique"):
-        CameraRig((rig.cameras[0], rig.cameras[0]), max_speed_mps=100.0)
+        CameraRig(
+            (rig.cameras[0], rig.cameras[0]),
+            max_speed_mps=100.0,
+            calibration_is_exact=True,
+        )
     with pytest.raises(ValueError, match="max_time_skew"):
-        CameraRig(rig.cameras[:2], max_speed_mps=100.0, max_time_skew_s=-0.1)
+        CameraRig(
+            rig.cameras[:2],
+            max_speed_mps=100.0,
+            calibration_is_exact=True,
+            max_time_skew_s=-0.1,
+        )
     with pytest.raises(ValueError, match="simultaneous_capture must be a boolean"):
         CameraRig(
             rig.cameras[:2],
             max_speed_mps=100.0,
+            calibration_is_exact=True,
             simultaneous_capture="yes",  # type: ignore[arg-type]
+        )
+    with pytest.raises(TypeError, match="calibration_is_exact"):
+        CameraRig(rig.cameras[:2], max_speed_mps=100.0)
+    with pytest.raises(ValueError, match="calibration_is_exact"):
+        CameraRig(
+            rig.cameras[:2],
+            max_speed_mps=100.0,
+            calibration_is_exact=False,
+        )
+    with pytest.raises(ValueError, match="calibration_is_exact"):
+        CameraRig(
+            rig.cameras[:2],
+            max_speed_mps=100.0,
+            calibration_is_exact=1,  # type: ignore[arg-type]
         )
 
 
@@ -505,6 +568,7 @@ def test_asynchronous_far_target_perfect_fit_is_rejected_despite_small_legacy_co
         cameras,
         pixels,
         [0.01, 0.01],
+        calibration_is_exact=True,
         min_ray_angle_deg=1.0,
     )
     legacy_covariance = geometric_covariance + np.eye(3) * (100.0 * 0.01) ** 2
@@ -529,8 +593,88 @@ def test_asynchronous_far_target_perfect_fit_is_rejected_despite_small_legacy_co
                 ordered,
                 max_time_skew=0.02,
                 max_speed_mps=100.0,
+                calibration_is_exact=True,
                 min_ray_angle_deg=1.0,
             )
+
+
+def test_focal_and_baseline_bias_are_unobservable_from_pixel_only_covariance():
+    intrinsics = np.diag([1000.0, 1000.0, 1.0])
+    truth_cameras = [
+        Camera(intrinsics, np.eye(3), np.zeros(3), name="cam0"),
+        Camera(intrinsics, np.eye(3), [-10.0, 0.0, 0.0], name="cam1"),
+    ]
+    truth = np.array([0.0, 0.0, 1000.0])
+    pixels = [camera.project(truth) for camera in truth_cameras]
+
+    biased_focal = np.diag([1010.0, 1010.0, 1.0])
+    reconstructions = {
+        "focal length": [
+            Camera(biased_focal, np.eye(3), np.zeros(3), name="cam0"),
+            Camera(biased_focal, np.eye(3), [-10.0, 0.0, 0.0], name="cam1"),
+        ],
+        "baseline": [
+            Camera(intrinsics, np.eye(3), np.zeros(3), name="cam0"),
+            Camera(intrinsics, np.eye(3), [-10.1, 0.0, 0.0], name="cam1"),
+        ],
+    }
+
+    with pytest.raises(ValueError, match="calibration_is_exact must be explicitly True"):
+        triangulation_covariance(
+            reconstructions["focal length"],
+            pixels,
+            [1e-7, 1e-7],
+            min_ray_angle_deg=0.1,
+            max_range_m=2000.0,
+        )
+
+    for biased_cameras in reconstructions.values():
+        estimate = triangulate_dlt(
+            biased_cameras,
+            pixels,
+            min_ray_angle_deg=0.1,
+            max_range_m=2000.0,
+        )
+        # Deliberately violate the new acknowledgement inside this regression
+        # to quantify the overconfidence that callers could previously emit.
+        conditional_covariance = triangulation_covariance(
+            biased_cameras,
+            pixels,
+            [1e-7, 1e-7],
+            calibration_is_exact=True,
+            min_ray_angle_deg=0.1,
+            max_range_m=2000.0,
+        )
+
+        # Rectified stereo gives Z = f*B/disparity. A common +1% focal error or
+        # a +1% assumed baseline therefore produces exactly +1% depth bias while
+        # the biased model still reprojects both observations exactly.
+        assert estimate[2] == pytest.approx(1010.0, abs=1e-8)
+        assert np.linalg.norm(estimate - truth) == pytest.approx(10.0, abs=1e-8)
+        assert reprojection_error(biased_cameras, pixels, estimate) < 1e-9
+        assert np.sqrt(conditional_covariance[2, 2]) == pytest.approx(
+            1.42835571e-5,
+            rel=1e-5,
+        )
+
+    detections = [
+        _detection(
+            index,
+            pixel,
+            timestamp=0.0,
+            camera_id=camera.name,
+            pixel_std_px=1e-7,
+        )
+        for index, (camera, pixel) in enumerate(zip(reconstructions["focal length"], pixels))
+    ]
+    with pytest.raises(ValueError, match="calibration_is_exact must be explicitly True"):
+        correlate_and_triangulate(
+            reconstructions["focal length"],
+            detections,
+            max_speed_mps=0.0,
+            min_ray_angle_deg=0.1,
+            max_range_m=2000.0,
+        )
 
 
 def test_pixel_uncertainty_increases_output_covariance():
@@ -571,6 +715,14 @@ def test_uncertainty_and_work_inputs_fail_closed_when_absent_or_exceeded():
             detections,
             max_speed_mps=100.0,
             simultaneous_capture=1,  # type: ignore[arg-type]
+            calibration_is_exact=True,
+        )
+    with pytest.raises(ValueError, match="calibration_is_exact must be explicitly True"):
+        correlate_and_triangulate(
+            cameras,
+            detections,
+            max_speed_mps=100.0,
+            calibration_is_exact=1,  # type: ignore[arg-type]
         )
     with pytest.raises(ValueError, match="camera count"):
         _correlate(cameras, detections, max_cameras=2)
@@ -583,7 +735,12 @@ def test_uncertainty_and_work_inputs_fail_closed_when_absent_or_exceeded():
     with pytest.raises(ValueError, match="max_association_states"):
         _correlate(cameras, detections, max_association_states=1)
     with pytest.raises(ValueError, match="camera count"):
-        CameraRig(cameras, max_speed_mps=100.0, max_cameras=2)
+        CameraRig(
+            cameras,
+            max_speed_mps=100.0,
+            calibration_is_exact=True,
+            max_cameras=2,
+        )
 
     with pytest.raises(ValueError, match="at most 64"):
         Detection3D(

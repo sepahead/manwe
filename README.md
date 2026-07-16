@@ -189,7 +189,12 @@ dets = [
     )
     for index, camera in enumerate(cams)
 ]
-dets3d = correlate_and_triangulate(cams, dets, max_speed_mps=50.0)
+dets3d = correlate_and_triangulate(
+    cams,
+    dets,
+    max_speed_mps=50.0,
+    calibration_is_exact=True,  # valid here only because geometry is synthetic
+)
 
 # Audio — one array yields DOA, not range; fuse only after independent ranging
 from dataclasses import replace
@@ -217,6 +222,14 @@ contract, not merely clock synchronization: asynchronous rays can intersect with
 near-zero reprojection error at a badly biased depth, so isotropic speed/skew
 covariance cannot make moving-target triangulation sound. Static-scene callers
 may set `max_speed_mps=0` and opt into bounded `max_time_skew`.
+
+The current triangulation covariance propagates pixel-localization uncertainty
+only. It does not propagate uncertainty or systematic bias in camera intrinsics
+or extrinsics: focal-length and baseline errors can preserve an exact
+reprojection fit while biasing depth. Consequently, correlation also requires
+the explicit `calibration_is_exact=True` acknowledgement, which is valid only
+for analytically exact synthetic geometry. Estimated real-camera rigs remain
+fail-closed until a calibration-parameter covariance model is implemented.
 
 ## Consumer integration status
 

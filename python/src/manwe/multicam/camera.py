@@ -462,10 +462,18 @@ class CameraRig:
     this rig share one physical exposure instant. It is required before
     untimestamped detections may triangulate a target with a non-zero speed
     bound; synchronized clocks alone are not this acknowledgement.
+
+    ``calibration_is_exact=True`` is a separate, mandatory trust-boundary
+    acknowledgement. Current position covariance propagates pixel localization
+    noise but not uncertainty in ``K``, ``R`` or ``t``. The acknowledgement is
+    therefore valid only for analytically exact synthetic geometry; estimated
+    real-world rigs remain unsupported rather than emitting overconfident
+    covariance.
     """
 
     cameras: tuple[Camera, ...]
     max_speed_mps: float = field(kw_only=True)
+    calibration_is_exact: bool = field(kw_only=True)
     simultaneous_capture: bool = field(default=False, kw_only=True)
     max_ray_gap_m: float = 8.0
     max_reprojection_px: float = 12.0
@@ -510,6 +518,11 @@ class CameraRig:
             raise ValueError("every rig camera requires a stable, non-empty name")
         if len(set(names)) != len(names):
             raise ValueError("rig camera names must be unique")
+        if self.calibration_is_exact is not True:
+            raise ValueError(
+                "calibration_is_exact must be explicitly True; calibration-parameter "
+                "uncertainty is not propagated"
+            )
         if not isinstance(self.simultaneous_capture, bool):
             raise ValueError("simultaneous_capture must be a boolean")
 
@@ -585,6 +598,7 @@ class CameraRig:
             max_range_m=self.max_range_m,
             max_speed_mps=self.max_speed_mps,
             simultaneous_capture=self.simultaneous_capture,
+            calibration_is_exact=self.calibration_is_exact,
             max_cameras=self.max_cameras,
             max_detections=self.max_detections,
             max_candidate_pairs=self.max_candidate_pairs,
@@ -600,6 +614,7 @@ class CameraRig:
             "schema_version",
             "cameras",
             "max_speed_mps",
+            "calibration_is_exact",
             "simultaneous_capture",
             "max_ray_gap_m",
             "max_reprojection_px",
@@ -617,11 +632,16 @@ class CameraRig:
         if (
             isinstance(version, bool)
             or not isinstance(version, (int, np.integer))
-            or int(version) != 1
+            or int(version) != 2
         ):
             raise ValueError(f"unsupported rig schema_version {version!r}")
         if "max_speed_mps" not in data:
             raise ValueError("rig record requires max_speed_mps for the capture-time contract")
+        if data.get("calibration_is_exact") is not True:
+            raise ValueError(
+                "rig record requires calibration_is_exact: true; "
+                "calibration-parameter uncertainty is not propagated"
+            )
         max_cameras = _bounded_positive_integer(
             data.get("max_cameras", 16), "max_cameras", _MAX_RIG_CAMERAS
         )
@@ -639,6 +659,7 @@ class CameraRig:
                 nonnegative=True,
                 maximum=_MAX_SPEED_MPS,
             ),
+            calibration_is_exact=True,
             simultaneous_capture=data.get("simultaneous_capture", False),
             max_ray_gap_m=_finite_scalar(
                 data.get("max_ray_gap_m", 8.0), "max_ray_gap_m", positive=True

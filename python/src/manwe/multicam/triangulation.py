@@ -277,17 +277,30 @@ def triangulation_covariance(
     pixels: Sequence[np.ndarray],
     pixel_stds_px: Sequence[float],
     *,
+    calibration_is_exact: bool = False,
     min_ray_angle_deg: float = 1.0,
     max_range_m: float = 100_000.0,
     max_cameras: int = 16,
 ) -> np.ndarray:
     """Propagate per-view pixel uncertainty through DLT by central differences.
 
-    The returned 3x3 covariance contains geometry-dependent position uncertainty
-    only. Callers add their temporal/motion model at the chosen reference time.
-    Failure of any perturbation is treated as an unquantifiable observation.
+    Each scalar pixel standard deviation is applied isotropically to x and y;
+    coordinate and cross-view errors are assumed mutually independent. The
+    returned 3x3 covariance is also conditional on every supplied ``K``, ``R``
+    and ``t`` being exact. Calibration-parameter uncertainty is not represented
+    by independent pixel localization noise: focal-length or pose bias can move
+    the 3D solution while retaining zero reprojection residual. Callers must
+    therefore set ``calibration_is_exact=True`` explicitly, and may do so only
+    for exact synthetic geometry or a separately completed calibration-
+    uncertainty propagation. Failure of any perturbation is treated as
+    unquantifiable.
     """
 
+    if calibration_is_exact is not True:
+        raise ValueError(
+            "calibration_is_exact must be explicitly True; triangulation covariance "
+            "is conditional on exact K/R/t"
+        )
     max_cameras = _camera_limit(max_cameras)
     camera_values, pixel_values = _validated_inputs(cameras, pixels, max_cameras)
     if not isinstance(pixel_stds_px, (list, tuple)) or len(pixel_stds_px) != len(pixel_values):

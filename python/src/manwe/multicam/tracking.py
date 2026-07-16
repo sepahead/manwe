@@ -150,7 +150,10 @@ class Detection2D:
 
     ``pixels_undistorted=True`` is a required producer acknowledgement because
     this pinhole-only module has no distortion coefficients. ``pixel_std_px`` is
-    a required one-sigma localization uncertainty. ``timestamp`` is the image
+    a required one-sigma localization uncertainty. The scalar denotes the same
+    standard deviation on x and y, and errors are assumed independent between
+    coordinates and camera views. Correlated or anisotropic localization errors
+    require a future full pixel-covariance input. ``timestamp`` is the image
     exposure/capture time (never inference completion time), and
     ``timestamp_std_s`` describes its clock/capture uncertainty.
 
@@ -231,6 +234,10 @@ class Detection3D:
     acknowledged a simultaneous capture but not supplied its time; a declared
     static target needs no simultaneity acknowledgement. In either case,
     :func:`to_measurements` requires the applicable external time reference.
+
+    Detections emitted by :func:`correlate_and_triangulate` carry position
+    covariance conditional on exact camera intrinsics/extrinsics. Real
+    calibration-parameter uncertainty is not silently folded into pixel noise.
     """
 
     position: np.ndarray
@@ -500,6 +507,7 @@ def _build_hypothesis(
             cluster_cameras,
             pixels,
             [detections[index].pixel_std_px for index in members],
+            calibration_is_exact=True,
             min_ray_angle_deg=min_ray_angle_deg,
             max_range_m=max_range_m,
             max_cameras=max_cameras,
@@ -752,6 +760,7 @@ def correlate_and_triangulate(
     max_range_m: float = 100_000.0,
     max_speed_mps: float | None = None,
     simultaneous_capture: bool = False,
+    calibration_is_exact: bool = False,
     max_cameras: int = 16,
     max_detections: int = 4096,
     max_candidate_pairs: int = 1_000_000,
@@ -770,6 +779,13 @@ def correlate_and_triangulate(
     exposure instant. The latter leaves the output timestamp unset; the
     timestamp supplied to :func:`to_measurements` must be that shared capture
     time. Static targets (``max_speed_mps=0``) may use bounded skew.
+
+    Position covariance is conditional on exact camera intrinsics and
+    extrinsics. This module does not yet accept a calibration-parameter
+    covariance, so ``calibration_is_exact=True`` is a required acknowledgement
+    and is valid only for exact synthetic geometry. Estimated real-world
+    calibrations fail closed rather than reporting pixel-only covariance as a
+    complete measurement covariance.
     """
 
     if not isinstance(cameras, (list, tuple)) or not cameras:
@@ -821,6 +837,11 @@ def correlate_and_triangulate(
     )
     if not isinstance(simultaneous_capture, bool):
         raise ValueError("simultaneous_capture must be a boolean")
+    if calibration_is_exact is not True:
+        raise ValueError(
+            "calibration_is_exact must be explicitly True; calibration-parameter "
+            "uncertainty is not propagated"
+        )
     camera_ids = _resolve_camera_ids(camera_values, detection_values)
 
     stamped_flags = [detection.timestamp is not None for detection in detection_values]

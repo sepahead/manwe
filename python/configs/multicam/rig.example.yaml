@@ -13,8 +13,14 @@
 # Build cameras in code with manwe.multicam.Camera.from_lookat(...) or load this
 # complete file with CameraRig.from_yaml(...). Calibrate real cameras: Zhang/OpenCV (intrinsics) →
 # COLMAP/PnP (extrinsics) → GeoCalib/AnyCalib (single-image fallback).
+#
+# This committed fixture uses analytically generated look-at geometry, so its
+# calibration is exact by construction. Current code does NOT propagate
+# uncertainty in K/R/t. A real estimated calibration must not copy this flag;
+# it remains fail-closed until calibration-parameter covariance is supported.
 
-schema_version: 1
+schema_version: 2
+calibration_is_exact: true
 cameras:
   - name: cam0
     position: [0, 0, 100]

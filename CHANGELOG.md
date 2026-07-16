@@ -38,6 +38,12 @@ This is the first planned tagged alpha after the untagged Rust/Candle prototypes
   acknowledgement. Static-scene skew remains supported. This removes an
   unsound isotropic speed/skew covariance heuristic that could understate
   geometry-amplified depth bias by orders of magnitude.
+- Multi-camera covariance now fails closed unless callers explicitly acknowledge
+  analytically exact calibration. Pixel localization covariance cannot represent
+  focal-length or pose bias, which may preserve a zero reprojection residual
+  while shifting depth; estimated real-camera rigs remain unsupported until
+  calibration-parameter covariance is propagated. The rig schema is version 2
+  because this acknowledgement is now mandatory.
 - Tracker clock-gap budgeting no longer partitions the discrete per-cycle filter
   model: each call now applies acceleration noise and an IMM Markov transition
   exactly once, independent of the `max_dt` admission quantum. This intentionally
