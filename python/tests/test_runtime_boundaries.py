@@ -37,6 +37,15 @@ from manwe.vision.sahi_infer import SliceConfig
 from manwe.vision.train import VisionTrainConfig, train
 
 
+def _assert_exception_note(error: BaseException, *fragments: str) -> None:
+    """Assert PEP 678 evidence where the supported interpreter provides it."""
+    if not hasattr(error, "add_note"):
+        return
+    assert any(
+        all(fragment in note for fragment in fragments) for note in getattr(error, "__notes__", ())
+    )
+
+
 def _write_calibration_png(
     path,
     color: tuple[int, int, int],
@@ -342,7 +351,7 @@ def test_artifact_snapshot_cleanup_never_masks_body_exception(tmp_path, monkeypa
     with pytest.raises(BodyError, match="body failure") as captured, snapshot:
         raise BodyError("body failure")
     assert isinstance(captured.value.__cause__, OSError)
-    assert any("artifact snapshot cleanup failed" in note for note in captured.value.__notes__)
+    _assert_exception_note(captured.value, "artifact snapshot cleanup failed")
 
 
 def test_bounded_regular_read_detects_ctime_only_mutation(tmp_path, monkeypatch):
@@ -1825,6 +1834,7 @@ def test_directory_export_failure_preserves_private_partial_for_recovery(tmp_pat
     (source / "Manifest.json").write_text("{}", encoding="utf-8")
     destination = tmp_path / "published.mlpackage"
     digest = sha256_artifact(source)
+    stage = tmp_path / f".manwe-export-stage-{'1' * 48}"
 
     def fail_publication(_src, destination_fd):
         fd = os.open(
@@ -1838,11 +1848,13 @@ def test_directory_export_failure_preserves_private_partial_for_recovery(tmp_pat
         raise OSError("injected publication failure")
 
     monkeypatch.setattr(backends, "_copy_directory_fd_relative", fail_publication)
+    monkeypatch.setattr(backends, "_new_private_stage_name", lambda: stage.name)
     with pytest.raises(OSError, match="injected publication failure") as captured:
         _publish_exclusive(source, destination, digest)
-    assert any("automatic output rollback is disabled" in note for note in captured.value.__notes__)
-    assert (destination / "partial").read_bytes() == b"partial"
-    assert stat.S_IMODE(destination.stat().st_mode) == 0o700
+    _assert_exception_note(captured.value, "No automatic deletion was attempted")
+    assert not destination.exists()
+    assert (stage / "partial").read_bytes() == b"partial"
+    assert stat.S_IMODE(stage.stat().st_mode) == 0o700
 
 
 def test_publication_preserves_original_error_and_recovery_evidence(tmp_path, monkeypatch):
@@ -1854,6 +1866,7 @@ def test_publication_preserves_original_error_and_recovery_evidence(tmp_path, mo
     (source / "Manifest.json").write_text("{}", encoding="utf-8")
     destination = tmp_path / "published.mlpackage"
     digest = sha256_artifact(source)
+    stage = tmp_path / f".manwe-export-stage-{'2' * 48}"
 
     def fail_publication(_source, destination_fd):
         fd = os.open(
@@ -1866,14 +1879,18 @@ def test_publication_preserves_original_error_and_recovery_evidence(tmp_path, mo
         raise ValueError("injected publication failure")
 
     monkeypatch.setattr(backends, "_copy_directory_fd_relative", fail_publication)
+    monkeypatch.setattr(backends, "_new_private_stage_name", lambda: stage.name)
     with pytest.raises(ValueError, match="injected publication failure") as captured:
         _publish_exclusive(source, destination, digest)
-    assert any(
-        "automatic output rollback is disabled" in note and str(destination) in note
-        for note in captured.value.__notes__
+    _assert_exception_note(
+        captured.value,
+        "No automatic deletion was attempted",
+        destination.name,
+        str(destination.parent),
     )
-    assert destination.is_dir()
-    assert (destination / "partial").is_file()
+    assert not destination.exists()
+    assert stage.is_dir()
+    assert (stage / "partial").is_file()
 
 
 def test_file_publication_rejects_private_snapshot_growth(tmp_path, monkeypatch):
@@ -1884,6 +1901,7 @@ def test_file_publication_rejects_private_snapshot_growth(tmp_path, monkeypatch)
     source.write_bytes(b"trusted")
     destination = tmp_path / "published.onnx"
     digest = sha256_artifact(source)
+    stage = tmp_path / f".manwe-export-stage-{'3' * 48}"
     real_copy = backends._copy_regular_snapshot
 
     class GrowingReader:
@@ -1911,11 +1929,13 @@ def test_file_publication_rejects_private_snapshot_growth(tmp_path, monkeypatch)
         )
 
     monkeypatch.setattr(backends, "_copy_regular_snapshot", grow_during_copy)
+    monkeypatch.setattr(backends, "_new_private_stage_name", lambda: stage.name)
     with pytest.raises(RuntimeError, match="grew while being published") as captured:
         _publish_exclusive(source, destination, digest)
-    assert any("automatic output rollback is disabled" in note for note in captured.value.__notes__)
-    assert destination.read_bytes() == b""
-    assert stat.S_IMODE(destination.stat().st_mode) == 0o600
+    _assert_exception_note(captured.value, "No automatic deletion was attempted")
+    assert not destination.exists()
+    assert stage.read_bytes() == b""
+    assert stat.S_IMODE(stage.stat().st_mode) == 0o600
 
 
 def test_directory_export_replacement_cannot_redirect_descriptor_relative_writes(
@@ -1929,6 +1949,7 @@ def test_directory_export_replacement_cannot_redirect_descriptor_relative_writes
     source.mkdir()
     (source / "weights.bin").write_bytes(b"trusted")
     destination = tmp_path / "published.mlpackage"
+    stage = tmp_path / f".manwe-export-stage-{'4' * 48}"
     moved = tmp_path / "moved-original.mlpackage"
     digest = sha256_artifact(source)
     real_fsync = artifacts.os.fsync
@@ -1937,18 +1958,20 @@ def test_directory_export_replacement_cannot_redirect_descriptor_relative_writes
     def replace_root_during_copy(fd):
         nonlocal replaced
         metadata = os.fstat(fd)
-        if not replaced and destination.exists() and stat.S_ISREG(metadata.st_mode):
-            destination.rename(moved)
-            destination.mkdir()
-            (destination / "foreign.txt").write_text("foreign", encoding="utf-8")
+        if not replaced and stage.exists() and stat.S_ISREG(metadata.st_mode):
+            stage.rename(moved)
+            stage.mkdir()
+            (stage / "foreign.txt").write_text("foreign", encoding="utf-8")
             replaced = True
         return real_fsync(fd)
 
     monkeypatch.setattr(artifacts.os, "fsync", replace_root_during_copy)
+    monkeypatch.setattr(backends, "_new_private_stage_name", lambda: stage.name)
     with pytest.raises(RuntimeError, match="replaced"):
         backends._publish_exclusive(source, destination, digest)
-    assert (destination / "foreign.txt").read_text(encoding="utf-8") == "foreign"
-    assert not (destination / "weights.bin").exists()
+    assert not destination.exists()
+    assert (stage / "foreign.txt").read_text(encoding="utf-8") == "foreign"
+    assert not (stage / "weights.bin").exists()
     assert (moved / "weights.bin").read_bytes() == b"trusted"
 
 
@@ -1960,6 +1983,7 @@ def test_directory_export_binds_the_directory_created_before_copy(tmp_path, monk
     source.mkdir()
     (source / "weights.bin").write_bytes(b"trusted")
     destination = tmp_path / "published.mlpackage"
+    stage = tmp_path / f".manwe-export-stage-{'5' * 48}"
     moved = tmp_path / "moved-created.mlpackage"
     digest = sha256_artifact(source)
     real_open = backends.os.open
@@ -1969,20 +1993,22 @@ def test_directory_export_binds_the_directory_created_before_copy(tmp_path, monk
         nonlocal replaced
         if (
             not replaced
-            and path == destination.name
+            and path == stage.name
             and kwargs.get("dir_fd") is not None
-            and destination.is_dir()
+            and stage.is_dir()
         ):
-            destination.rename(moved)
-            destination.mkdir()
-            (destination / "foreign.txt").write_text("foreign", encoding="utf-8")
+            stage.rename(moved)
+            stage.mkdir()
+            (stage / "foreign.txt").write_text("foreign", encoding="utf-8")
             replaced = True
         return real_open(path, flags, *args, **kwargs)
 
     monkeypatch.setattr(backends.os, "open", replace_before_directory_open)
+    monkeypatch.setattr(backends, "_new_private_stage_name", lambda: stage.name)
     with pytest.raises(RuntimeError, match="replaced while it was being opened"):
         backends._publish_exclusive(source, destination, digest)
-    assert (destination / "foreign.txt").read_text(encoding="utf-8") == "foreign"
+    assert not destination.exists()
+    assert (stage / "foreign.txt").read_text(encoding="utf-8") == "foreign"
     assert list(moved.iterdir()) == []
 
 
@@ -1994,22 +2020,25 @@ def test_directory_export_failure_never_deletes_foreign_replacement(tmp_path, mo
     source.mkdir()
     (source / "weights.bin").write_bytes(b"trusted")
     destination = tmp_path / "published.mlpackage"
+    stage = tmp_path / f".manwe-export-stage-{'6' * 48}"
     moved = tmp_path / "moved-partial.mlpackage"
     digest = sha256_artifact(source)
 
     def fail_copy(_source, destination_fd):
         fd = os.open("partial", os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600, dir_fd=destination_fd)
         os.close(fd)
-        destination.rename(moved)
-        destination.mkdir()
-        (destination / "foreign.txt").write_text("foreign", encoding="utf-8")
+        stage.rename(moved)
+        stage.mkdir()
+        (stage / "foreign.txt").write_text("foreign", encoding="utf-8")
         raise ValueError("injected publication failure")
 
     monkeypatch.setattr(backends, "_copy_directory_fd_relative", fail_copy)
+    monkeypatch.setattr(backends, "_new_private_stage_name", lambda: stage.name)
     with pytest.raises(ValueError, match="injected publication failure") as captured:
         backends._publish_exclusive(source, destination, digest)
-    assert any("automatic output rollback is disabled" in note for note in captured.value.__notes__)
-    assert (destination / "foreign.txt").read_text(encoding="utf-8") == "foreign"
+    _assert_exception_note(captured.value, "No automatic deletion was attempted")
+    assert not destination.exists()
+    assert (stage / "foreign.txt").read_text(encoding="utf-8") == "foreign"
     assert (moved / "partial").is_file()
 
 
@@ -2044,20 +2073,23 @@ def test_export_publication_rechecks_identity_after_digest(tmp_path, monkeypatch
     source = tmp_path / "source.onnx"
     source.write_bytes(b"trusted")
     destination = tmp_path / "published.onnx"
+    stage = tmp_path / f".manwe-export-stage-{'7' * 48}"
     moved = tmp_path / "moved-published.onnx"
     digest = sha256_artifact(source)
     original_hash = backends.sha256_artifact_at
 
     def replace_after_hash(parent_fd, name):
         value = original_hash(parent_fd, name)
-        destination.rename(moved)
-        destination.write_bytes(b"attacker")
+        stage.rename(moved)
+        stage.write_bytes(b"attacker")
         return value
 
     monkeypatch.setattr(backends, "sha256_artifact_at", replace_after_hash)
+    monkeypatch.setattr(backends, "_new_private_stage_name", lambda: stage.name)
     with pytest.raises(RuntimeError, match="digest was being verified"):
         backends._publish_exclusive(source, destination, digest)
-    assert destination.read_bytes() == b"attacker"
+    assert not destination.exists()
+    assert stage.read_bytes() == b"attacker"
     assert moved.read_bytes() == b"trusted"
 
 
@@ -2071,6 +2103,7 @@ def test_export_parent_replacement_cannot_redirect_publication(tmp_path, monkeyp
     parent.mkdir()
     moved_parent = tmp_path / "moved-output"
     destination = parent / "published.onnx"
+    stage_name = f".manwe-export-stage-{'8' * 48}"
     digest = sha256_artifact(source)
     prepared = backends._prepare_destination(str(destination), {".onnx"})
     real_copy = backends._copy_regular_snapshot
@@ -2086,6 +2119,7 @@ def test_export_parent_replacement_cannot_redirect_publication(tmp_path, monkeyp
         return real_copy(source_handle, destination_handle, display=display)
 
     monkeypatch.setattr(backends, "_copy_regular_snapshot", replace_parent_during_copy)
+    monkeypatch.setattr(backends, "_new_private_stage_name", lambda: stage_name)
 
     try:
         with pytest.raises(RuntimeError, match="parent was replaced") as captured:
@@ -2094,10 +2128,10 @@ def test_export_parent_replacement_cannot_redirect_publication(tmp_path, monkeyp
         prepared.close()
     assert (parent / "foreign.txt").read_text(encoding="utf-8") == "foreign"
     assert not (parent / destination.name).exists()
-    preserved = moved_parent / destination.name
+    preserved = moved_parent / stage_name
     assert preserved.read_bytes() == b"trusted"
     assert stat.S_IMODE(preserved.stat().st_mode) == 0o600
-    assert any("automatic output rollback is disabled" in note for note in captured.value.__notes__)
+    _assert_exception_note(captured.value, "No automatic deletion was attempted")
 
 
 def test_ultralytics_policy_disables_install_network_and_analytics(tmp_path, monkeypatch):

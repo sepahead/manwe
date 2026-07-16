@@ -8,13 +8,16 @@ supported conversion target here.
 
 from __future__ import annotations
 
+import ctypes
+import errno
 import importlib
 import importlib.metadata
 import math
 import os
+import secrets
 import stat
+import sys
 from collections.abc import Mapping
-from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 from typing import BinaryIO
@@ -43,6 +46,130 @@ log = get_logger("manwe.export")
 
 _MAX_MODEL_STRIDES = 64
 _MAX_MODEL_STRIDE_NODES = 128
+_LINUX_RENAME_NOREPLACE = 1
+_DARWIN_RENAME_EXCL = 0x00000004
+_DARWIN_ACL_TYPE_EXTENDED = 0x00000100
+_STAGE_NAME_ATTEMPTS = 16
+_STAGE_TOKEN_BYTES = 24
+
+
+def _raise_exclusive_rename_error(
+    error_number: int,
+    *,
+    source_name: str,
+    destination_name: str,
+) -> None:
+    if error_number <= 0:
+        raise RuntimeError(
+            "atomic no-replace rename failed without a usable operating-system error"
+        )
+    operation_error = OSError(
+        error_number,
+        os.strerror(error_number),
+        f"{source_name} -> {destination_name}",
+    )
+    unsupported_errors = {
+        errno.EINVAL,
+        errno.ENOSYS,
+        getattr(errno, "ENOTSUP", errno.EINVAL),
+        getattr(errno, "EOPNOTSUPP", errno.EINVAL),
+    }
+    if error_number in unsupported_errors:
+        raise RuntimeError(
+            "the operating system or destination filesystem does not support "
+            "the required atomic no-replace rename operation"
+        ) from operation_error
+    raise operation_error
+
+
+def _call_libc_rename_noreplace(
+    symbol: str,
+    parent_fd: int,
+    source_name: str,
+    destination_name: str,
+    flags: int,
+) -> None:
+    """Call one descriptor-relative libc rename primitive exactly once.
+
+    A failed rename is deliberately never retried: Linux documents that NFS
+    can report failure after the server committed a rename, so retrying could
+    turn an indeterminate outcome into an overwrite attempt or a misleading
+    secondary error.
+    """
+    try:
+        libc = ctypes.CDLL(None, use_errno=True)
+        rename_function = getattr(libc, symbol)
+    except (AttributeError, OSError) as exc:
+        raise RuntimeError(
+            f"this operating system does not expose the required libc {symbol} primitive"
+        ) from exc
+    rename_function.argtypes = [
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_uint,
+    ]
+    rename_function.restype = ctypes.c_int
+    ctypes.set_errno(0)
+    result = rename_function(
+        parent_fd,
+        os.fsencode(source_name),
+        parent_fd,
+        os.fsencode(destination_name),
+        flags,
+    )
+    if result != 0:
+        _raise_exclusive_rename_error(
+            ctypes.get_errno(),
+            source_name=source_name,
+            destination_name=destination_name,
+        )
+
+
+def _linux_rename_noreplace_at(
+    parent_fd: int,
+    source_name: str,
+    destination_name: str,
+) -> None:
+    _call_libc_rename_noreplace(
+        "renameat2",
+        parent_fd,
+        source_name,
+        destination_name,
+        _LINUX_RENAME_NOREPLACE,
+    )
+
+
+def _darwin_rename_noreplace_at(
+    parent_fd: int,
+    source_name: str,
+    destination_name: str,
+) -> None:
+    _call_libc_rename_noreplace(
+        "renameatx_np",
+        parent_fd,
+        source_name,
+        destination_name,
+        _DARWIN_RENAME_EXCL,
+    )
+
+
+def _rename_noreplace_at(
+    parent_fd: int,
+    source_name: str,
+    destination_name: str,
+) -> None:
+    if sys.platform.startswith("linux"):
+        _linux_rename_noreplace_at(parent_fd, source_name, destination_name)
+        return
+    if sys.platform == "darwin":
+        _darwin_rename_noreplace_at(parent_fd, source_name, destination_name)
+        return
+    raise RuntimeError(
+        "atomic export publication requires Linux renameat2(RENAME_NOREPLACE) "
+        "or macOS renameatx_np(RENAME_EXCL)"
+    )
 
 
 def _preflight_tensorrt_int8(device_index: int) -> tuple[str, str | None]:
@@ -355,6 +482,83 @@ EXPORT_FORMATS: dict[str, FormatSpec] = {
 }
 
 
+def _assert_no_darwin_extended_acl(parent_fd: int, path: Path) -> None:
+    """Reject macOS ACLs whose delete rights are not proven by mode bits."""
+    if sys.platform != "darwin":
+        return
+    try:
+        libc = ctypes.CDLL(None, use_errno=True)
+        acl_get_fd_np = libc.acl_get_fd_np
+        acl_free = libc.acl_free
+    except (AttributeError, OSError) as exc:
+        raise RuntimeError(f"output parent ACL policy could not be inspected: {path}") from exc
+    acl_get_fd_np.argtypes = [ctypes.c_int, ctypes.c_int]
+    acl_get_fd_np.restype = ctypes.c_void_p
+    acl_free.argtypes = [ctypes.c_void_p]
+    acl_free.restype = ctypes.c_int
+    ctypes.set_errno(0)
+    acl = acl_get_fd_np(parent_fd, _DARWIN_ACL_TYPE_EXTENDED)
+    if not acl:
+        error_number = ctypes.get_errno()
+        no_acl_errors = {
+            errno.ENOENT,
+            getattr(errno, "ENOTSUP", errno.ENOENT),
+            getattr(errno, "EOPNOTSUPP", errno.ENOENT),
+        }
+        if error_number in no_acl_errors:
+            return
+        operation_error = OSError(
+            error_number,
+            os.strerror(error_number) if error_number > 0 else "unknown ACL inspection error",
+            str(path),
+        )
+        raise RuntimeError(
+            f"output parent ACL policy could not be inspected: {path}"
+        ) from operation_error
+
+    rejection = PermissionError(
+        f"output parent has an extended ACL that prevents a mode-bit trust proof: {path}"
+    )
+    ctypes.set_errno(0)
+    if acl_free(acl) != 0:
+        error_number = ctypes.get_errno()
+        cleanup = OSError(
+            error_number,
+            os.strerror(error_number) if error_number > 0 else "unknown ACL cleanup error",
+        )
+        attach_cleanup_failure(rejection, cleanup, "output parent ACL cleanup failed")
+    raise rejection
+
+
+def _assert_publication_parent_trust(
+    parent_fd: int,
+    metadata: os.stat_result,
+    path: Path,
+) -> None:
+    """Reject parents where a different unprivileged identity can replace a stage.
+
+    Sticky-directory rules protect entries from other ordinary users, provided
+    the directory owner is either this process or root. A process sharing our
+    effective UID, and a privileged process, remain outside what pathname-based
+    POSIX publication can defend against.
+    """
+    if not stat.S_ISDIR(metadata.st_mode):
+        raise RuntimeError(f"output parent is not a directory: {path}")
+    _assert_no_darwin_extended_acl(parent_fd, path)
+    shared_write = metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+    if not shared_write:
+        return
+    if not (metadata.st_mode & stat.S_ISVTX):
+        raise PermissionError(
+            f"output parent is group/other-writable without sticky-directory protection: {path}"
+        )
+    effective_uid = os.geteuid()
+    if metadata.st_uid not in {0, effective_uid}:
+        raise PermissionError(
+            f"shared sticky output parent must be owned by the effective user or root: {path}"
+        )
+
+
 @dataclass
 class _PreparedDestination:
     path: Path
@@ -366,18 +570,29 @@ class _PreparedDestination:
         if self.closed:
             raise RuntimeError("output parent descriptor is already closed")
         try:
-            metadata = os.stat(self.path.parent, follow_symlinks=False)
+            descriptor_metadata = os.fstat(self.parent_fd)
+            path_metadata = os.stat(self.path.parent, follow_symlinks=False)
         except OSError as exc:
             raise RuntimeError("output parent was replaced while the export was running") from exc
         if (
-            not stat.S_ISDIR(metadata.st_mode)
+            not stat.S_ISDIR(path_metadata.st_mode)
             or (
-                metadata.st_dev,
-                metadata.st_ino,
+                path_metadata.st_dev,
+                path_metadata.st_ino,
+            )
+            != self.parent_identity
+            or (
+                descriptor_metadata.st_dev,
+                descriptor_metadata.st_ino,
             )
             != self.parent_identity
         ):
             raise RuntimeError("output parent was replaced while the export was running")
+        _assert_publication_parent_trust(
+            self.parent_fd,
+            descriptor_metadata,
+            self.path.parent,
+        )
 
     def close(self) -> None:
         if not self.closed:
@@ -407,18 +622,37 @@ def _prepare_destination(path: str, allowed_suffixes: set[str]) -> _PreparedDest
     try:
         metadata = os.stat(destination.name, dir_fd=parent_fd, follow_symlinks=False)
     except FileNotFoundError:
-        parent_metadata = os.fstat(parent_fd)
+        try:
+            parent_metadata = os.fstat(parent_fd)
+            _assert_publication_parent_trust(
+                parent_fd,
+                parent_metadata,
+                destination.parent,
+            )
+        except BaseException as error:
+            try:
+                os.close(parent_fd)
+            except BaseException as cleanup:
+                attach_cleanup_failure(error, cleanup, "output parent cleanup failed")
+            raise
         return _PreparedDestination(
             destination,
             parent_fd,
             (parent_metadata.st_dev, parent_metadata.st_ino),
         )
-    except BaseException:
-        os.close(parent_fd)
+    except BaseException as error:
+        try:
+            os.close(parent_fd)
+        except BaseException as cleanup:
+            attach_cleanup_failure(error, cleanup, "output parent cleanup failed")
         raise
-    os.close(parent_fd)
     kind = "symbolic link" if stat.S_ISLNK(metadata.st_mode) else "filesystem entry"
-    raise FileExistsError(f"output destination is already occupied by a {kind}: {destination}")
+    occupied = FileExistsError(f"output destination is already occupied by a {kind}: {destination}")
+    try:
+        os.close(parent_fd)
+    except BaseException as cleanup:
+        attach_cleanup_failure(occupied, cleanup, "output parent cleanup failed")
+    raise occupied
 
 
 def _copy_directory_fd_relative(source: Path, destination_fd: int) -> None:
@@ -524,14 +758,69 @@ def _finalize_published_mode(
         metadata = os.fstat(fd)
         expected_kind = stat.S_ISDIR if is_directory else stat.S_ISREG
         if not expected_kind(metadata.st_mode) or (metadata.st_dev, metadata.st_ino) != identity:
-            raise RuntimeError("output destination was replaced before permission finalization")
+            raise RuntimeError("published export was replaced before permission finalization")
         os.fchmod(fd, 0o755 if is_directory else 0o644)
         os.fsync(fd)
-    except BaseException:
-        with suppress(OSError):
+    except BaseException as error:
+        try:
             os.close(fd)
+        except BaseException as cleanup:
+            attach_cleanup_failure(
+                error,
+                cleanup,
+                "published export permission descriptor cleanup failed",
+            )
         raise
-    os.close(fd)
+    else:
+        os.close(fd)
+
+
+def _new_private_stage_name() -> str:
+    return f".manwe-export-stage-{secrets.token_hex(_STAGE_TOKEN_BYTES)}"
+
+
+def _attach_publication_recovery_note(
+    error: BaseException,
+    anchor: _PreparedDestination,
+    stage_name: str,
+    *,
+    rename_attempted: bool,
+    rename_returned: bool,
+    publication_complete: bool,
+) -> None:
+    if publication_complete:
+        state = "publication completed, but subsequent private resource cleanup failed"
+    elif rename_returned:
+        state = (
+            "the exclusive rename returned success, but final verification or "
+            "directory durability did not complete"
+        )
+    elif rename_attempted:
+        state = (
+            "the exclusive rename outcome is indeterminate; a network filesystem "
+            "can commit a rename and then report failure"
+        )
+    else:
+        state = "the exclusive rename was not attempted"
+    recovery_message = (
+        f"Atomic export recovery required: {state}. No automatic deletion was "
+        "attempted. Inspect both the descriptor-relative stage "
+        f"{stage_name!r} and final {anchor.path.name!r} in parent inode "
+        f"(device={anchor.parent_identity[0]}, inode={anchor.parent_identity[1]}). "
+        f"The original parent path was {anchor.path.parent}, but that pathname may "
+        "have been replaced."
+    )
+    try:
+        log.error("%s", recovery_message)
+    except BaseException as reporting_error:
+        attach_cleanup_failure(
+            error,
+            reporting_error,
+            "atomic export recovery logging failed",
+        )
+    add_note = getattr(error, "add_note", None)
+    if callable(add_note):
+        add_note(recovery_message)
 
 
 def _publish_exclusive(source: Path, destination: Path | _PreparedDestination, digest: str) -> None:
@@ -543,6 +832,12 @@ def _publish_exclusive(source: Path, destination: Path | _PreparedDestination, d
         anchor = _prepare_destination(str(destination), {destination.suffix.lower()})
     if anchor.closed:
         raise RuntimeError("output parent descriptor is already closed")
+    stage_name = ""
+    stage_created = False
+    rename_attempted = False
+    rename_returned = False
+    publication_complete = False
+    recovery_reported = False
     try:
         anchor.assert_parent_path()
         with ArtifactSnapshot(source, digest, allowed_suffixes={source.suffix.lower()}) as snapshot:
@@ -550,55 +845,89 @@ def _publish_exclusive(source: Path, destination: Path | _PreparedDestination, d
                 raise ValueError(
                     "output suffix must match the exact artifact type returned by the exporter"
                 )
-            created_identity: tuple[int, int] | None = None
-            created_is_directory = False
             try:
-                if snapshot.path.is_dir():
-                    os.mkdir(anchor.path.name, mode=0o700, dir_fd=anchor.parent_fd)
+                stage_is_directory = snapshot.path.is_dir()
+                stage_fd = -1
+                for _attempt in range(_STAGE_NAME_ATTEMPTS):
+                    candidate = _new_private_stage_name()
+                    try:
+                        if stage_is_directory:
+                            os.mkdir(candidate, mode=0o700, dir_fd=anchor.parent_fd)
+                        else:
+                            flags = (
+                                os.O_WRONLY
+                                | os.O_CREAT
+                                | os.O_EXCL
+                                | getattr(os, "O_CLOEXEC", 0)
+                                | getattr(os, "O_NOFOLLOW", 0)
+                            )
+                            stage_fd = os.open(
+                                candidate,
+                                flags,
+                                0o600,
+                                dir_fd=anchor.parent_fd,
+                            )
+                    except FileExistsError:
+                        continue
+                    stage_name = candidate
+                    stage_created = True
+                    break
+                else:
+                    raise RuntimeError(
+                        "could not allocate a unique high-entropy export staging name"
+                    )
+
+                stage_identity: tuple[int, int]
+                if stage_is_directory:
                     created = os.stat(
-                        anchor.path.name,
+                        stage_name,
                         dir_fd=anchor.parent_fd,
                         follow_symlinks=False,
                     )
                     if not stat.S_ISDIR(created.st_mode):
-                        raise RuntimeError("output destination is not the directory just created")
-                    created_identity = (created.st_dev, created.st_ino)
-                    created_is_directory = True
+                        raise RuntimeError("export stage is not the directory just created")
+                    stage_identity = (created.st_dev, created.st_ino)
                     flags = (
                         os.O_RDONLY
                         | getattr(os, "O_CLOEXEC", 0)
                         | getattr(os, "O_DIRECTORY", 0)
                         | getattr(os, "O_NOFOLLOW", 0)
                     )
-                    root_fd = os.open(anchor.path.name, flags, dir_fd=anchor.parent_fd)
+                    root_fd = os.open(stage_name, flags, dir_fd=anchor.parent_fd)
                     try:
                         metadata = os.fstat(root_fd)
                         if (
                             not stat.S_ISDIR(metadata.st_mode)
-                            or (metadata.st_dev, metadata.st_ino) != created_identity
+                            or (metadata.st_dev, metadata.st_ino) != stage_identity
                         ):
                             raise RuntimeError(
-                                "output destination was replaced while it was being opened"
+                                "export stage was replaced while it was being opened"
                             )
+                        os.fchmod(root_fd, 0o700)
                         _copy_directory_fd_relative(snapshot.path, root_fd)
                         os.fsync(root_fd)
-                    finally:
+                    except BaseException as error:
+                        try:
+                            os.close(root_fd)
+                        except BaseException as cleanup:
+                            attach_cleanup_failure(
+                                error,
+                                cleanup,
+                                "export stage descriptor cleanup failed",
+                            )
+                        raise
+                    else:
                         os.close(root_fd)
                 else:
-                    flags = (
-                        os.O_WRONLY
-                        | os.O_CREAT
-                        | os.O_EXCL
-                        | getattr(os, "O_CLOEXEC", 0)
-                        | getattr(os, "O_NOFOLLOW", 0)
-                    )
-                    fd = os.open(anchor.path.name, flags, 0o600, dir_fd=anchor.parent_fd)
                     try:
-                        metadata = os.fstat(fd)
-                        created_identity = (metadata.st_dev, metadata.st_ino)
+                        metadata = os.fstat(stage_fd)
+                        if not stat.S_ISREG(metadata.st_mode):
+                            raise RuntimeError("export stage is not the regular file just created")
+                        stage_identity = (metadata.st_dev, metadata.st_ino)
+                        os.fchmod(stage_fd, 0o600)
                         with snapshot.path.open("rb") as source_handle:
-                            owned_fd = fd
-                            fd = -1
+                            owned_fd = stage_fd
+                            stage_fd = -1
                             target = owned_binary_writer(owned_fd)
                             with target:
                                 _copy_regular_snapshot(
@@ -606,43 +935,90 @@ def _publish_exclusive(source: Path, destination: Path | _PreparedDestination, d
                                     target,
                                     display=snapshot.path,
                                 )
-                    finally:
-                        if fd >= 0:
-                            os.close(fd)
-                if _entry_identity_at(anchor.parent_fd, anchor.path.name) != created_identity:
+                    except BaseException as error:
+                        if stage_fd >= 0:
+                            try:
+                                os.close(stage_fd)
+                            except BaseException as cleanup:
+                                attach_cleanup_failure(
+                                    error,
+                                    cleanup,
+                                    "export stage file descriptor cleanup failed",
+                                )
+                        raise
+                    else:
+                        if stage_fd >= 0:
+                            os.close(stage_fd)
+                if _entry_identity_at(anchor.parent_fd, stage_name) != stage_identity:
+                    raise RuntimeError("export stage was replaced while it was being populated")
+                if sha256_artifact_at(anchor.parent_fd, stage_name) != snapshot.sha256:
+                    raise RuntimeError("staged export digest differs from the verified artifact")
+                if _entry_identity_at(anchor.parent_fd, stage_name) != stage_identity:
                     raise RuntimeError(
-                        "output destination was replaced while it was being published"
+                        "export stage was replaced while its digest was being verified"
                     )
-                if sha256_artifact_at(anchor.parent_fd, anchor.path.name) != digest:
-                    raise RuntimeError("published export digest differs from the verified artifact")
-                if _entry_identity_at(anchor.parent_fd, anchor.path.name) != created_identity:
+                anchor.assert_parent_path()
+                os.fsync(anchor.parent_fd)
+                if _entry_identity_at(anchor.parent_fd, anchor.path.name) is not None:
+                    raise FileExistsError(
+                        f"output destination became occupied before publication: {anchor.path}"
+                    )
+                if _entry_identity_at(anchor.parent_fd, stage_name) != stage_identity:
+                    raise RuntimeError("export stage was replaced before atomic publication")
+                rename_attempted = True
+                _rename_noreplace_at(
+                    anchor.parent_fd,
+                    stage_name,
+                    anchor.path.name,
+                )
+                rename_returned = True
+                if _entry_identity_at(anchor.parent_fd, stage_name) is not None:
                     raise RuntimeError(
-                        "output destination was replaced while its digest was being verified"
+                        "exclusive rename returned success but the export stage still exists"
                     )
-                if created_identity is None:
-                    raise RuntimeError("output destination identity was not established")
+                if _entry_identity_at(anchor.parent_fd, anchor.path.name) != stage_identity:
+                    raise RuntimeError(
+                        "output destination does not reference the verified export after rename"
+                    )
                 anchor.assert_parent_path()
                 _finalize_published_mode(
                     anchor.parent_fd,
                     anchor.path.name,
-                    created_identity,
-                    is_directory=created_is_directory,
+                    stage_identity,
+                    is_directory=stage_is_directory,
                 )
-                anchor.assert_parent_path()
-                if _entry_identity_at(anchor.parent_fd, anchor.path.name) != created_identity:
+                if _entry_identity_at(anchor.parent_fd, anchor.path.name) != stage_identity:
                     raise RuntimeError(
-                        "output destination was replaced while the export was being published"
+                        "output destination was replaced during permission finalization"
                     )
                 os.fsync(anchor.parent_fd)
-            except BaseException as error:
-                if created_identity is not None and hasattr(error, "add_note"):
-                    error.add_note(
-                        "automatic output rollback is disabled because POSIX cannot unlink "
-                        "a pathname conditionally by inode; inspect the private-mode destination "
-                        f"before manual recovery: {anchor.path}"
+                if _entry_identity_at(anchor.parent_fd, anchor.path.name) != stage_identity:
+                    raise RuntimeError(
+                        "output destination was replaced while publication durability was verified"
                     )
+                publication_complete = True
+            except BaseException as error:
+                if stage_created:
+                    _attach_publication_recovery_note(
+                        error,
+                        anchor,
+                        stage_name,
+                        rename_attempted=rename_attempted,
+                        rename_returned=rename_returned,
+                        publication_complete=publication_complete,
+                    )
+                    recovery_reported = True
                 raise
     except BaseException as error:
+        if stage_created and not recovery_reported:
+            _attach_publication_recovery_note(
+                error,
+                anchor,
+                stage_name,
+                rename_attempted=rename_attempted,
+                rename_returned=rename_returned,
+                publication_complete=publication_complete,
+            )
         if owns_anchor:
             try:
                 anchor.close()
