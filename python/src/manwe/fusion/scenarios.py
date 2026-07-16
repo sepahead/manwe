@@ -9,11 +9,26 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
+from typing import cast
 
 import numpy as np
 
+from .metrics import _MAX_COORDINATE_MAGNITUDE as _MAX_TRUTH_COORDINATE_MAGNITUDE
+from .metrics import _MAX_POINTS as _MAX_SCORE_TARGETS
 from .metrics import ospa
-from .tracker import TIMESTAMP_ATOL, Measurement, MultiSensorTracker, measurement_cartesian
+from .tracker import (
+    _SUPPORTED_INTEGER_SCALAR_TYPES,
+    MAX_ABSOLUTE_TIMESTAMP,
+    TIMESTAMP_ATOL,
+    Measurement,
+    MultiSensorTracker,
+    TrackOutput,
+    _as_finite_vector,
+    _finite_number,
+    _float64_array,
+    _measurement_cartesian_validated,
+    _raw_real_array,
+)
 
 # Per-modality measurement noise (std). Cartesian entries are metres; radar is
 # [range_m, azimuth_rad, elevation_rad].
@@ -25,11 +40,14 @@ MODALITY_NOISE = {
     "radar": np.array([3.0, 0.02, 0.02]),
     "rf": np.array([15.0, 15.0, 20.0]),
 }
+_EXPECTED_MODALITIES = frozenset({"visual", "thermal", "lidar", "acoustic", "radar", "rf"})
 
 _MAX_SCENARIO_FRAMES = 1_000_000
 _MAX_TARGET_FRAMES = 10_000_000
 _MAX_FRAME_MEASUREMENTS = 10_000
 _MAX_SCENARIO_MEASUREMENTS = 10_000_000
+_MAX_SCENARIO_TARGETS = 10_000
+_MAX_SEED = (1 << 128) - 1
 
 
 @dataclass
@@ -40,8 +58,145 @@ class Scenario:
 
     def truth_at(self, k: int) -> np.ndarray:
         """Active ground-truth positions at frame ``k`` (shape ``(n_active, 3)``)."""
-        pts = [t[k] for t in self.truth if not np.isnan(t[k, 0])]
-        return np.array(pts) if pts else np.empty((0, 3))
+        if type(k) not in _SUPPORTED_INTEGER_SCALAR_TYPES:
+            raise TypeError("truth frame index must be an integer")
+        k = int(k)
+        if k < 0:
+            raise IndexError("truth frame index must be nonnegative")
+        if type(self.truth) is not list:
+            raise TypeError("scenario truth must be a list")
+        if len(self.truth) > _MAX_SCENARIO_TARGETS:
+            raise ValueError("scenario truth exceeds the bounded target limit")
+        total_target_frames = 0
+        points: list[np.ndarray] = []
+        for index, trajectory in enumerate(self.truth):
+            if type(trajectory) in (list, tuple):
+                if len(trajectory) > _MAX_TARGET_FRAMES - total_target_frames:
+                    raise ValueError("scenario truth exceeds the bounded target-frame limit")
+                raw = _raw_real_array(
+                    trajectory,
+                    f"truth trajectory {index}",
+                    allowed_shapes=((len(trajectory), 3),),
+                )
+            else:
+                raw = _raw_real_array(trajectory, f"truth trajectory {index}")
+            if raw.ndim != 2 or raw.shape[1:] != (3,):
+                raise ValueError(
+                    f"truth trajectory {index} must have shape (T, 3), got {raw.shape}"
+                )
+            total_target_frames += raw.shape[0]
+            if total_target_frames > _MAX_TARGET_FRAMES:
+                raise ValueError("scenario truth exceeds the bounded target-frame limit")
+            if k >= raw.shape[0]:
+                raise IndexError(f"truth frame index {k} is out of range")
+            row = raw[k]
+            inactive = np.isnan(row)
+            if np.any(np.isinf(row)) or (np.any(inactive) and not np.all(inactive)):
+                raise ValueError("truth rows must be either fully finite or fully NaN")
+            if not np.all(inactive):
+                points.append(_float64_array(row, f"truth trajectory {index} row").copy())
+        return np.stack(points) if points else np.empty((0, 3))
+
+
+def _validated_times(value: object) -> np.ndarray:
+    if type(value) in (list, tuple):
+        sequence = cast(list[object] | tuple[object, ...], value)
+        if len(sequence) > _MAX_SCENARIO_FRAMES:
+            raise ValueError("scenario exceeds the bounded frame limit")
+    raw = _raw_real_array(value, "scenario times")
+    if raw.ndim != 1:
+        raise ValueError("scenario times must be a finite one-dimensional array")
+    if raw.size > _MAX_SCENARIO_FRAMES:
+        raise ValueError("scenario exceeds the bounded frame limit")
+    if not np.isfinite(raw).all():
+        raise ValueError("scenario times must be a finite one-dimensional array")
+    times = _float64_array(raw, "scenario times").copy()
+    if np.any(np.abs(times) > MAX_ABSOLUTE_TIMESTAMP):
+        raise ValueError(
+            f"scenario time magnitude must not exceed {MAX_ABSOLUTE_TIMESTAMP:g} seconds"
+        )
+    if len(times) > 1 and np.any(np.diff(times) <= 0):
+        raise ValueError("scenario times must be strictly increasing")
+    return times
+
+
+def _validated_modality_noise() -> dict[str, np.ndarray]:
+    if (
+        type(MODALITY_NOISE) is not dict
+        or len(MODALITY_NOISE) != len(_EXPECTED_MODALITIES)
+        or set(MODALITY_NOISE) != _EXPECTED_MODALITIES
+    ):
+        raise ValueError("MODALITY_NOISE must retain the supported modality keys")
+    validated: dict[str, np.ndarray] = {}
+    for modality in sorted(_EXPECTED_MODALITIES):
+        noise = _as_finite_vector(
+            MODALITY_NOISE[modality],
+            f"MODALITY_NOISE[{modality!r}]",
+        )
+        if np.any(noise < 0):
+            raise ValueError("modality noise standard deviations must be nonnegative")
+        with np.errstate(over="ignore", invalid="ignore"):
+            variances = np.square(noise)
+        if not np.isfinite(variances).all():
+            raise ValueError("modality noise variances must remain finite")
+        validated[modality] = noise
+    return validated
+
+
+def _validated_truth(
+    truth: object,
+    frame_count: int,
+) -> list[np.ndarray]:
+    if type(truth) is not list:
+        raise TypeError("scenario truth must be a list")
+    if len(truth) > _MAX_SCENARIO_TARGETS:
+        raise ValueError("scenario truth exceeds the bounded target limit")
+    if len(truth) * frame_count > _MAX_TARGET_FRAMES:
+        raise ValueError("scenario truth exceeds the bounded target-frame limit")
+    if not truth:
+        return []
+
+    raw_trajectories: list[tuple[int, np.ndarray]] = []
+    active_counts = np.zeros(frame_count, dtype=np.uint16)
+    for index, trajectory in enumerate(truth):
+        expected = (frame_count, 3)
+        raw = _raw_real_array(
+            trajectory,
+            f"truth trajectory {index}",
+            allowed_shapes=(expected,),
+        )
+        if raw.shape != expected:
+            raise ValueError(
+                f"truth trajectory {index} must have shape {expected}, got {raw.shape}"
+            )
+        inactive_any = np.isnan(raw).any(axis=1)
+        inactive_all = np.isnan(raw).all(axis=1)
+        if np.any(np.isinf(raw)) or np.any(inactive_any != inactive_all):
+            raise ValueError("truth rows must be either fully finite or fully NaN while inactive")
+        active_counts += ~inactive_all
+        raw_trajectories.append((index, raw))
+    if active_counts.size and int(active_counts.max()) > _MAX_SCORE_TARGETS:
+        raise ValueError(f"scenario exceeds the {_MAX_SCORE_TARGETS}-active-target scoring limit")
+    validated: list[np.ndarray] = []
+    for index, raw in raw_trajectories:
+        values = _float64_array(raw, f"truth trajectory {index}").copy()
+        if np.any(
+            np.logical_or(
+                values > _MAX_TRUTH_COORDINATE_MAGNITUDE,
+                values < -_MAX_TRUTH_COORDINATE_MAGNITUDE,
+            )
+        ):
+            raise ValueError(
+                "truth coordinate magnitude exceeds the float64 metric limit "
+                f"{_MAX_TRUTH_COORDINATE_MAGNITUDE:g}"
+            )
+        validated.append(values)
+    return validated
+
+
+def _truth_at_validated(truth: list[np.ndarray], index: int) -> np.ndarray:
+    points = [trajectory[index] for trajectory in truth if not np.isnan(trajectory[index, 0])]
+    return np.stack(points) if points else np.empty((0, 3))
 
 
 def _constant_acceleration_step(
@@ -51,8 +206,25 @@ def _constant_acceleration_step(
     dt: float,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Integrate one interval whose sampled acceleration is held constant."""
-    next_position = position + velocity * dt + 0.5 * acceleration * dt * dt
-    next_velocity = velocity + acceleration * dt
+    position = _as_finite_vector(position, "position")
+    velocity = _as_finite_vector(velocity, "velocity")
+    acceleration = _as_finite_vector(acceleration, "acceleration")
+    dt = _finite_number(dt, "dt", nonnegative=True)
+    return _constant_acceleration_step_unchecked(position, velocity, acceleration, dt)
+
+
+def _constant_acceleration_step_unchecked(
+    position: np.ndarray,
+    velocity: np.ndarray,
+    acceleration: np.ndarray,
+    dt: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    with np.errstate(over="ignore", invalid="ignore"):
+        velocity_delta = acceleration * dt
+        next_position = position + velocity * dt + 0.5 * velocity_delta * dt
+        next_velocity = velocity + velocity_delta
+    if not np.isfinite(next_position).all() or not np.isfinite(next_velocity).all():
+        raise FloatingPointError("constant-acceleration step must remain finite")
     return next_position, next_velocity
 
 
@@ -73,34 +245,35 @@ def make_scenario(
     active sensor detects each target with probability ``p_detect`` and adds
     ``clutter_rate`` Poisson false alarms per frame (as Cartesian "visual" hits).
     """
-    if type(n_targets) is not int or n_targets < 0:
-        raise ValueError("n_targets must be a nonnegative integer")
-    if type(seed) is not int or seed < 0:
-        raise ValueError("seed must be a nonnegative integer")
-    for value, name, allow_zero in (
-        (duration, "duration", False),
-        (dt, "dt", False),
-        (clutter_rate, "clutter_rate", True),
-        (area, "area", False),
-    ):
-        if (
-            isinstance(value, bool)
-            or not np.isfinite(value)
-            or (value < 0 if allow_zero else value <= 0)
-        ):
-            qualifier = "nonnegative" if allow_zero else "positive"
-            raise ValueError(f"{name} must be finite and {qualifier}")
-    if isinstance(p_detect, bool) or not np.isfinite(p_detect) or not 0.0 <= p_detect <= 1.0:
+    if type(n_targets) is not int or not 0 <= n_targets <= _MAX_SCENARIO_TARGETS:
+        raise ValueError(f"n_targets must be an integer in [0, {_MAX_SCENARIO_TARGETS}]")
+    if type(seed) is not int or not 0 <= seed <= _MAX_SEED:
+        raise ValueError(f"seed must be an integer in [0, {_MAX_SEED}]")
+    duration = _finite_number(duration, "duration", positive=True)
+    dt = _finite_number(dt, "dt", positive=True)
+    clutter_rate = _finite_number(clutter_rate, "clutter_rate", nonnegative=True)
+    area = _finite_number(area, "area", positive=True)
+    if area > 2.0 * _MAX_TRUTH_COORDINATE_MAGNITUDE:
+        raise ValueError("area exceeds the float64 scoring-coordinate limit")
+    p_detect = _finite_number(p_detect, "p_detect")
+    if not 0.0 <= p_detect <= 1.0:
         raise ValueError("p_detect must be finite and in [0, 1]")
-    if not isinstance(modalities, tuple) or not modalities:
+    if type(modalities) is not tuple or not modalities:
         raise ValueError("modalities must be a nonempty tuple")
+    if len(modalities) > len(_EXPECTED_MODALITIES):
+        raise ValueError(
+            f"modalities must contain at most {len(_EXPECTED_MODALITIES)} unique entries"
+        )
+    if any(type(modality) is not str for modality in modalities):
+        raise ValueError("modalities must contain only modality names")
     if len(set(modalities)) != len(modalities):
         raise ValueError("modalities must not contain duplicates")
-    unknown = [modality for modality in modalities if modality not in MODALITY_NOISE]
+    unknown = [modality for modality in modalities if modality not in _EXPECTED_MODALITIES]
     if unknown:
-        raise ValueError(f"unknown modalities {unknown}; expected {sorted(MODALITY_NOISE)}")
-    ratio = float(duration) / float(dt)
-    if not np.isfinite(ratio):
+        raise ValueError(f"unknown modalities {unknown}; expected {sorted(_EXPECTED_MODALITIES)}")
+    noise_table = _validated_modality_noise()
+    ratio = duration / dt
+    if not math.isfinite(ratio):
         raise ValueError("scenario is too large; duration / dt must be finite")
     nearest = round(ratio)
     ratio_tolerance = 8.0 * np.finfo(float).eps * max(1.0, abs(ratio))
@@ -110,7 +283,7 @@ def make_scenario(
         raise ValueError("scenario is too large; reduce duration, target count, or time resolution")
     maximum_true_per_frame = n_targets * len(modalities)
     maximum_true_total = maximum_true_per_frame * frame_count
-    expected_clutter_total = float(clutter_rate) * frame_count
+    expected_clutter_total = clutter_rate * frame_count
     if (
         maximum_true_per_frame > _MAX_FRAME_MEASUREMENTS
         or maximum_true_total > _MAX_SCENARIO_MEASUREMENTS
@@ -120,28 +293,30 @@ def make_scenario(
     ):
         raise ValueError("scenario exceeds the bounded measurement-work limit")
 
-    rng = np.random.default_rng(seed)
     origin: np.ndarray
     if sensor_origin is None:
         origin = np.zeros(3)
     else:
         try:
-            origin = np.asarray(sensor_origin, dtype=float)
-        except (TypeError, ValueError) as exc:
+            origin = _as_finite_vector(sensor_origin, "sensor_origin")
+        except ValueError as exc:
             raise ValueError("sensor_origin must be a finite three-vector") from exc
-        if origin.shape != (3,) or not np.all(np.isfinite(origin)):
-            raise ValueError("sensor_origin must be a finite three-vector")
     # Construct by integer frame index. An absolute epsilon in the stop value can
     # create thousands of extra frames when dt is tiny and can bypass the bound
     # calculated above.
     with np.errstate(over="raise", invalid="raise"):
         try:
-            times = np.arange(frame_count, dtype=float) * float(dt)
+            times = np.arange(frame_count, dtype=float) * dt
         except FloatingPointError as exc:
             raise ValueError("scenario timestamps exceed the representable float64 range") from exc
-    if not np.all(np.isfinite(times)) or (len(times) > 1 and np.any(np.diff(times) <= 0)):
+    if (
+        not np.all(np.isfinite(times))
+        or np.any(np.abs(times) > MAX_ABSOLUTE_TIMESTAMP)
+        or (len(times) > 1 and np.any(np.diff(times) <= 0))
+    ):
         raise ValueError("scenario timestamps must be finite and strictly increasing")
     T = len(times)
+    rng = np.random.default_rng(seed)
 
     # --- ground-truth trajectories -------------------------------------
     truth: list[np.ndarray] = []
@@ -160,12 +335,21 @@ def make_scenario(
                         continue
                     if k > birth:
                         accel = rng.normal(0, 0.5, size=3)
-                        p, vel = _constant_acceleration_step(p, vel, accel, dt)
-                    if not np.all(np.isfinite(p)):
+                        p, vel = _constant_acceleration_step_unchecked(
+                            p,
+                            vel,
+                            accel,
+                            dt,
+                        )
+                    if not np.all(np.isfinite(p)) or np.any(
+                        np.abs(p) > _MAX_TRUTH_COORDINATE_MAGNITUDE
+                    ):
                         raise FloatingPointError
                     traj[k] = p
         except FloatingPointError as exc:
-            raise ValueError("scenario trajectory exceeds the representable float64 range") from exc
+            raise ValueError(
+                "scenario trajectory exceeds the finite float64 scoring-coordinate range"
+            ) from exc
         truth.append(traj)
 
     # --- measurements ---------------------------------------------------
@@ -180,7 +364,16 @@ def make_scenario(
             for modality in modalities:
                 if rng.random() > p_detect:
                     continue
-                frame.append(_sample_measurement(modality, p, origin, float(t), rng))
+                frame.append(
+                    _sample_measurement(
+                        modality,
+                        p,
+                        origin,
+                        float(t),
+                        rng,
+                        noise_table[modality],
+                    )
+                )
         # clutter
         n_clutter = int(rng.poisson(clutter_rate))
         if (
@@ -191,7 +384,7 @@ def make_scenario(
         for _ in range(n_clutter):
             fp = rng.uniform(-area / 2, area / 2, size=3)
             fp[2] = abs(fp[2]) + 10.0
-            noise = MODALITY_NOISE["visual"]
+            noise = noise_table["visual"]
             frame.append(Measurement("visual", fp, noise**2, float(t)))
         total_measurements += len(frame)
         frames.append(frame)
@@ -200,14 +393,30 @@ def make_scenario(
 
 
 def _sample_measurement(
-    modality: str, p: np.ndarray, origin: np.ndarray, t: float, rng: np.random.Generator
+    modality: str,
+    p: np.ndarray,
+    origin: np.ndarray,
+    t: float,
+    rng: np.random.Generator,
+    noise: np.ndarray,
 ) -> Measurement:
-    noise = MODALITY_NOISE[modality]
     if modality == "radar":
-        d = p - origin
+        with np.errstate(over="ignore", invalid="ignore"):
+            d = p - origin
+        if not np.isfinite(d).all():
+            raise ValueError("radar relative position must remain finite")
         rho = np.hypot(d[0], d[1])
-        polar = np.array([np.linalg.norm(d), np.arctan2(d[1], d[0]), np.arctan2(d[2], rho)])
-        polar = polar + rng.normal(0, noise)
+        polar = np.array(
+            [
+                np.hypot.reduce(np.abs(d)),
+                np.arctan2(d[1], d[0]),
+                np.arctan2(d[2], rho),
+            ]
+        )
+        with np.errstate(over="ignore", invalid="ignore"):
+            polar = polar + rng.normal(0, noise)
+        if not np.isfinite(polar).all():
+            raise ValueError("sampled radar measurement must remain finite")
         polar[0] = abs(polar[0])
         # Keep the spherical representation canonical after adding angular noise.
         polar[2] = (polar[2] + np.pi) % (2.0 * np.pi) - np.pi
@@ -219,7 +428,10 @@ def _sample_measurement(
             polar[1] += np.pi
         polar[1] = (polar[1] + np.pi) % (2.0 * np.pi) - np.pi
         return Measurement("radar", polar, noise**2, float(t), sensor_origin=origin)
-    meas = p + rng.normal(0, noise)
+    with np.errstate(over="ignore", invalid="ignore"):
+        meas = p + rng.normal(0, noise)
+    if not np.isfinite(meas).all():
+        raise ValueError("sampled Cartesian measurement must remain finite")
     return Measurement(modality, meas, noise**2, float(t))
 
 
@@ -230,59 +442,48 @@ def score_tracker(
 
     Skips a short warm-up (first 3 frames) so filters can lock on before scoring.
     """
-    if not isinstance(tracker, MultiSensorTracker):
+    if type(tracker) is not MultiSensorTracker:
         raise TypeError("tracker must be a MultiSensorTracker")
-    if not isinstance(scenario, Scenario):
+    if type(scenario) is not Scenario:
         raise TypeError("scenario must be a Scenario")
-    if (
-        isinstance(c, bool)
-        or not np.isfinite(c)
-        or c <= 0
-        or isinstance(p, bool)
-        or not np.isfinite(p)
-        or p < 1
-    ):
+    c = _finite_number(c, "c", positive=True)
+    p = _finite_number(p, "p")
+    if p < 1:
         raise ValueError("c must be positive and p must be at least 1")
-    c = float(c)
-    p = float(p)
     # Exercise the complete metric parameter contract before the tracker can be
     # mutated. In particular, this rejects finite-looking ``c, p`` pairs whose
     # power is not representable.
     ospa(np.empty((0, 3)), np.empty((0, 3)), c=c, p=p)
-    times = np.asarray(scenario.times, dtype=float)
-    if times.ndim != 1 or not np.all(np.isfinite(times)):
-        raise ValueError("scenario times must be a finite one-dimensional array")
-    if len(times) > 1 and np.any(np.diff(times) <= 0):
-        raise ValueError("scenario times must be strictly increasing")
+    tracker._validate_runtime_state()
+    times = _validated_times(scenario.times)
     warmup = 3
-    if len(scenario.times) != len(scenario.frames):
+    if type(scenario.frames) is not list:
+        raise TypeError("scenario frames must be a list")
+    if len(times) != len(scenario.frames):
         raise ValueError("scenario times and frames must have the same length")
-    if len(times) > _MAX_SCENARIO_FRAMES:
-        raise ValueError("scenario exceeds the bounded frame limit")
-    for index, trajectory in enumerate(scenario.truth):
-        values = np.asarray(trajectory, dtype=float)
-        if values.shape != (len(times), 3):
-            raise ValueError(
-                f"truth trajectory {index} must have shape ({len(times)}, 3), got {values.shape}"
-            )
-        inactive_any = np.isnan(values).any(axis=1)
-        inactive_all = np.isnan(values).all(axis=1)
-        if np.any(np.isinf(values)) or np.any(inactive_any != inactive_all):
-            raise ValueError("truth rows must be either fully finite or fully NaN while inactive")
-    if len(scenario.times) <= warmup:
-        raise ValueError(
-            f"scenario needs more than {warmup} frames so at least one frame is scored"
-        )
     total_measurements = 0
-    previous_time = tracker._last_t
-    for k, frame in enumerate(scenario.frames):
-        if not isinstance(frame, list) or any(not isinstance(item, Measurement) for item in frame):
-            raise ValueError(f"scenario frame {k} must be a list of Measurement instances")
+    for frame_index, frame in enumerate(scenario.frames):
+        if type(frame) is not list:
+            raise ValueError(
+                f"scenario frame {frame_index} must be a list of Measurement instances"
+            )
         if len(frame) > min(_MAX_FRAME_MEASUREMENTS, tracker.cfg.max_measurements):
-            raise ValueError(f"scenario frame {k} exceeds the bounded measurement limit")
+            raise ValueError(f"scenario frame {frame_index} exceeds the bounded measurement limit")
         total_measurements += len(frame)
         if total_measurements > _MAX_SCENARIO_MEASUREMENTS:
             raise ValueError("scenario exceeds the bounded measurement-work limit")
+        if any(type(measurement) is not Measurement for measurement in frame):
+            raise ValueError(
+                f"scenario frame {frame_index} must contain only Measurement instances"
+            )
+    if len(times) <= warmup:
+        raise ValueError(
+            f"scenario needs more than {warmup} frames so at least one frame is scored"
+        )
+    validated_truth = _validated_truth(scenario.truth, len(times))
+
+    previous_time = tracker._last_t
+    for k, frame in enumerate(scenario.frames):
         timestamp = float(times[k])
         if previous_time is not None:
             gap = timestamp - previous_time
@@ -296,23 +497,44 @@ def score_tracker(
                 raise ValueError("scenario prediction exceeds the tracker gap budget")
         previous_time = timestamp
         for measurement in frame:
-            if abs(measurement.timestamp - timestamp) > TIMESTAMP_ATOL:
+            validated_measurement = Measurement(
+                modality=measurement.modality,
+                position=measurement.position,
+                covariance=measurement.covariance,
+                timestamp=measurement.timestamp,
+                velocity=measurement.velocity,
+                sensor_origin=measurement.sensor_origin,
+                class_label=measurement.class_label,
+                sensor_id=measurement.sensor_id,
+            )
+            if abs(validated_measurement.timestamp - timestamp) > TIMESTAMP_ATOL:
                 raise ValueError(f"scenario frame {k} contains a measurement timestamp mismatch")
-            position, covariance = measurement_cartesian(measurement)
+            position, covariance = _measurement_cartesian_validated(validated_measurement)
             if not np.all(np.isfinite(position)) or not np.all(np.isfinite(covariance)):
                 raise ValueError(f"scenario frame {k} has a non-finite Cartesian projection")
-        if k >= warmup:
-            ospa(scenario.truth_at(k), np.empty((0, 3)), c=c, p=p)
 
     totals: dict[str, list[float]] = {"ospa": [], "localization": [], "cardinality": []}
     tracker_snapshot = tracker._snapshot()
     try:
         for k, (t, frame) in enumerate(zip(times, scenario.frames, strict=True)):
             outputs = tracker.step(frame, float(t))
+            if type(outputs) is not list or len(outputs) > tracker.cfg.max_tracks:
+                raise TypeError("tracker.step must return a bounded list of TrackOutput")
+            if any(type(output) is not TrackOutput for output in outputs):
+                raise TypeError("tracker.step must return only TrackOutput instances")
             if k < warmup:
                 continue
-            est = np.array([o.position for o in outputs]) if outputs else np.empty((0, 3))
-            d = ospa(scenario.truth_at(k), est, c=c, p=p)
+            est = (
+                np.stack(
+                    [
+                        _as_finite_vector(output.position, "track output position")
+                        for output in outputs
+                    ]
+                )
+                if outputs
+                else np.empty((0, 3))
+            )
+            d = ospa(_truth_at_validated(validated_truth, k), est, c=c, p=p)
             for key in totals:
                 totals[key].append(d[key])
     except BaseException:
