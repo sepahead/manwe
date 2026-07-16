@@ -11,7 +11,7 @@ import stat
 import sys
 import tempfile
 import warnings
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from itertools import combinations
 
@@ -20,7 +20,12 @@ from .config_io import (
     open_directory_nofollow,
     open_regular_nofollow,
 )
-from .fd_io import owned_binary_reader, owned_binary_writer, owned_text_writer
+from .fd_io import (
+    attach_cleanup_failure,
+    owned_binary_reader,
+    owned_binary_writer,
+    owned_text_writer,
+)
 
 _MAX_MANIFEST_BYTES = 1 << 20
 _MAX_SPLIT_PATHS = 1024
@@ -59,6 +64,27 @@ _CALIBRATION_POLICY = (
     b"network-url-probes=disabled;dataset-cache-io=disabled;format-bgr0=deterministic;"
     b"optional-codec-hook=disabled;modelopt-peak-factor=10;modelopt-work-limit=8GiB"
 )
+
+_Cleanup = tuple[str, Callable[[], None]]
+
+
+def _release_resources(
+    cleanups: Sequence[_Cleanup],
+    *,
+    primary: BaseException | None = None,
+) -> None:
+    """Attempt each cleanup once without replacing an earlier failure."""
+    failure = primary
+    for label, cleanup in cleanups:
+        try:
+            cleanup()
+        except BaseException as cleanup_error:
+            if failure is None:
+                failure = cleanup_error
+            else:
+                attach_cleanup_failure(failure, cleanup_error, label)
+    if primary is None and failure is not None:
+        raise failure.with_traceback(failure.__traceback__)
 
 
 @dataclass(frozen=True)
@@ -232,9 +258,15 @@ def _read_regular_utf8_at(
         current = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
         if _regular_file_identity(current) != expected_identity:
             raise ValueError(f"{subject} was replaced while it was being read")
-    finally:
+    except BaseException as primary:
         if fd >= 0:
-            os.close(fd)
+            cleanup_fd = fd
+            fd = -1
+            _release_resources(
+                ((f"{subject} descriptor cleanup also failed", lambda: os.close(cleanup_fd)),),
+                primary=primary,
+            )
+        raise
     try:
         text = value.decode("utf-8")
     except UnicodeDecodeError as exc:
@@ -258,9 +290,11 @@ class _BoundSourceManifest:
                 subject="dataset manifest",
             )
             self.assert_unchanged()
-        except BaseException:
-            os.close(self._parent_fd)
-            self._closed = True
+        except BaseException as primary:
+            _release_resources(
+                (("source dataset manifest binding cleanup also failed", self.close),),
+                primary=primary,
+            )
             raise
 
     @property
@@ -287,24 +321,7 @@ class _BoundSourceManifest:
             raise RuntimeError("source dataset manifest binding is closed")
         if _directory_identity(os.fstat(self._parent_fd)) != self._parent_identity:
             raise ValueError("source dataset manifest parent descriptor changed")
-        visible_parent_fd = open_directory_nofollow(
-            self.path.parent, "source dataset manifest parent"
-        )
-        try:
-            if _directory_identity(os.fstat(visible_parent_fd)) != self._parent_identity:
-                raise ValueError("source dataset manifest parent path was replaced")
-            visible_manifest = os.stat(
-                self.path.name,
-                dir_fd=visible_parent_fd,
-                follow_symlinks=False,
-            )
-            if (
-                not stat.S_ISREG(visible_manifest.st_mode)
-                or _regular_file_identity(visible_manifest) != self._identity
-            ):
-                raise ValueError("source dataset manifest path was replaced")
-        finally:
-            os.close(visible_parent_fd)
+        self._assert_visible_binding()
         text, identity, digest = _read_regular_utf8_at(
             self._parent_fd,
             self.path.name,
@@ -315,6 +332,9 @@ class _BoundSourceManifest:
             raise ValueError("source dataset manifest identity changed")
         if digest != self.sha256 or text != self.text:
             raise ValueError("source dataset manifest content changed")
+        self._assert_visible_binding()
+
+    def _assert_visible_binding(self) -> None:
         visible_parent_fd = open_directory_nofollow(
             self.path.parent, "source dataset manifest parent"
         )
@@ -331,8 +351,25 @@ class _BoundSourceManifest:
                 or _regular_file_identity(visible_manifest) != self._identity
             ):
                 raise ValueError("source dataset manifest path was replaced")
-        finally:
-            os.close(visible_parent_fd)
+        except BaseException as primary:
+            _release_resources(
+                (
+                    (
+                        "visible source dataset manifest parent cleanup also failed",
+                        lambda: os.close(visible_parent_fd),
+                    ),
+                ),
+                primary=primary,
+            )
+            raise
+        _release_resources(
+            (
+                (
+                    "visible source dataset manifest parent cleanup failed",
+                    lambda: os.close(visible_parent_fd),
+                ),
+            )
+        )
 
     def close(self) -> None:
         if not self._closed:
@@ -357,21 +394,34 @@ def _open_relative_directory_nofollow(
         for component in relative.parts:
             if component in {"", "."}:
                 continue
-            next_fd = os.open(component, flags, dir_fd=current_fd)
-            os.close(current_fd)
+            try:
+                next_fd = os.open(component, flags, dir_fd=current_fd)
+            except FileNotFoundError as exc:
+                raise FileNotFoundError(f"{subject} path does not exist") from exc
+            except OSError as exc:
+                raise ValueError(
+                    f"{subject} path chain contains a symbolic link or special component"
+                ) from exc
+            previous_fd = current_fd
             current_fd = next_fd
+            os.close(previous_fd)
         result = current_fd
         current_fd = -1
         return result
-    except FileNotFoundError as exc:
-        raise FileNotFoundError(f"{subject} path does not exist") from exc
-    except OSError as exc:
-        raise ValueError(
-            f"{subject} path chain contains a symbolic link or special component"
-        ) from exc
-    finally:
+    except BaseException as primary:
         if current_fd >= 0:
-            os.close(current_fd)
+            cleanup_fd = current_fd
+            current_fd = -1
+            _release_resources(
+                (
+                    (
+                        f"{subject} directory descriptor cleanup also failed",
+                        lambda: os.close(cleanup_fd),
+                    ),
+                ),
+                primary=primary,
+            )
+        raise
 
 
 class _BoundSourceDirectory:
@@ -387,9 +437,11 @@ class _BoundSourceDirectory:
                 raise ValueError("dataset root must be a directory")
             self._identity = _directory_identity(metadata)
             self.assert_path_unchanged()
-        except BaseException:
-            os.close(directory_fd)
-            self._closed = True
+        except BaseException as primary:
+            _release_resources(
+                (("source dataset root binding cleanup also failed", self.close),),
+                primary=primary,
+            )
             raise
 
     @classmethod
@@ -430,8 +482,20 @@ class _BoundSourceDirectory:
         try:
             if _directory_identity(os.fstat(visible_fd)) != self._identity:
                 raise ValueError("source dataset root path was replaced")
-        finally:
-            os.close(visible_fd)
+        except BaseException as primary:
+            _release_resources(
+                (
+                    (
+                        "visible source dataset root cleanup also failed",
+                        lambda: os.close(visible_fd),
+                    ),
+                ),
+                primary=primary,
+            )
+            raise
+        _release_resources(
+            (("visible source dataset root cleanup failed", lambda: os.close(visible_fd)),)
+        )
 
     def digest(self) -> str:
         if self._closed:
@@ -476,8 +540,20 @@ def _stat_relative_entry(
         parent_fd = _open_relative_directory_nofollow(root_fd, parent, subject)
         try:
             metadata = os.stat(components[-1], dir_fd=parent_fd, follow_symlinks=False)
-        finally:
-            os.close(parent_fd)
+        except BaseException as primary:
+            _release_resources(
+                (
+                    (
+                        f"{subject} parent descriptor cleanup also failed",
+                        lambda: os.close(parent_fd),
+                    ),
+                ),
+                primary=primary,
+            )
+            raise
+        _release_resources(
+            ((f"{subject} parent descriptor cleanup failed", lambda: os.close(parent_fd)),)
+        )
     if stat.S_ISLNK(metadata.st_mode):
         raise ValueError(f"{subject} must not contain symbolic links")
     if require_directory is True and not stat.S_ISDIR(metadata.st_mode):
@@ -851,10 +927,10 @@ class _CalibrationLoaderSnapshot:
     ) -> None:
         import yaml
 
-        self._temporary = tempfile.TemporaryDirectory(prefix="manwe-calibration-loader-")
-        root = pathlib.Path(self._temporary.name).resolve(strict=True)
-        image_root = root / "calibration-images"
+        temporary = tempfile.TemporaryDirectory(prefix="manwe-calibration-loader-")
         try:
+            root = pathlib.Path(temporary.name).resolve(strict=True)
+            image_root = root / "calibration-images"
             image_root.mkdir(mode=0o700)
             for index, image in enumerate(images):
                 source = artifact_root / image.relative_path
@@ -877,7 +953,7 @@ class _CalibrationLoaderSnapshot:
                 "nc": source_payload["nc"],
                 "channels": 3,
             }
-            self.path = root / "dataset.yaml"
+            manifest_path = root / "dataset.yaml"
             manifest_bytes = yaml.safe_dump(payload, sort_keys=True).encode("utf-8")
             flags = (
                 os.O_WRONLY
@@ -886,7 +962,7 @@ class _CalibrationLoaderSnapshot:
                 | getattr(os, "O_CLOEXEC", 0)
                 | getattr(os, "O_NOFOLLOW", 0)
             )
-            fd = os.open(self.path, flags, 0o400)
+            fd = os.open(manifest_path, flags, 0o400)
             try:
                 owned_fd = fd
                 fd = -1
@@ -899,18 +975,27 @@ class _CalibrationLoaderSnapshot:
                     os.close(fd)
             image_root.chmod(0o500)
             root.chmod(0o500)
-        except BaseException:
-            self._temporary.cleanup()
+            root_metadata = root.stat()
+            root_identity = (root_metadata.st_dev, root_metadata.st_ino)
+            destinations = tuple(
+                image_root / f"{index:08d}{(artifact_root / image.relative_path).suffix.lower()}"
+                for index, image in enumerate(images)
+            )
+            self._temporary = temporary
+            self.root = root
+            self.image_root = image_root
+            self.path = manifest_path
+            self._root_identity = root_identity
+            self._manifest_sha256 = hashlib.sha256(manifest_bytes).hexdigest()
+            self._destinations = destinations
+            self._closed = False
+        except BaseException as primary:
+            self._closed = True
+            _release_resources(
+                (("calibration loader staging cleanup also failed", temporary.cleanup),),
+                primary=primary,
+            )
             raise
-        self.root = root
-        self.image_root = image_root
-        root_metadata = root.stat()
-        self._root_identity = (root_metadata.st_dev, root_metadata.st_ino)
-        self._manifest_sha256 = hashlib.sha256(manifest_bytes).hexdigest()
-        self._destinations = tuple(
-            image_root / f"{index:08d}{(artifact_root / image.relative_path).suffix.lower()}"
-            for index, image in enumerate(images)
-        )
 
     def assert_unchanged(
         self,
@@ -918,6 +1003,8 @@ class _CalibrationLoaderSnapshot:
         images: Sequence[_CalibrationImage],
     ) -> None:
         """Require the backend-visible manifest and hard-linked inventory to remain exact."""
+        if self._closed:
+            raise RuntimeError("private calibration loader snapshot is closed")
         from .artifacts import _tree_entries
 
         metadata = self.root.lstat()
@@ -952,7 +1039,9 @@ class _CalibrationLoaderSnapshot:
                 raise RuntimeError("private calibration image view changed")
 
     def close(self) -> None:
-        self._temporary.cleanup()
+        if not self._closed:
+            self._closed = True
+            self._temporary.cleanup()
 
 
 class DatasetManifestSnapshot:
@@ -964,17 +1053,18 @@ class DatasetManifestSnapshot:
         source_manifest: _BoundSourceManifest,
         source_root: _BoundSourceDirectory,
     ) -> None:
-        import yaml
-
-        self._payload = copy.deepcopy(dict(payload))
         self._source_manifest = source_manifest
         self._source_root = source_root
         self._closed = False
-        self._temporary = tempfile.TemporaryDirectory(prefix="manwe-dataset-")
-        temporary_root = pathlib.Path(self._temporary.name).resolve(strict=True)
-        self.path = temporary_root / "dataset.yaml"
-        self.root = pathlib.Path(str(self._payload["path"]))
+        temporary = None
         try:
+            import yaml
+
+            payload_copy = copy.deepcopy(dict(payload))
+            temporary = tempfile.TemporaryDirectory(prefix="manwe-dataset-")
+            temporary_root = pathlib.Path(temporary.name).resolve(strict=True)
+            snapshot_path = temporary_root / "dataset.yaml"
+            root = pathlib.Path(str(payload_copy["path"]))
             flags = (
                 os.O_WRONLY
                 | os.O_CREAT
@@ -982,42 +1072,46 @@ class DatasetManifestSnapshot:
                 | getattr(os, "O_CLOEXEC", 0)
                 | getattr(os, "O_NOFOLLOW", 0)
             )
-            fd = os.open(self.path, flags, 0o400)
+            fd = os.open(snapshot_path, flags, 0o400)
             try:
                 owned_fd = fd
                 fd = -1
                 with owned_text_writer(owned_fd, encoding="utf-8", newline="\n") as handle:
-                    yaml.safe_dump(self._payload, handle, sort_keys=True)
+                    yaml.safe_dump(payload_copy, handle, sort_keys=True)
                     handle.flush()
                     os.fsync(handle.fileno())
             finally:
                 if fd >= 0:
                     os.close(fd)
-        except BaseException:
-            try:
-                self._temporary.cleanup()
-            finally:
-                try:
-                    self._source_root.close()
-                finally:
-                    try:
-                        self._source_manifest.close()
-                    finally:
-                        self._closed = True
+            assert temporary is not None
+            self._payload = payload_copy
+            self._temporary = temporary
+            self.path = snapshot_path
+            self.root = root
+        except BaseException as primary:
+            self._closed = True
+            cleanups: list[_Cleanup] = []
+            if temporary is not None:
+                cleanups.append(("dataset manifest staging cleanup also failed", temporary.cleanup))
+            cleanups.extend(
+                (
+                    ("source dataset root cleanup also failed", self._source_root.close),
+                    ("source dataset manifest cleanup also failed", self._source_manifest.close),
+                )
+            )
+            _release_resources(cleanups, primary=primary)
             raise
 
     def close(self) -> None:
         if not self._closed:
-            try:
-                self._temporary.cleanup()
-            finally:
-                try:
-                    self._source_root.close()
-                finally:
-                    try:
-                        self._source_manifest.close()
-                    finally:
-                        self._closed = True
+            self._closed = True
+            _release_resources(
+                (
+                    ("dataset manifest staging cleanup failed", self._temporary.cleanup),
+                    ("source dataset root cleanup also failed", self._source_root.close),
+                    ("source dataset manifest cleanup also failed", self._source_manifest.close),
+                )
+            )
 
     def _payload_for_root(self, root: pathlib.Path) -> dict[str, object]:
         payload = copy.deepcopy(self._payload)
@@ -1150,8 +1244,14 @@ class DatasetManifestSnapshot:
             raise RuntimeError("dataset manifest snapshot is closed")
         return self
 
-    def __exit__(self, _exc_type, _exc, _traceback) -> None:
-        self.close()
+    def __exit__(self, _exc_type, exc, _traceback) -> None:
+        if exc is None:
+            self.close()
+            return
+        _release_resources(
+            (("dataset manifest snapshot cleanup also failed", self.close),),
+            primary=exc,
+        )
 
 
 class CalibrationDatasetSnapshot:
@@ -1170,11 +1270,15 @@ class CalibrationDatasetSnapshot:
         source_root = source._source_root.clone()
         try:
             source_manifest = source._source_manifest.clone()
-        except BaseException:
-            source_root.close()
+        except BaseException as primary:
+            _release_resources(
+                (("cloned source dataset root cleanup also failed", source_root.close),),
+                primary=primary,
+            )
             raise
         artifact_snapshot = None
         loader_snapshot = None
+        self._closed = True
         try:
             source_root.assert_path_unchanged()
             source_manifest.assert_unchanged()
@@ -1223,32 +1327,35 @@ class CalibrationDatasetSnapshot:
             source_manifest.assert_unchanged()
             if current_digest != source_content_digest:
                 raise RuntimeError("source calibration dataset changed while snapshotting")
-        except BaseException:
-            try:
-                if loader_snapshot is not None:
-                    loader_snapshot.close()
-            finally:
-                try:
-                    if artifact_snapshot is not None:
-                        artifact_snapshot.close()
-                finally:
-                    try:
-                        source_root.close()
-                    finally:
-                        source_manifest.close()
+            self._artifact_snapshot = artifact_snapshot
+            self._loader_snapshot = loader_snapshot
+            self._images = loader_images
+            self._source_root = source_root
+            self._source_content_digest = source_content_digest
+            self._source_manifest = source_manifest
+            self.sha256 = expected_digest
+            self.root = artifact_snapshot.path
+            self.loader_root = loader_snapshot.root
+            self.path = loader_snapshot.path
+            self._closed = False
+        except BaseException as primary:
+            cleanups: list[_Cleanup] = []
+            if loader_snapshot is not None:
+                cleanups.append(
+                    ("calibration loader snapshot cleanup also failed", loader_snapshot.close)
+                )
+            if artifact_snapshot is not None:
+                cleanups.append(
+                    ("calibration artifact snapshot cleanup also failed", artifact_snapshot.close)
+                )
+            cleanups.extend(
+                (
+                    ("cloned source dataset root cleanup also failed", source_root.close),
+                    ("cloned source dataset manifest cleanup also failed", source_manifest.close),
+                )
+            )
+            _release_resources(cleanups, primary=primary)
             raise
-
-        self._artifact_snapshot = artifact_snapshot
-        self._loader_snapshot = loader_snapshot
-        self._images = loader_images
-        self._source_root = source_root
-        self._source_content_digest = source_content_digest
-        self._source_manifest = source_manifest
-        self.sha256 = expected_digest
-        self.root = artifact_snapshot.path
-        self.loader_root = loader_snapshot.root
-        self.path = loader_snapshot.path
-        self._closed = False
 
     def calibration_digest(self) -> str:
         """Re-hash private raw bytes so backend-time mutation fails closed."""
@@ -1295,27 +1402,35 @@ class CalibrationDatasetSnapshot:
 
     def close(self) -> None:
         if not self._closed:
-            try:
-                self._loader_snapshot.close()
-            finally:
-                try:
-                    self._artifact_snapshot.close()
-                finally:
-                    try:
-                        self._source_root.close()
-                    finally:
-                        try:
-                            self._source_manifest.close()
-                        finally:
-                            self._closed = True
+            self._closed = True
+            _release_resources(
+                (
+                    ("calibration loader snapshot cleanup failed", self._loader_snapshot.close),
+                    (
+                        "calibration artifact snapshot cleanup also failed",
+                        self._artifact_snapshot.close,
+                    ),
+                    ("cloned source dataset root cleanup also failed", self._source_root.close),
+                    (
+                        "cloned source dataset manifest cleanup also failed",
+                        self._source_manifest.close,
+                    ),
+                )
+            )
 
     def __enter__(self) -> CalibrationDatasetSnapshot:
         if self._closed:
             raise RuntimeError("calibration snapshot is closed")
         return self
 
-    def __exit__(self, _exc_type, _exc, _traceback) -> None:
-        self.close()
+    def __exit__(self, _exc_type, exc, _traceback) -> None:
+        if exc is None:
+            self.close()
+            return
+        _release_resources(
+            (("calibration dataset snapshot cleanup also failed", self.close),),
+            primary=exc,
+        )
 
 
 def validate_local_detection_manifest(
@@ -1463,13 +1578,14 @@ def validate_local_detection_manifest(
         source_manifest = None
         source_root = None
         return result
-    finally:
-        try:
-            if source_root is not None:
-                source_root.close()
-        finally:
-            if source_manifest is not None:
-                source_manifest.close()
+    except BaseException as primary:
+        cleanups: list[_Cleanup] = []
+        if source_root is not None:
+            cleanups.append(("source dataset root cleanup also failed", source_root.close))
+        if source_manifest is not None:
+            cleanups.append(("source dataset manifest cleanup also failed", source_manifest.close))
+        _release_resources(cleanups, primary=primary)
+        raise
 
 
 def snapshot_local_calibration_dataset(
@@ -1482,14 +1598,27 @@ def snapshot_local_calibration_dataset(
     """Validate and privately snapshot one bounded local INT8 calibration dataset."""
     validated = validate_local_detection_manifest(path)
     try:
-        return CalibrationDatasetSnapshot(
+        result = CalibrationDatasetSnapshot(
             validated,
             image_size,
             tensorrt_version,
             modelopt_version,
         )
-    finally:
+    except BaseException as primary:
+        _release_resources(
+            (("validated dataset manifest cleanup also failed", validated.close),),
+            primary=primary,
+        )
+        raise
+    try:
         validated.close()
+    except BaseException as primary:
+        _release_resources(
+            (("constructed calibration snapshot cleanup also failed", result.close),),
+            primary=primary,
+        )
+        raise
+    return result
 
 
 __all__ = [
