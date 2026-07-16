@@ -7,27 +7,32 @@ from typing import Any
 
 import numpy as np
 
-from .camera import Camera
+from .camera import (
+    Camera,
+    _admit_fixed_array,
+    _copy_finite_array,
+    _finite_float64_scalar,
+    _is_primitive_integer,
+    _is_primitive_real_scalar,
+    _preflight_fixed_shape,
+)
 
 _GEOMETRY_EPS = 1e-12
 _MAX_GEOMETRY_MAGNITUDE = 1e12
 _MAX_PIXEL_MAGNITUDE = 1e9
 _MAX_TRIANGULATION_CAMERAS = 64
+_MAX_TRIANGULATION_COORDINATES = 2 * _MAX_TRIANGULATION_CAMERAS
+_MAX_COVARIANCE_SOLVES = 4 * _MAX_TRIANGULATION_CAMERAS
+_MAX_COVARIANCE_PIXEL_COPY_WORK = _MAX_COVARIANCE_SOLVES * _MAX_TRIANGULATION_CAMERAS
 
 
-def _finite_vector(value: Any, name: str, size: int, *, maximum: float) -> np.ndarray:
-    try:
-        vector = np.asarray(value, dtype=float)
-    except (TypeError, ValueError, OverflowError) as exc:
-        raise ValueError(f"{name} must contain numeric values") from exc
-    if vector.size != size:
-        raise ValueError(f"{name} must contain {size} values, got {vector.size}")
-    vector = vector.reshape(size).copy()
-    if not np.isfinite(vector).all():
-        raise ValueError(f"{name} must contain only finite values")
-    if np.any(np.abs(vector) > maximum):
-        raise ValueError(f"{name} exceeds the supported magnitude")
-    return vector
+def _copy_vector(
+    admitted: np.ndarray,
+    name: str,
+    *,
+    maximum: float,
+) -> np.ndarray:
+    return _copy_finite_array(admitted, name, maximum=maximum)
 
 
 def _stable_norm(value: np.ndarray) -> float:
@@ -40,25 +45,23 @@ def _stable_norm(value: np.ndarray) -> float:
     return norm
 
 
-def _positive_scalar(value: Any, name: str) -> float:
-    if (
-        isinstance(value, bool)
-        or not isinstance(value, (int, float, np.integer, np.floating))
-        or not np.isfinite(value)
-        or float(value) <= 0
-    ):
+def _positive_scalar(value: Any, name: str, *, maximum: float | None = None) -> float:
+    try:
+        result = _finite_float64_scalar(value, name)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be a finite number > 0") from exc
+    if result <= 0:
         raise ValueError(f"{name} must be a finite number > 0")
-    return float(value)
+    if maximum is not None and result > maximum:
+        raise ValueError(f"{name} exceeds the supported magnitude {maximum:g}")
+    return result
 
 
 def _minimum_angle(value: Any, name: str, *, allow_zero: bool = False) -> float:
-    if (
-        isinstance(value, bool)
-        or not isinstance(value, (int, float, np.integer, np.floating))
-        or not np.isfinite(value)
-    ):
-        raise ValueError(f"{name} must be a finite number")
-    angle = float(value)
+    try:
+        angle = _finite_float64_scalar(value, name)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be a finite number") from exc
     lower_valid = angle >= 0.0 if allow_zero else angle > 0.0
     if not lower_valid or angle >= 90.0:
         interval = "[0, 90)" if allow_zero else "(0, 90)"
@@ -68,8 +71,7 @@ def _minimum_angle(value: Any, name: str, *, allow_zero: bool = False) -> float:
 
 def _camera_limit(value: Any) -> int:
     if (
-        isinstance(value, bool)
-        or not isinstance(value, (int, np.integer))
+        not _is_primitive_integer(value)
         or int(value) < 2
         or int(value) > _MAX_TRIANGULATION_CAMERAS
     ):
@@ -77,26 +79,42 @@ def _camera_limit(value: Any) -> int:
     return int(value)
 
 
-def _validated_inputs(
+def _preflight_inputs(
     cameras: Sequence[Camera], pixels: Sequence[np.ndarray], max_cameras: int
-) -> tuple[list[Camera], list[np.ndarray]]:
-    if not isinstance(cameras, (list, tuple)) or not isinstance(pixels, (list, tuple)):
+) -> list[Camera]:
+    if type(cameras) not in (list, tuple) or type(pixels) not in (list, tuple):
         raise ValueError("cameras and pixels must be sequences")
-    camera_values = list(cameras)
-    pixel_values = list(pixels)
-    if len(camera_values) < 2:
+    view_count = len(cameras)
+    if view_count < 2:
         raise ValueError("need at least two views to triangulate")
-    if len(camera_values) != len(pixel_values):
+    if view_count != len(pixels):
         raise ValueError("cameras and pixels must be the same length")
-    if len(camera_values) > max_cameras:
+    if view_count > max_cameras:
         raise ValueError("triangulation view count exceeds max_cameras")
-    if any(not isinstance(camera, Camera) for camera in camera_values):
+    if 2 * view_count > _MAX_TRIANGULATION_COORDINATES:
+        raise ValueError("triangulation coordinate work exceeds the supported bound")
+    if any(not isinstance(camera, Camera) for camera in cameras):
         raise TypeError("cameras must contain only Camera instances")
-    validated_pixels = [
-        _finite_vector(pixel, f"pixels[{index}]", 2, maximum=_MAX_PIXEL_MAGNITUDE)
-        for index, pixel in enumerate(pixel_values)
+    for index, pixel in enumerate(pixels):
+        _preflight_fixed_shape(pixel, f"pixels[{index}]", (2,))
+    return list(cameras)
+
+
+def _admit_pixels(pixels: Sequence[np.ndarray]) -> list[np.ndarray]:
+    return [
+        _admit_fixed_array(pixel, f"pixels[{index}]", (2,)) for index, pixel in enumerate(pixels)
     ]
-    return camera_values, validated_pixels
+
+
+def _copy_pixels(admitted_pixels: Sequence[np.ndarray]) -> list[np.ndarray]:
+    return [
+        _copy_vector(
+            pixel,
+            f"pixels[{index}]",
+            maximum=_MAX_PIXEL_MAGNITUDE,
+        )
+        for index, pixel in enumerate(admitted_pixels)
+    ]
 
 
 def _acute_ray_angle_deg(first: np.ndarray, second: np.ndarray) -> float:
@@ -137,9 +155,11 @@ def triangulate_dlt(
     """
 
     max_cameras = _camera_limit(max_cameras)
+    camera_values = _preflight_inputs(cameras, pixels, max_cameras)
     min_ray_angle_deg = _minimum_angle(min_ray_angle_deg, "min_ray_angle_deg")
     max_range_m = _positive_scalar(max_range_m, "max_range_m")
-    camera_values, pixel_values = _validated_inputs(cameras, pixels, max_cameras)
+    admitted_pixels = _admit_pixels(pixels)
+    pixel_values = _copy_pixels(admitted_pixels)
 
     maximum_parallax, _ = _maximum_parallax_deg(camera_values, pixel_values)
     if maximum_parallax + 1e-12 < min_ray_angle_deg:
@@ -201,20 +221,43 @@ def triangulate_midpoint(
     so an ill-conditioned or unbounded pair cannot become a candidate edge.
     """
 
-    first_origin = _finite_vector(o1, "o1", 3, maximum=_MAX_GEOMETRY_MAGNITUDE)
-    first_direction = _finite_vector(d1, "d1", 3, maximum=_MAX_GEOMETRY_MAGNITUDE)
-    second_origin = _finite_vector(o2, "o2", 3, maximum=_MAX_GEOMETRY_MAGNITUDE)
-    second_direction = _finite_vector(d2, "d2", 3, maximum=_MAX_GEOMETRY_MAGNITUDE)
+    _preflight_fixed_shape(o1, "o1", (3,))
+    _preflight_fixed_shape(d1, "d1", (3,))
+    _preflight_fixed_shape(o2, "o2", (3,))
+    _preflight_fixed_shape(d2, "d2", (3,))
+    min_ray_angle_deg = _minimum_angle(min_ray_angle_deg, "min_ray_angle_deg", allow_zero=True)
+    if max_range_m is not None:
+        max_range_m = _positive_scalar(max_range_m, "max_range_m")
+    admitted_first_origin = _admit_fixed_array(o1, "o1", (3,))
+    admitted_first_direction = _admit_fixed_array(d1, "d1", (3,))
+    admitted_second_origin = _admit_fixed_array(o2, "o2", (3,))
+    admitted_second_direction = _admit_fixed_array(d2, "d2", (3,))
+    first_origin = _copy_vector(
+        admitted_first_origin,
+        "o1",
+        maximum=_MAX_GEOMETRY_MAGNITUDE,
+    )
+    first_direction = _copy_vector(
+        admitted_first_direction,
+        "d1",
+        maximum=_MAX_GEOMETRY_MAGNITUDE,
+    )
+    second_origin = _copy_vector(
+        admitted_second_origin,
+        "o2",
+        maximum=_MAX_GEOMETRY_MAGNITUDE,
+    )
+    second_direction = _copy_vector(
+        admitted_second_direction,
+        "d2",
+        maximum=_MAX_GEOMETRY_MAGNITUDE,
+    )
     norm1 = _stable_norm(first_direction)
     norm2 = _stable_norm(second_direction)
     if norm1 <= _GEOMETRY_EPS or norm2 <= _GEOMETRY_EPS:
         raise ValueError("ray directions must be non-zero")
     first_direction /= norm1
     second_direction /= norm2
-    min_ray_angle_deg = _minimum_angle(min_ray_angle_deg, "min_ray_angle_deg", allow_zero=True)
-    if max_range_m is not None:
-        max_range_m = _positive_scalar(max_range_m, "max_range_m")
-
     angle = _acute_ray_angle_deg(first_direction, second_direction)
     if angle + 1e-12 < min_ray_angle_deg:
         raise ValueError("ray parallax is below min_ray_angle_deg")
@@ -259,8 +302,16 @@ def reprojection_error(
     """Return mean pixel reprojection error for a bounded set of views."""
 
     max_cameras = _camera_limit(max_cameras)
-    camera_values, pixel_values = _validated_inputs(cameras, pixels, max_cameras)
-    world_point = _finite_vector(point, "point", 3, maximum=_MAX_GEOMETRY_MAGNITUDE)
+    camera_values = _preflight_inputs(cameras, pixels, max_cameras)
+    _preflight_fixed_shape(point, "point", (3,))
+    admitted_pixels = _admit_pixels(pixels)
+    admitted_point = _admit_fixed_array(point, "point", (3,))
+    pixel_values = _copy_pixels(admitted_pixels)
+    world_point = _copy_vector(
+        admitted_point,
+        "point",
+        maximum=_MAX_GEOMETRY_MAGNITUDE,
+    )
     errors: list[float] = []
     for camera, pixel in zip(camera_values, pixel_values):
         try:
@@ -302,15 +353,34 @@ def triangulation_covariance(
             "is conditional on exact K/R/t"
         )
     max_cameras = _camera_limit(max_cameras)
-    camera_values, pixel_values = _validated_inputs(cameras, pixels, max_cameras)
-    if not isinstance(pixel_stds_px, (list, tuple)) or len(pixel_stds_px) != len(pixel_values):
+    camera_values = _preflight_inputs(cameras, pixels, max_cameras)
+    view_count = len(pixels)
+    if type(pixel_stds_px) not in (list, tuple) or len(pixel_stds_px) != view_count:
         raise ValueError("pixel_stds_px must align one-to-one with pixels")
+    coordinate_count = 2 * view_count
+    if coordinate_count > _MAX_TRIANGULATION_COORDINATES:
+        raise ValueError("triangulation covariance work exceeds the supported bound")
+    solve_count = 2 * coordinate_count
+    pixel_copy_work = solve_count * view_count
+    if solve_count > _MAX_COVARIANCE_SOLVES or pixel_copy_work > _MAX_COVARIANCE_PIXEL_COPY_WORK:
+        raise ValueError("triangulation covariance perturbation work exceeds the supported bound")
+    for index, value in enumerate(pixel_stds_px):
+        if not _is_primitive_real_scalar(value):
+            raise ValueError(f"pixel_stds_px[{index}] must be a finite number > 0")
+    min_ray_angle_deg = _minimum_angle(min_ray_angle_deg, "min_ray_angle_deg")
+    max_range_m = _positive_scalar(max_range_m, "max_range_m")
     standard_deviations = [
-        _positive_scalar(value, f"pixel_stds_px[{index}]")
+        _positive_scalar(
+            value,
+            f"pixel_stds_px[{index}]",
+            maximum=_MAX_PIXEL_MAGNITUDE,
+        )
         for index, value in enumerate(pixel_stds_px)
     ]
+    admitted_pixels = _admit_pixels(pixels)
+    pixel_values = _copy_pixels(admitted_pixels)
 
-    jacobian = np.empty((3, 2 * len(pixel_values)), dtype=float)
+    jacobian = np.empty((3, coordinate_count), dtype=float)
     for view, standard_deviation in enumerate(standard_deviations):
         step = max(1e-3, min(0.25, 0.05 * standard_deviation))
         for axis in range(2):
@@ -336,20 +406,38 @@ def triangulation_covariance(
     if not np.isfinite(jacobian).all():
         raise ValueError("triangulation uncertainty Jacobian is non-finite")
 
-    repeated_stds = np.repeat(np.asarray(standard_deviations, dtype=float), 2)
+    standard_array = np.asarray(standard_deviations, dtype=np.float64)
+    if standard_array.shape != (view_count,):
+        raise ValueError("pixel_stds_px produced an invalid internal shape")
+    repeated_stds = np.repeat(standard_array, 2)
+    if repeated_stds.shape != (coordinate_count,):
+        raise ValueError("pixel_stds_px repeat produced an invalid internal shape")
     weighted_jacobian = jacobian * repeated_stds[np.newaxis, :]
+    if not np.isfinite(weighted_jacobian).all():
+        raise ValueError("weighted triangulation uncertainty Jacobian is non-finite")
     covariance = weighted_jacobian @ weighted_jacobian.T
     if not np.isfinite(covariance).all():
         raise ValueError("triangulation covariance is non-finite")
-    covariance = 0.5 * (covariance + covariance.T)
-    values, vectors = np.linalg.eigh(covariance)
+    covariance = 0.5 * covariance + 0.5 * covariance.T
+    if not np.isfinite(covariance).all():
+        raise ValueError("triangulation covariance symmetrization is non-finite")
     scale = max(1.0, float(np.max(np.abs(covariance))))
-    if float(values[0]) < -1e-10 * scale:
+    normalized = covariance / scale
+    try:
+        values, vectors = np.linalg.eigh(normalized)
+    except np.linalg.LinAlgError as exc:
+        raise ValueError("triangulation covariance eigendecomposition did not converge") from exc
+    if not np.isfinite(values).all() or not np.isfinite(vectors).all():
+        raise ValueError("triangulation covariance eigendecomposition is non-finite")
+    if float(values[0]) < -1e-10:
         raise ValueError("triangulation covariance is not positive semidefinite")
     if values[0] < 0.0:
-        covariance = vectors @ np.diag(np.maximum(values, 0.0)) @ vectors.T
-        covariance = 0.5 * (covariance + covariance.T)
-    if float(np.trace(covariance)) <= 0.0:
+        normalized = vectors @ np.diag(np.maximum(values, 0.0)) @ vectors.T
+        normalized = 0.5 * normalized + 0.5 * normalized.T
+        covariance = normalized * scale
+        if not np.isfinite(covariance).all():
+            raise ValueError("triangulation covariance repair is non-finite")
+    if float(np.trace(normalized)) <= 0.0:
         raise ValueError("triangulation covariance has no measurable uncertainty")
     return covariance
 

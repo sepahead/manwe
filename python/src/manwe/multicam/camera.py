@@ -39,21 +39,152 @@ _MAX_RIG_YAML_BYTES = 1_000_000
 _MAX_TIME_SKEW_S = 60.0
 _MAX_SPEED_MPS = 1_000_000.0
 _MAX_IDENTITY_BYTES = 256
+_REAL_ARRAY_KINDS = frozenset({"i", "u", "f"})
+_PRIMITIVE_REAL_SCALAR_TYPES = frozenset(
+    scalar_type for scalar_type in np.ScalarType if np.dtype(scalar_type).kind in _REAL_ARRAY_KINDS
+)
+_PRIMITIVE_INTEGER_TYPES = frozenset(
+    scalar_type for scalar_type in np.ScalarType if np.dtype(scalar_type).kind in {"i", "u"}
+)
+_PRIMITIVE_FLOAT_TYPES = _PRIMITIVE_REAL_SCALAR_TYPES - _PRIMITIVE_INTEGER_TYPES
+_MIN_RAW_PYTHON_INTEGER = -(1 << 63)
+_MAX_RAW_PYTHON_INTEGER = (1 << 64) - 1
+_MAX_EXACT_FLOAT64_INTEGER = 1 << 53
+_FLOAT64_DTYPE = np.dtype(np.float64)
+
+
+def _is_primitive_real_scalar(value: Any) -> bool:
+    """Accept built-in real scalars without trusting subclass conversion hooks."""
+
+    return type(value) in _PRIMITIVE_REAL_SCALAR_TYPES
+
+
+def _is_primitive_integer(value: Any) -> bool:
+    """Accept built-in integer scalars without trusting subclass hooks."""
+
+    return type(value) in _PRIMITIVE_INTEGER_TYPES
+
+
+def _finite_float64_scalar(value: Any, name: str) -> float:
+    """Convert one primitive scalar without silent float64 information loss."""
+
+    if not _is_primitive_real_scalar(value):
+        raise ValueError(f"{name} must be a finite number")
+    if _is_primitive_integer(value):
+        integer = int(value)
+        if not -_MAX_EXACT_FLOAT64_INTEGER <= integer <= _MAX_EXACT_FLOAT64_INTEGER:
+            raise ValueError(f"{name} must be exactly representable as a finite float64")
+    try:
+        result = float(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(f"{name} must be a finite number") from exc
+    if not np.isfinite(result):
+        raise ValueError(f"{name} must be a finite number")
+    if type(value) in _PRIMITIVE_FLOAT_TYPES:
+        raw = np.asarray(value)
+        if raw.dtype.itemsize > _FLOAT64_DTYPE.itemsize:
+            restored = np.asarray(result, dtype=raw.dtype)
+            if restored != raw:
+                raise ValueError(f"{name} must be exactly representable as a finite float64")
+    return result
+
+
+def _preflight_fixed_shape(value: Any, name: str, shape: tuple[int, ...]) -> None:
+    """Prove a nested built-in array has the requested bounded shape.
+
+    This walk happens before NumPy materializes a sequence, so a malformed
+    nested input cannot trigger an unexpectedly large dense allocation.
+    """
+
+    if isinstance(value, np.ndarray):
+        value = np.asarray(value)
+        expected_size = int(np.prod(shape, dtype=np.int64))
+        if value.dtype.kind not in _REAL_ARRAY_KINDS:
+            raise ValueError(f"{name} must use an integer or real floating-point dtype")
+        if value.ndim != len(shape):
+            raise ValueError(f"{name} must have {len(shape)} dimensions, got {value.ndim}")
+        if value.size != expected_size:
+            raise ValueError(f"{name} must contain {expected_size} values, got {value.size}")
+        if value.shape != shape:
+            raise ValueError(f"{name} must have shape {shape}, got {value.shape}")
+        if value.dtype.kind == "f" and any(not np.isfinite(item) for item in value.flat):
+            raise ValueError(f"{name} must contain only finite values")
+        return
+    if not shape:
+        if not _is_primitive_real_scalar(value):
+            raise ValueError(f"{name} must contain primitive real numeric values")
+        if type(value) is int and not (_MIN_RAW_PYTHON_INTEGER <= value <= _MAX_RAW_PYTHON_INTEGER):
+            raise ValueError(f"{name} must use an integer or real floating-point dtype")
+        if type(value) in _PRIMITIVE_FLOAT_TYPES and not np.isfinite(value):
+            raise ValueError(f"{name} must contain only finite values")
+        return
+    if type(value) not in (list, tuple):
+        raise ValueError(f"{name} must be a NumPy array, list, or tuple")
+    if len(value) != shape[0]:
+        raise ValueError(f"{name} must have shape {shape}")
+    for item in value:
+        _preflight_fixed_shape(item, name, shape[1:])
+
+
+def _admit_fixed_array(value: Any, name: str, shape: tuple[int, ...]) -> np.ndarray:
+    """Validate bounded structure and a primitive real dtype without casting."""
+
+    _preflight_fixed_shape(value, name, shape)
+    try:
+        array = np.asarray(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(f"{name} must contain primitive real numeric values") from exc
+    expected_size = int(np.prod(shape, dtype=np.int64))
+    if array.dtype.kind not in _REAL_ARRAY_KINDS:
+        raise ValueError(f"{name} must use an integer or real floating-point dtype")
+    if array.ndim != len(shape):
+        raise ValueError(f"{name} must have {len(shape)} dimensions, got {array.ndim}")
+    if array.size != expected_size:
+        raise ValueError(f"{name} must contain {expected_size} values, got {array.size}")
+    if array.shape != shape:
+        raise ValueError(f"{name} must have shape {shape}, got {array.shape}")
+    return array
+
+
+def _copy_finite_array(
+    array: np.ndarray,
+    name: str,
+    *,
+    maximum: float | None,
+    maximum_description: str = "supported magnitude",
+) -> np.ndarray:
+    """Create the trusted float64 copy after raw aggregate admission."""
+
+    if array.dtype.kind == "u" and np.any(array > _MAX_EXACT_FLOAT64_INTEGER):
+        raise ValueError(f"{name} integers must be exactly representable in float64")
+    if array.dtype.kind == "i" and (
+        np.any(array < -_MAX_EXACT_FLOAT64_INTEGER) or np.any(array > _MAX_EXACT_FLOAT64_INTEGER)
+    ):
+        raise ValueError(f"{name} integers must be exactly representable in float64")
+    try:
+        with np.errstate(over="ignore", invalid="ignore"):
+            result = np.array(array, dtype=np.float64, order="C", copy=True)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(f"{name} must contain numeric values") from exc
+    if not np.isfinite(result).all():
+        raise ValueError(f"{name} must contain only finite values")
+    if array.dtype.kind == "f" and array.dtype.itemsize > _FLOAT64_DTYPE.itemsize:
+        restored = np.asarray(result, dtype=array.dtype)
+        if np.any(restored != array):
+            raise ValueError(f"{name} loses numeric precision when converted to float64")
+    if maximum is not None and np.any(np.abs(result) > maximum):
+        raise ValueError(f"{name} exceeds the {maximum_description}")
+    return result
 
 
 def _finite_array(value: Any, name: str, shape: tuple[int, ...]) -> np.ndarray:
-    try:
-        array = np.asarray(value, dtype=float)
-    except (TypeError, ValueError, OverflowError) as exc:
-        raise ValueError(f"{name} must contain numeric values") from exc
-    if array.size != int(np.prod(shape)):
-        raise ValueError(f"{name} must contain {int(np.prod(shape))} values, got {array.size}")
-    array = array.reshape(shape).copy()
-    if not np.isfinite(array).all():
-        raise ValueError(f"{name} must contain only finite values")
-    if np.any(np.abs(array) > _MAX_GEOMETRY_MAGNITUDE):
-        raise ValueError(f"{name} exceeds the supported geometry magnitude")
-    return array
+    array = _admit_fixed_array(value, name, shape)
+    return _copy_finite_array(
+        array,
+        name,
+        maximum=_MAX_GEOMETRY_MAGNITUDE,
+        maximum_description="supported geometry magnitude",
+    )
 
 
 def _readonly_array(array: np.ndarray) -> np.ndarray:
@@ -80,7 +211,7 @@ def _stable_norm(value: np.ndarray) -> float:
 
 
 def _positive_dimension(value: Any, name: str, *, allow_zero: bool = False) -> int:
-    if isinstance(value, bool) or not isinstance(value, (int, np.integer)):
+    if not _is_primitive_integer(value):
         raise ValueError(f"{name} must be an integer")
     value = int(value)
     if value < 0 or (value == 0 and not allow_zero):
@@ -92,7 +223,7 @@ def _positive_dimension(value: Any, name: str, *, allow_zero: bool = False) -> i
 
 
 def _bounded_positive_integer(value: Any, name: str, maximum: int) -> int:
-    if isinstance(value, bool) or not isinstance(value, (int, np.integer)) or int(value) <= 0:
+    if not _is_primitive_integer(value) or int(value) <= 0:
         raise ValueError(f"{name} must be a positive integer")
     result = int(value)
     if result > maximum:
@@ -108,18 +239,14 @@ def _finite_scalar(
     nonnegative: bool = False,
     maximum: float | None = None,
 ) -> float:
-    if isinstance(value, bool) or not isinstance(value, (int, float, np.integer, np.floating)):
-        raise ValueError(f"{name} must be a finite number")
-    value = float(value)
-    if not np.isfinite(value):
-        raise ValueError(f"{name} must be a finite number")
-    if positive and value <= 0:
+    result = _finite_float64_scalar(value, name)
+    if positive and result <= 0:
         raise ValueError(f"{name} must be > 0")
-    if nonnegative and value < 0:
+    if nonnegative and result < 0:
         raise ValueError(f"{name} must be >= 0")
-    if maximum is not None and abs(value) > maximum:
+    if maximum is not None and abs(result) > maximum:
         raise ValueError(f"{name} exceeds the supported magnitude {maximum:g}")
-    return value
+    return result
 
 
 def _bounded_angle(value: Any, name: str) -> float:
@@ -179,9 +306,9 @@ class Camera:
     name: str = ""
 
     def __post_init__(self) -> None:
-        intrinsics = _finite_array(self.K, "K", (3, 3))
-        rotation = _validate_rotation(_finite_array(self.R, "R", (3, 3)))
-        translation = _finite_array(self.t, "t", (3,))
+        _preflight_fixed_shape(self.K, "K", (3, 3))
+        _preflight_fixed_shape(self.R, "R", (3, 3))
+        _preflight_fixed_shape(self.t, "t", (3,))
         width = _positive_dimension(self.width, "width", allow_zero=True)
         height = _positive_dimension(self.height, "height", allow_zero=True)
         if (width == 0) != (height == 0):
@@ -189,6 +316,30 @@ class Camera:
         if width and width * height > _MAX_IMAGE_PIXELS:
             raise ValueError("image dimensions exceed the supported pixel count")
         name = _camera_name(self.name)
+
+        admitted_intrinsics = _admit_fixed_array(self.K, "K", (3, 3))
+        admitted_rotation = _admit_fixed_array(self.R, "R", (3, 3))
+        admitted_translation = _admit_fixed_array(self.t, "t", (3,))
+        intrinsics = _copy_finite_array(
+            admitted_intrinsics,
+            "K",
+            maximum=_MAX_GEOMETRY_MAGNITUDE,
+            maximum_description="supported geometry magnitude",
+        )
+        rotation = _validate_rotation(
+            _copy_finite_array(
+                admitted_rotation,
+                "R",
+                maximum=_MAX_GEOMETRY_MAGNITUDE,
+                maximum_description="supported geometry magnitude",
+            )
+        )
+        translation = _copy_finite_array(
+            admitted_translation,
+            "t",
+            maximum=_MAX_GEOMETRY_MAGNITUDE,
+            maximum_description="supported geometry magnitude",
+        )
 
         # A standard pinhole K has a nonzero homogeneous scale, positive focal
         # lengths, and no projective terms in its final row. Normalize its harmless
@@ -306,9 +457,10 @@ class Camera:
     ) -> Camera:
         """Build a camera from an eye/target pose and a safe vertical FOV."""
 
-        position = _finite_array(position, "position", (3,))
-        target = _finite_array(target, "target", (3,))
-        up = _finite_array([0.0, 1.0, 0.0] if up is None else up, "up", (3,))
+        up_value = [0.0, 1.0, 0.0] if up is None else up
+        _preflight_fixed_shape(position, "position", (3,))
+        _preflight_fixed_shape(target, "target", (3,))
+        _preflight_fixed_shape(up_value, "up", (3,))
         width = _positive_dimension(width, "width")
         height = _positive_dimension(height, "height")
         if width * height > _MAX_IMAGE_PIXELS:
@@ -318,6 +470,28 @@ class Camera:
             raise ValueError(
                 f"fov_deg must be in the closed interval [{_MIN_FOV_DEG:g}, {_MAX_FOV_DEG:g}]"
             )
+
+        admitted_position = _admit_fixed_array(position, "position", (3,))
+        admitted_target = _admit_fixed_array(target, "target", (3,))
+        admitted_up = _admit_fixed_array(up_value, "up", (3,))
+        position = _copy_finite_array(
+            admitted_position,
+            "position",
+            maximum=_MAX_GEOMETRY_MAGNITUDE,
+            maximum_description="supported geometry magnitude",
+        )
+        target = _copy_finite_array(
+            admitted_target,
+            "target",
+            maximum=_MAX_GEOMETRY_MAGNITUDE,
+            maximum_description="supported geometry magnitude",
+        )
+        up = _copy_finite_array(
+            admitted_up,
+            "up",
+            maximum=_MAX_GEOMETRY_MAGNITUDE,
+            maximum_description="supported geometry magnitude",
+        )
 
         forward = target - position
         forward_norm = _stable_norm(forward)
@@ -390,12 +564,10 @@ class Camera:
         }
         _reject_unknown_keys(data, known_keys, "camera record")
         version = data.get("schema_version", 1)
-        if (
-            isinstance(version, bool)
-            or not isinstance(version, (int, np.integer))
-            or int(version) != 1
-        ):
-            raise ValueError(f"unsupported camera schema_version {version!r}")
+        if not _is_primitive_integer(version):
+            raise ValueError("unsupported camera schema_version")
+        if int(version) != 1:
+            raise ValueError(f"unsupported camera schema_version {int(version)}")
 
         matrix_keys = {"K", "R", "t"}
         pose_target_keys = {"look_at", "lookAt", "target"}
@@ -506,7 +678,7 @@ class CameraRig:
             "max_association_states",
             _MAX_RIG_ASSOCIATION_STATES,
         )
-        if not isinstance(self.cameras, (list, tuple)) or len(self.cameras) < 2:
+        if type(self.cameras) not in (list, tuple) or len(self.cameras) < 2:
             raise ValueError("rig requires at least two cameras")
         if len(self.cameras) > max_cameras:
             raise ValueError("rig camera count exceeds max_cameras")
@@ -629,12 +801,10 @@ class CameraRig:
         }
         _reject_unknown_keys(data, allowed, "rig record")
         version = data.get("schema_version", 1)
-        if (
-            isinstance(version, bool)
-            or not isinstance(version, (int, np.integer))
-            or int(version) != 2
-        ):
-            raise ValueError(f"unsupported rig schema_version {version!r}")
+        if not _is_primitive_integer(version):
+            raise ValueError("unsupported rig schema_version")
+        if int(version) != 2:
+            raise ValueError(f"unsupported rig schema_version {int(version)}")
         if "max_speed_mps" not in data:
             raise ValueError("rig record requires max_speed_mps for the capture-time contract")
         if data.get("calibration_is_exact") is not True:
@@ -646,7 +816,7 @@ class CameraRig:
             data.get("max_cameras", 16), "max_cameras", _MAX_RIG_CAMERAS
         )
         records = data.get("cameras")
-        if not isinstance(records, list) or len(records) < 2:
+        if type(records) is not list or len(records) < 2:
             raise ValueError("rig requires a cameras list with at least two entries")
         if len(records) > max_cameras:
             raise ValueError("rig camera count exceeds max_cameras")

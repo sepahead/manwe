@@ -18,7 +18,14 @@ from typing import Any
 
 import numpy as np
 
-from .camera import Camera
+from .camera import (
+    Camera,
+    _admit_fixed_array,
+    _copy_finite_array,
+    _finite_float64_scalar,
+    _is_primitive_integer,
+    _preflight_fixed_shape,
+)
 from .triangulation import (
     reprojection_error,
     triangulate_dlt,
@@ -49,13 +56,7 @@ def _finite_scalar(
     nonnegative: bool = False,
     maximum: float | None = None,
 ) -> float:
-    if (
-        isinstance(value, bool)
-        or not isinstance(value, (int, float, np.integer, np.floating))
-        or not np.isfinite(value)
-    ):
-        raise ValueError(f"{name} must be a finite number")
-    result = float(value)
+    result = _finite_float64_scalar(value, name)
     if positive and result <= 0:
         raise ValueError(f"{name} must be > 0")
     if nonnegative and result < 0:
@@ -66,27 +67,12 @@ def _finite_scalar(
 
 
 def _bounded_positive_integer(value: Any, name: str, maximum: int) -> int:
-    if isinstance(value, bool) or not isinstance(value, (int, np.integer)) or int(value) <= 0:
+    if not _is_primitive_integer(value) or int(value) <= 0:
         raise ValueError(f"{name} must be a positive integer")
     result = int(value)
     if result > maximum:
         raise ValueError(f"{name} must be <= {maximum}")
     return result
-
-
-def _finite_vector(value: Any, name: str, size: int, *, maximum: float) -> np.ndarray:
-    try:
-        vector = np.asarray(value, dtype=float)
-    except (TypeError, ValueError, OverflowError) as exc:
-        raise ValueError(f"{name} must contain numeric values") from exc
-    if vector.size != size:
-        raise ValueError(f"{name} must contain {size} values, got {vector.size}")
-    vector = vector.reshape(size).copy()
-    if not np.isfinite(vector).all():
-        raise ValueError(f"{name} must contain only finite values")
-    if np.any(np.abs(vector) > maximum):
-        raise ValueError(f"{name} exceeds the supported magnitude")
-    return vector
 
 
 def _readonly_array(array: np.ndarray) -> np.ndarray:
@@ -96,26 +82,33 @@ def _readonly_array(array: np.ndarray) -> np.ndarray:
     )
 
 
-def _validated_covariance(value: Any, name: str) -> np.ndarray:
-    try:
-        covariance = np.asarray(value, dtype=float)
-    except (TypeError, ValueError, OverflowError) as exc:
-        raise ValueError(f"{name} must contain numeric values") from exc
-    if covariance.shape != (3, 3):
-        raise ValueError(f"{name} must have shape (3, 3)")
-    if not np.isfinite(covariance).all():
-        raise ValueError(f"{name} must contain only finite values")
+def _validated_covariance(admitted: np.ndarray, name: str) -> np.ndarray:
+    covariance = _copy_finite_array(admitted, name, maximum=None)
     scale = max(1.0, float(np.max(np.abs(covariance))))
-    if not np.allclose(covariance, covariance.T, rtol=1e-10, atol=1e-10 * scale):
+    normalized = covariance / scale
+    if not np.allclose(normalized, normalized.T, rtol=1e-10, atol=1e-10):
         raise ValueError(f"{name} must be symmetric")
-    covariance = 0.5 * (covariance + covariance.T)
-    values, vectors = np.linalg.eigh(covariance)
-    if float(values[0]) < -1e-10 * scale:
+    covariance = 0.5 * covariance + 0.5 * covariance.T
+    if not np.isfinite(covariance).all():
+        raise ValueError(f"{name} exceeds the finite numeric range")
+    normalized = covariance / scale
+    try:
+        values, vectors = np.linalg.eigh(normalized)
+    except np.linalg.LinAlgError as exc:
+        raise ValueError(f"{name} eigendecomposition did not converge") from exc
+    if not np.isfinite(values).all() or not np.isfinite(vectors).all():
+        raise ValueError(f"{name} eigendecomposition is non-finite")
+    if float(values[0]) < -1e-10:
         raise ValueError(f"{name} must be positive semidefinite")
+    if float(values[-1]) > np.finfo(np.float64).max / scale:
+        raise ValueError(f"{name} spectral magnitude exceeds the finite numeric range")
     if values[0] < 0.0:
-        covariance = vectors @ np.diag(np.maximum(values, 0.0)) @ vectors.T
-        covariance = 0.5 * (covariance + covariance.T)
-    if float(np.trace(covariance)) <= 0.0:
+        normalized = vectors @ np.diag(np.maximum(values, 0.0)) @ vectors.T
+        normalized = 0.5 * normalized + 0.5 * normalized.T
+        covariance = normalized * scale
+        if not np.isfinite(covariance).all():
+            raise ValueError(f"{name} repair exceeds the finite numeric range")
+    if float(np.trace(normalized)) <= 0.0:
         raise ValueError(f"{name} must contain non-zero uncertainty")
     return _readonly_array(covariance)
 
@@ -173,8 +166,7 @@ class Detection2D:
 
     def __post_init__(self) -> None:
         if (
-            isinstance(self.camera_index, bool)
-            or not isinstance(self.camera_index, (int, np.integer))
+            not _is_primitive_integer(self.camera_index)
             or self.camera_index < 0
             or self.camera_index >= _MAX_CAMERAS
         ):
@@ -183,7 +175,7 @@ class Detection2D:
             raise ValueError(
                 "pixels_undistorted must be explicitly True; distort pixels before this boundary"
             )
-        pixel = _finite_vector(self.pixel, "pixel", 2, maximum=_MAX_PIXEL_MAGNITUDE)
+        _preflight_fixed_shape(self.pixel, "pixel", (2,))
         confidence = _finite_scalar(self.confidence, "confidence")
         if not 0.0 <= confidence <= 1.0:
             raise ValueError("confidence must be in [0, 1]")
@@ -196,6 +188,12 @@ class Detection2D:
             nonnegative=True,
             maximum=_MAX_TIME_SKEW_S,
         )
+        pixel_std = _finite_scalar(
+            self.pixel_std_px,
+            "pixel_std_px",
+            positive=True,
+            maximum=_MAX_PIXEL_MAGNITUDE,
+        )
         if timestamp is None and timestamp_std != 0.0:
             raise ValueError("timestamp_std_s must be zero when timestamp is absent")
         camera_id = self.camera_id
@@ -204,23 +202,21 @@ class Detection2D:
                 camera_id = _bounded_identity(camera_id, "camera_id")
             except ValueError as exc:
                 raise ValueError("camera_id must be a bounded non-empty string or None") from exc
+        class_label = _class_label(self.class_label)
+        admitted_pixel = _admit_fixed_array(self.pixel, "pixel", (2,))
+        pixel = _copy_finite_array(
+            admitted_pixel,
+            "pixel",
+            maximum=_MAX_PIXEL_MAGNITUDE,
+        )
 
         object.__setattr__(self, "camera_index", int(self.camera_index))
         object.__setattr__(self, "pixel", _readonly_array(pixel))
-        object.__setattr__(self, "class_label", _class_label(self.class_label))
+        object.__setattr__(self, "class_label", class_label)
         object.__setattr__(self, "confidence", confidence)
         object.__setattr__(self, "timestamp", timestamp)
         object.__setattr__(self, "camera_id", camera_id)
-        object.__setattr__(
-            self,
-            "pixel_std_px",
-            _finite_scalar(
-                self.pixel_std_px,
-                "pixel_std_px",
-                positive=True,
-                maximum=_MAX_PIXEL_MAGNITUDE,
-            ),
-        )
+        object.__setattr__(self, "pixel_std_px", pixel_std)
         object.__setattr__(self, "timestamp_std_s", timestamp_std)
 
 
@@ -252,30 +248,24 @@ class Detection3D:
     motion_speed_bound_mps: float = 0.0
 
     def __post_init__(self) -> None:
-        position = _finite_vector(self.position, "position", 3, maximum=_MAX_POSITION_MAGNITUDE)
-        confidence = _finite_scalar(self.confidence, "confidence")
-        if not 0.0 <= confidence <= 1.0:
-            raise ValueError("confidence must be in [0, 1]")
-        if not isinstance(self.camera_indices, (list, tuple)) or len(self.camera_indices) < 2:
+        if type(self.camera_indices) not in (list, tuple) or len(self.camera_indices) < 2:
             raise ValueError("camera_indices must contain at least two non-negative integers")
         if len(self.camera_indices) > _MAX_CAMERAS:
             raise ValueError(f"camera_indices must contain at most {_MAX_CAMERAS} entries")
+        if type(self.camera_ids) not in (list, tuple):
+            raise ValueError("camera_ids must be a sequence")
+        if len(self.camera_ids) > _MAX_CAMERAS:
+            raise ValueError(f"camera_ids must contain at most {_MAX_CAMERAS} entries")
+        _preflight_fixed_shape(self.position, "position", (3,))
+        _preflight_fixed_shape(self.position_covariance, "position_covariance", (3, 3))
+
         camera_indices: list[int] = []
         for index in self.camera_indices:
-            if (
-                isinstance(index, bool)
-                or not isinstance(index, (int, np.integer))
-                or index < 0
-                or index >= _MAX_CAMERAS
-            ):
+            if not _is_primitive_integer(index) or index < 0 or index >= _MAX_CAMERAS:
                 raise ValueError(f"camera_indices must contain integers in [0, {_MAX_CAMERAS})")
             camera_indices.append(int(index))
         if len(set(camera_indices)) != len(camera_indices):
             raise ValueError("camera_indices must be unique")
-        if not isinstance(self.camera_ids, (list, tuple)):
-            raise ValueError("camera_ids must be a sequence")
-        if len(self.camera_ids) > _MAX_CAMERAS:
-            raise ValueError(f"camera_ids must contain at most {_MAX_CAMERAS} entries")
         camera_ids = tuple(self.camera_ids)
         if camera_ids:
             if len(camera_ids) != len(camera_indices):
@@ -289,46 +279,56 @@ class Detection3D:
                 raise ValueError("camera_ids must contain bounded non-empty strings") from exc
             if len(set(camera_ids)) != len(camera_ids):
                 raise ValueError("camera_ids must be unique")
+        confidence = _finite_scalar(self.confidence, "confidence")
+        if not 0.0 <= confidence <= 1.0:
+            raise ValueError("confidence must be in [0, 1]")
         timestamp = self.timestamp
         if timestamp is not None:
             timestamp = _finite_scalar(timestamp, "timestamp", maximum=_MAX_TIMESTAMP_MAGNITUDE)
+        reprojection_error = _finite_scalar(
+            self.reprojection_error,
+            "reprojection_error",
+            nonnegative=True,
+        )
+        time_uncertainty = _finite_scalar(
+            self.time_uncertainty_s,
+            "time_uncertainty_s",
+            nonnegative=True,
+            maximum=_MAX_TIME_SKEW_S,
+        )
+        motion_speed_bound = _finite_scalar(
+            self.motion_speed_bound_mps,
+            "motion_speed_bound_mps",
+            nonnegative=True,
+            maximum=_MAX_SPEED_MPS,
+        )
+        class_label = _class_label(self.class_label)
+        admitted_position = _admit_fixed_array(self.position, "position", (3,))
+        admitted_covariance = _admit_fixed_array(
+            self.position_covariance,
+            "position_covariance",
+            (3, 3),
+        )
+        position = _copy_finite_array(
+            admitted_position,
+            "position",
+            maximum=_MAX_POSITION_MAGNITUDE,
+        )
+        position_covariance = _validated_covariance(
+            admitted_covariance,
+            "position_covariance",
+        )
 
         object.__setattr__(self, "position", _readonly_array(position))
-        object.__setattr__(self, "class_label", _class_label(self.class_label))
+        object.__setattr__(self, "class_label", class_label)
         object.__setattr__(self, "confidence", confidence)
         object.__setattr__(self, "camera_indices", tuple(camera_indices))
-        object.__setattr__(
-            self,
-            "reprojection_error",
-            _finite_scalar(self.reprojection_error, "reprojection_error", nonnegative=True),
-        )
-        object.__setattr__(
-            self,
-            "position_covariance",
-            _validated_covariance(self.position_covariance, "position_covariance"),
-        )
+        object.__setattr__(self, "reprojection_error", reprojection_error)
+        object.__setattr__(self, "position_covariance", position_covariance)
         object.__setattr__(self, "timestamp", timestamp)
         object.__setattr__(self, "camera_ids", camera_ids)
-        object.__setattr__(
-            self,
-            "time_uncertainty_s",
-            _finite_scalar(
-                self.time_uncertainty_s,
-                "time_uncertainty_s",
-                nonnegative=True,
-                maximum=_MAX_TIME_SKEW_S,
-            ),
-        )
-        object.__setattr__(
-            self,
-            "motion_speed_bound_mps",
-            _finite_scalar(
-                self.motion_speed_bound_mps,
-                "motion_speed_bound_mps",
-                nonnegative=True,
-                maximum=_MAX_SPEED_MPS,
-            ),
-        )
+        object.__setattr__(self, "time_uncertainty_s", time_uncertainty)
+        object.__setattr__(self, "motion_speed_bound_mps", motion_speed_bound)
 
     @property
     def timestamp_reference(self) -> str:
@@ -788,9 +788,9 @@ def correlate_and_triangulate(
     complete measurement covariance.
     """
 
-    if not isinstance(cameras, (list, tuple)) or not cameras:
+    if type(cameras) not in (list, tuple) or not cameras:
         raise ValueError("cameras must be a non-empty sequence")
-    if not isinstance(detections, (list, tuple)):
+    if type(detections) not in (list, tuple):
         raise ValueError("detections must be a sequence")
     max_cameras = _bounded_positive_integer(max_cameras, "max_cameras", _MAX_CAMERAS)
     max_detections = _bounded_positive_integer(max_detections, "max_detections", _MAX_DETECTIONS)
@@ -1000,7 +1000,7 @@ def to_measurements(detections: Sequence[Detection3D], timestamp: float | None =
 
     from manwe.fusion.tracker import Measurement
 
-    if not isinstance(detections, (list, tuple)):
+    if type(detections) not in (list, tuple):
         raise TypeError("detections must contain only Detection3D instances")
     if len(detections) > _MAX_DETECTIONS:
         raise ValueError(f"detections must contain at most {_MAX_DETECTIONS} entries")
