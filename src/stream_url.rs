@@ -109,26 +109,75 @@ mod tests {
     }
 
     #[test]
+    fn validator_accepts_each_supported_authority_and_encoding_boundary() {
+        for value in [
+            "RTSP://camera.invalid",
+            "rTsPs://camera_1.invalid:65535/live",
+            "rtsp://user:p%40ss@camera.invalid/live%20feed?transport=tcp",
+            "rtsp://[::1]",
+            "rtsps://[2001:db8::1]:1/camera",
+        ] {
+            assert_eq!(validate_rtsp_url(value), Ok(()), "rejected {value:?}");
+        }
+
+        let prefix = "rtsp://camera.invalid/";
+        let maximum_length = format!("{prefix}{}", "a".repeat(4_096 - prefix.len()));
+        assert_eq!(maximum_length.len(), 4_096);
+        assert_eq!(validate_rtsp_url(&maximum_length), Ok(()));
+    }
+
+    #[test]
     fn validator_rejects_other_schemes_and_malformed_authorities() {
-        assert_eq!(
-            validate_rtsp_url("file:///etc/passwd"),
-            Err(INVALID_RTSP_URL)
-        );
-        assert_eq!(
-            validate_rtsp_url("rtsp://user:password/path"),
-            Err(INVALID_RTSP_URL)
-        );
-        assert_eq!(
-            validate_rtsp_url("rtsp://example.invalid/camera'\nfile '/tmp/other"),
-            Err(INVALID_RTSP_URL)
-        );
-        assert_eq!(
-            validate_rtsp_url("rtsp://example.invalid/live%0"),
-            Err(INVALID_RTSP_URL)
-        );
-        assert_eq!(
-            validate_rtsp_url("rtsp://example.invalid/live#fragment"),
-            Err(INVALID_RTSP_URL)
-        );
+        for value in [
+            "",
+            "file:///etc/passwd",
+            "rtsp://",
+            "rtsp:///camera",
+            "rtsp://?camera=1",
+            "rtsp://@camera.invalid",
+            "rtsp://user@name@camera.invalid",
+            "rtsp://user@",
+            "rtsp://:554/camera",
+            "rtsp://.camera.invalid/live",
+            "rtsp://camera.invalid./live",
+            "rtsp://camera!.invalid/live",
+            "rtsp://camera:554:555/live",
+            "rtsp://[2001:db8::1/live",
+            "rtsp://[not-an-address]/live",
+            "rtsp://[::1]suffix/live",
+            "rtsp://camera.invalid:0/live",
+            "rtsp://camera.invalid:65536/live",
+            "rtsp://camera.invalid:not-a-port/live",
+            "rtsp://camera.invalid/live#fragment",
+            "rtsp://camera.invalid/live%",
+            "rtsp://camera.invalid/live%0",
+            "rtsp://camera.invalid/live%GG",
+            "rtsp://camera.invalid/live path",
+            "rtsp://camera.invalid/live\u{0}",
+            "rtsp://camera.invalid/live'",
+            "rtsp://camera.invalid/live\"",
+            "rtsp://camera.invalid/live\\",
+        ] {
+            assert_eq!(
+                validate_rtsp_url(value),
+                Err(INVALID_RTSP_URL),
+                "accepted {value:?}"
+            );
+        }
+
+        let prefix = "rtsp://camera.invalid/";
+        let overlong = format!("{prefix}{}", "a".repeat(4_097 - prefix.len()));
+        assert_eq!(overlong.len(), 4_097);
+        assert_eq!(validate_rtsp_url(&overlong), Err(INVALID_RTSP_URL));
+    }
+
+    #[test]
+    fn percent_encoding_requires_exactly_two_hex_digits() {
+        for value in ["", "plain", "a%00", "a%aF", "a%20b%2F"] {
+            assert!(has_valid_percent_encoding(value), "rejected {value:?}");
+        }
+        for value in ["%", "%0", "%GG", "%0g", "a%0g", "aa%00%", "plain%"] {
+            assert!(!has_valid_percent_encoding(value), "accepted {value:?}");
+        }
     }
 }
