@@ -449,7 +449,7 @@ def test_detect_from_array_supports_negative_spl_and_silent_first_channel():
     fs = 16000
     # Leave a full-rank tetrahedral sub-array after silencing the first channel.
     microphones = np.vstack((np.zeros((1, 3)), _tetrahedral_mics()))
-    signals = synth_plane_wave(np.array([1.0, 0.0, 0.0]), microphones, fs, seed=30)
+    signals = synth_plane_wave(np.array([1.0, 0.0, 0.0]), microphones, fs, duration=0.05, seed=30)
     signals *= 1e-6
     signals[0] = 0.0
     detection = detect_from_array(
@@ -516,6 +516,21 @@ def test_mutated_acoustic_detection_is_revalidated_at_public_boundaries():
     detection.class_label = None
     detection.range_observed = 1
     with pytest.raises(ValueError, match="range_observed"):
+        detection.to_measurement()
+
+
+def test_acoustic_azimuth_rejects_unreliable_float_canonicalization():
+    # At 1e16, adjacent finite floats are already two radians apart. Producing a
+    # plausible-looking unit direction would hide information lost before entry.
+    assert np.isfinite(AcousticDetection(1_000_000.0, 0.0, 10.0, 60.0).azimuth)
+    with pytest.raises(ValueError, match="canonicalize reliably"):
+        AcousticDetection(1e16, 0.0, 10.0, 60.0)
+
+    detection = AcousticDetection(0.0, 0.0, 10.0, 60.0, range_observed=True)
+    detection.azimuth = 1e16
+    with pytest.raises(ValueError, match="canonicalize reliably"):
+        detection.direction()
+    with pytest.raises(ValueError, match="canonicalize reliably"):
         detection.to_measurement()
 
 

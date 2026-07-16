@@ -11,6 +11,7 @@ from .doa import SPEED_OF_SOUND, srp_peak_prominence, srp_phat
 from .features import sound_pressure_level_db
 
 MAX_CLASS_LABEL_BYTES = 256
+MAX_ABSOLUTE_AZIMUTH = 1_000_000.0
 
 
 def _finite_scalar(
@@ -47,6 +48,13 @@ def _finite_vector(value: Any, name: str) -> np.ndarray:
     if not np.isfinite(vector).all():
         raise ValueError(f"{name} must contain only finite values")
     return vector
+
+
+def _canonical_azimuth(value: Any) -> float:
+    azimuth = _finite_scalar(value, "azimuth")
+    if abs(azimuth) > MAX_ABSOLUTE_AZIMUTH:
+        raise ValueError("azimuth magnitude is too large to canonicalize reliably")
+    return float(np.arctan2(np.sin(azimuth), np.cos(azimuth)))
 
 
 def _rotation(value: np.ndarray | None) -> np.ndarray:
@@ -106,8 +114,7 @@ class AcousticDetection:
     range_observed: bool = field(default=False, kw_only=True)
 
     def __post_init__(self) -> None:
-        self.azimuth = _finite_scalar(self.azimuth, "azimuth")
-        self.azimuth = float(np.arctan2(np.sin(self.azimuth), np.cos(self.azimuth)))
+        self.azimuth = _canonical_azimuth(self.azimuth)
         self.elevation = _finite_scalar(self.elevation, "elevation")
         if not -np.pi / 2.0 <= self.elevation <= np.pi / 2.0:
             raise ValueError("elevation must lie in [-pi/2, pi/2]")
@@ -126,7 +133,7 @@ class AcousticDetection:
             raise ValueError("range_observed must be a boolean")
 
     def direction(self) -> np.ndarray:
-        azimuth = _finite_scalar(self.azimuth, "azimuth")
+        azimuth = _canonical_azimuth(self.azimuth)
         elevation = _finite_scalar(self.elevation, "elevation")
         if not -np.pi / 2.0 <= elevation <= np.pi / 2.0:
             raise ValueError("elevation must lie in [-pi/2, pi/2]")
@@ -170,7 +177,7 @@ class AcousticDetection:
         angle_std = _finite_scalar(angle_std, "angle_std", positive=True)
         range_std = _finite_scalar(range_std, "range_std", positive=True)
         distance = _finite_scalar(self.range_estimate, "range_estimate", nonnegative=True)
-        azimuth = _finite_scalar(self.azimuth, "azimuth")
+        azimuth = _canonical_azimuth(self.azimuth)
         elevation = _finite_scalar(self.elevation, "elevation")
         if not -np.pi / 2.0 <= elevation <= np.pi / 2.0:
             raise ValueError("elevation must lie in [-pi/2, pi/2]")
