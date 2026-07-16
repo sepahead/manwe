@@ -273,6 +273,16 @@ jobs:
         run: |
           uv export --locked --offline --no-default-groups --no-emit-project \
             --output-file "$RUNNER_TEMP/manwe-core-requirements.txt"
+          # As with isolated build requirements, a prior lock-based sync does
+          # not guarantee that registry candidates remain available offline.
+          # Prime only hash-pinned binary artifacts, discard the temporary
+          # install, and prove the wheel environment can then install offline.
+          rm -rf "$RUNNER_TEMP/manwe-core-prefetch"
+          uv pip install --python .venv/bin/python --no-sources \
+            --target "$RUNNER_TEMP/manwe-core-prefetch" \
+            --require-hashes --only-binary :all: \
+            -r "$RUNNER_TEMP/manwe-core-requirements.txt"
+          rm -rf "$RUNNER_TEMP/manwe-core-prefetch"
           uv venv --python 3.12 .wheel-venv
           uv pip install --python .wheel-venv/bin/python --offline \
             --require-hashes -r "$RUNNER_TEMP/manwe-core-requirements.txt"
