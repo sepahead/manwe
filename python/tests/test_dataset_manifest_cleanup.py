@@ -9,6 +9,13 @@ import pytest
 from manwe.common import dataset_manifest
 
 
+def _assert_exception_note(error: BaseException, fragment: str) -> None:
+    """Assert PEP 678 evidence where the supported interpreter provides it."""
+    if not hasattr(error, "add_note"):
+        return
+    assert any(fragment in note for note in getattr(error, "__notes__", ()))
+
+
 @pytest.mark.parametrize(
     "released_before_error",
     [False, True],
@@ -114,7 +121,7 @@ def test_release_resources_preserves_first_failure_and_attempts_every_cleanup() 
     assert captured.value is first
     assert captured.value.__cause__ is second
     assert events == ["first", "second"]
-    assert any("second resource cleanup also failed" in note for note in captured.value.__notes__)
+    _assert_exception_note(captured.value, "second resource cleanup also failed")
 
 
 def test_calibration_context_preserves_body_error_and_releases_every_resource() -> None:
@@ -154,14 +161,10 @@ def test_calibration_context_preserves_body_error_and_releases_every_resource() 
     assert captured.value.__cause__ is errors["loader"]
     assert events == ["loader", "artifact", "root", "manifest"]
     assert snapshot._closed
-    assert any(
-        "calibration dataset snapshot cleanup also failed" in note
-        for note in captured.value.__notes__
-    )
-    loader_notes = errors["loader"].__notes__
-    assert any("artifact snapshot cleanup" in note for note in loader_notes)
-    assert any("source dataset root cleanup" in note for note in loader_notes)
-    assert any("source dataset manifest cleanup" in note for note in loader_notes)
+    _assert_exception_note(captured.value, "calibration dataset snapshot cleanup also failed")
+    _assert_exception_note(errors["loader"], "artifact snapshot cleanup")
+    _assert_exception_note(errors["loader"], "source dataset root cleanup")
+    _assert_exception_note(errors["loader"], "source dataset manifest cleanup")
 
     snapshot.close()
     assert events == ["loader", "artifact", "root", "manifest"]
@@ -199,8 +202,8 @@ def test_manifest_snapshot_constructor_preserves_setup_error_during_cleanup(
     assert captured.value is setup_error
     assert captured.value.__cause__ is source_root.error
     assert events == ["root", "manifest"]
-    assert any("source dataset root cleanup" in note for note in captured.value.__notes__)
-    assert any("source dataset manifest cleanup" in note for note in captured.value.__notes__)
+    _assert_exception_note(captured.value, "source dataset root cleanup")
+    _assert_exception_note(captured.value, "source dataset manifest cleanup")
 
 
 def test_calibration_clone_error_remains_primary_when_clone_cleanup_fails() -> None:
