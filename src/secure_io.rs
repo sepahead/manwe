@@ -695,16 +695,25 @@ fn validate_native_executable(file: &File, file_len: u64, path: &Path) -> Result
 #[cfg(any(target_os = "linux", target_os = "android", test))]
 fn validate_elf_header(header: &[u8; 64], file_len: u64, path: &Path) -> Result<()> {
     if &header[..4] != b"\x7fELF" {
-        anyhow::bail!("child executable is not a native ELF container: {}", path.display())
+        anyhow::bail!(
+            "child executable is not a native ELF container: {}",
+            path.display()
+        )
     }
     let class = header[4];
     let little_endian = match header[5] {
         1 => true,
         2 => false,
-        _ => anyhow::bail!("ELF executable has an invalid byte order: {}", path.display()),
+        _ => anyhow::bail!(
+            "ELF executable has an invalid byte order: {}",
+            path.display()
+        ),
     };
     if header[6] != 1 {
-        anyhow::bail!("ELF executable has an invalid identifier version: {}", path.display())
+        anyhow::bail!(
+            "ELF executable has an invalid identifier version: {}",
+            path.display()
+        )
     }
     let executable_type = decode_u16([header[16], header[17]], little_endian);
     let machine = decode_u16([header[18], header[19]], little_endian);
@@ -773,7 +782,10 @@ fn validate_thin_macho(
         .checked_add(u64::from(command_bytes))
         .context("Mach-O load-command length overflowed")?;
     if file_type != 2 || command_count == 0 || command_bytes == 0 || command_end > slice_len {
-        anyhow::bail!("Mach-O executable header is not loadable: {}", path.display())
+        anyhow::bail!(
+            "Mach-O executable header is not loadable: {}",
+            path.display()
+        )
     }
     Ok(())
 }
@@ -790,7 +802,10 @@ fn validate_fat_macho(
     read_exact_at(file, &mut count_bytes, 4)?;
     let architecture_count = decode_u32(count_bytes, little_endian);
     if architecture_count == 0 || architecture_count > 64 {
-        anyhow::bail!("fat Mach-O architecture count is invalid: {}", path.display())
+        anyhow::bail!(
+            "fat Mach-O architecture count is invalid: {}",
+            path.display()
+        )
     }
     let entry_len = if is_64_bit { 32_u64 } else { 20_u64 };
     let table_len = u64::from(architecture_count)
@@ -798,7 +813,10 @@ fn validate_fat_macho(
         .and_then(|length| length.checked_add(8))
         .context("fat Mach-O architecture table overflowed")?;
     if table_len > file_len {
-        anyhow::bail!("fat Mach-O architecture table is truncated: {}", path.display())
+        anyhow::bail!(
+            "fat Mach-O architecture table is truncated: {}",
+            path.display()
+        )
     }
     let mut table = vec![0_u8; (table_len - 8) as usize];
     read_exact_at(file, &mut table, 8)?;
@@ -818,23 +836,20 @@ fn validate_fat_macho(
             .checked_add(size)
             .context("fat Mach-O architecture range overflowed")?;
         if offset < table_len || size < 28 || end > file_len {
-            anyhow::bail!("fat Mach-O architecture range is invalid: {}", path.display())
+            anyhow::bail!(
+                "fat Mach-O architecture range is invalid: {}",
+                path.display()
+            )
         }
         let mut magic = [0_u8; 4];
         read_exact_at(file, &mut magic, offset)?;
         match magic {
-            [0xce, 0xfa, 0xed, 0xfe] => {
-                validate_thin_macho(file, offset, size, true, false, path)?
-            }
-            [0xcf, 0xfa, 0xed, 0xfe] => {
-                validate_thin_macho(file, offset, size, true, true, path)?
-            }
+            [0xce, 0xfa, 0xed, 0xfe] => validate_thin_macho(file, offset, size, true, false, path)?,
+            [0xcf, 0xfa, 0xed, 0xfe] => validate_thin_macho(file, offset, size, true, true, path)?,
             [0xfe, 0xed, 0xfa, 0xce] => {
                 validate_thin_macho(file, offset, size, false, false, path)?
             }
-            [0xfe, 0xed, 0xfa, 0xcf] => {
-                validate_thin_macho(file, offset, size, false, true, path)?
-            }
+            [0xfe, 0xed, 0xfa, 0xcf] => validate_thin_macho(file, offset, size, false, true, path)?,
             _ => anyhow::bail!("fat Mach-O contains a non-native slice: {}", path.display()),
         }
     }
@@ -854,7 +869,10 @@ fn validate_native_executable(_file: &File, _file_len: u64, path: &Path) -> Resu
 
 #[cfg(not(unix))]
 fn validate_native_executable(_file: &File, _file_len: u64, path: &Path) -> Result<()> {
-    anyhow::bail!("native executable validation requires Unix: {}", path.display())
+    anyhow::bail!(
+        "native executable validation requires Unix: {}",
+        path.display()
+    )
 }
 
 #[cfg(unix)]
@@ -913,14 +931,8 @@ fn ensure_trusted_path_component(
 
 #[cfg(target_os = "macos")]
 fn ensure_no_mutating_extended_acl(path: &Path) -> Result<()> {
-    const MUTATING_PERMISSIONS: u64 = (1 << 2)
-        | (1 << 4)
-        | (1 << 5)
-        | (1 << 6)
-        | (1 << 8)
-        | (1 << 10)
-        | (1 << 12)
-        | (1 << 13);
+    const MUTATING_PERMISSIONS: u64 =
+        (1 << 2) | (1 << 4) | (1 << 5) | (1 << 6) | (1 << 8) | (1 << 10) | (1 << 12) | (1 << 13);
 
     ensure_no_extended_acl_permissions(path, MUTATING_PERMISSIONS, "mutating")
 }
@@ -964,8 +976,7 @@ fn ensure_no_extended_acl_permissions(
         if error.raw_os_error() == Some(libc::ENOENT) {
             return Ok(());
         }
-        return Err(error)
-            .with_context(|| format!("failed to inspect ACL for {}", path.display()));
+        return Err(error).with_context(|| format!("failed to inspect ACL for {}", path.display()));
     }
 
     let inspection = (|| -> Result<()> {
@@ -1166,8 +1177,7 @@ mod tests {
         std::fs::create_dir(&base).unwrap();
         let sticky_parent = base.join("shared");
         std::fs::create_dir(&sticky_parent).unwrap();
-        std::fs::set_permissions(&sticky_parent, std::fs::Permissions::from_mode(0o1777))
-            .unwrap();
+        std::fs::set_permissions(&sticky_parent, std::fs::Permissions::from_mode(0o1777)).unwrap();
         let directory = sticky_parent.join("private");
         std::fs::create_dir(&directory).unwrap();
         std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -1211,7 +1221,8 @@ mod tests {
         std::fs::write(&sentinel, b"preserve").unwrap();
         let bound = BoundDirectory::open(&directory).unwrap();
 
-        bound.remove_file_entry(std::ffi::OsStr::new("known"))
+        bound
+            .remove_file_entry(std::ffi::OsStr::new("known"))
             .unwrap();
         let error = bound
             .remove_directory_entry(std::ffi::OsStr::new("unknown"))
@@ -1219,7 +1230,9 @@ mod tests {
 
         assert!(!known.exists());
         assert_eq!(std::fs::read(sentinel).unwrap(), b"preserve");
-        assert!(error.to_string().contains("failed to remove bound directory entry"));
+        assert!(error
+            .to_string()
+            .contains("failed to remove bound directory entry"));
         assert!(bound
             .remove_file_entry(std::ffi::OsStr::new("../escape"))
             .is_err());
@@ -1379,8 +1392,7 @@ mod tests {
         std::fs::create_dir(&directory).unwrap();
         let executable_path = directory.join("tool");
         std::fs::copy(std::env::current_exe().unwrap(), &executable_path).unwrap();
-        std::fs::set_permissions(&executable_path, std::fs::Permissions::from_mode(0o700))
-            .unwrap();
+        std::fs::set_permissions(&executable_path, std::fs::Permissions::from_mode(0o700)).unwrap();
         let executable = resolve_executable(&executable_path).unwrap();
 
         let error = executable
@@ -1404,12 +1416,10 @@ mod tests {
         std::fs::create_dir(&directory).unwrap();
         let writable_parent = directory.join("writable");
         std::fs::create_dir(&writable_parent).unwrap();
-        std::fs::set_permissions(&writable_parent, std::fs::Permissions::from_mode(0o770))
-            .unwrap();
+        std::fs::set_permissions(&writable_parent, std::fs::Permissions::from_mode(0o770)).unwrap();
         let executable_path = writable_parent.join("tool");
         std::fs::copy(std::env::current_exe().unwrap(), &executable_path).unwrap();
-        std::fs::set_permissions(&executable_path, std::fs::Permissions::from_mode(0o700))
-            .unwrap();
+        std::fs::set_permissions(&executable_path, std::fs::Permissions::from_mode(0o700)).unwrap();
 
         let error = resolve_executable(&executable_path).unwrap_err();
 
@@ -1427,10 +1437,13 @@ mod tests {
         std::fs::create_dir(&directory).unwrap();
         let executable_path = directory.join("tool");
         std::fs::copy(std::env::current_exe().unwrap(), &executable_path).unwrap();
-        std::fs::set_permissions(&executable_path, std::fs::Permissions::from_mode(0o700))
-            .unwrap();
+        std::fs::set_permissions(&executable_path, std::fs::Permissions::from_mode(0o700)).unwrap();
         let status = std::process::Command::new("/bin/chmod")
-            .args(["+a", "everyone allow write", executable_path.to_str().unwrap()])
+            .args([
+                "+a",
+                "everyone allow write",
+                executable_path.to_str().unwrap(),
+            ])
             .status()
             .unwrap();
         assert!(status.success());
@@ -1472,8 +1485,7 @@ mod tests {
         let mut bytes = vec![0_u8; 32];
         bytes[..4].copy_from_slice(&[0xcf, 0xfa, 0xed, 0xfe]);
         std::fs::write(&executable_path, bytes).unwrap();
-        std::fs::set_permissions(&executable_path, std::fs::Permissions::from_mode(0o700))
-            .unwrap();
+        std::fs::set_permissions(&executable_path, std::fs::Permissions::from_mode(0o700)).unwrap();
         let executable = resolve_executable(&executable_path).unwrap();
 
         let error = executable.require_native_executable().unwrap_err();
