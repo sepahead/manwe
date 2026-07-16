@@ -241,11 +241,11 @@ def _safe_location(value: str) -> str:
     # perfectly printable filename and would otherwise be echoed when a finding
     # in that file is reported. Apply the same conservative rules to the display
     # value and replace suspicious or unsafe paths with a stable opaque digest.
-    path_contains_secret = bool(scan_text("<path>", value))
+    path_is_sensitive = bool(scan_text("<path>", value))
     if (
         len(value) > 512
         or any(not character.isprintable() for character in value)
-        or path_contains_secret
+        or path_is_sensitive
     ):
         digest = hashlib.sha256(value.encode("utf-8", errors="surrogateescape")).hexdigest()
         return f"worktree-path/{digest}"

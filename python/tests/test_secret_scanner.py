@@ -7,6 +7,12 @@ from manwe.common import secret_scan
 from manwe.common.secret_scan import main, scan_paths, scan_text
 
 
+def test_secret_scanner_does_not_flag_its_own_implementation() -> None:
+    source = Path(secret_scan.__file__).read_text(encoding="utf-8")
+
+    assert scan_text("secret_scan.py", source) == []
+
+
 def test_secret_scanner_reports_location_without_value() -> None:
     credential_url = "rtsp://operator:" + "sensitive-value-123" + "@camera.example/live"
 
