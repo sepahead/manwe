@@ -111,8 +111,34 @@ the exact digest-bound `.pt` origin is trusted even under restricted loading;
 `--allow-unverified` confirms that successful conversion is not a consumer handoff
 or fidelity result. The exporter works in a private snapshot and refuses to
 replace an existing destination. TensorRT INT8 calibration likewise uses a bounded
-read-only private dataset snapshot; its receipt digest binds the normalized manifest
-and exact copied tree, and the source is rechecked before publication.
+read-only private dataset snapshot. Only the manifest's `val` images count: every
+candidate must have matching suffix/content, identity EXIF orientation, bounded
+encoded/decoded size, and decode as 3-channel `uint8`; images that collapse to the
+same resized/letterboxed backend tensor are rejected. A hash-ranked 512-image
+subset is then exposed in an exact label/cache/adjacent-array-free private view
+with batch 1 and fraction 1.0. Ultralytics cache loading/writing and network URL
+probes are disabled, and its process-global `bgr=0` validation formatter is
+serialized and made deterministic only for the calibration operation, so
+TensorRT 7–10 and TensorRT 11 ModelOpt consume the same bounded set. The
+exporter rejects the pinned Ultralytics branch that would silently fall back to
+FP32 when TensorRT reports no INT8 capability. Its receipt digest binds the
+TensorRT version/route, loader policy, `imgsz`, normalized manifest, validated
+inventory, and exact copied tree; both the caller-visible manifest file and its
+declared source tree are pinned and rechecked through descriptor-relative POSIX
+I/O before publication. Dataset roots and splits must be absolute or descendant-
+relative (`..`, symlinks, and special path components are rejected).
+These checks prove availability and byte/tensor uniqueness, not target-domain
+representativeness or per-layer INT8 execution. `precision="int8"` records the
+requested mixed-precision route; engine-inspector and fidelity evidence remain
+promotion requirements. TensorRT 11 preflights locally installed
+`nvidia-modelopt>=0.44`, binds its exact version into the digest, and rejects
+image sizes whose conservative 10× tensor-materialization estimate exceeds
+8 GiB. The ModelOpt version and TensorRT route are not yet explicit receipt
+fields, so independent reconstruction still needs the build environment record.
+This is not an operating-system filesystem snapshot: privileged mount changes,
+SHA-256 collisions, and malicious same-UID mutation of the process-owned private
+loader tree during backend reads require an isolated build worker or stronger OS
+containment.
 
 `uv run --no-sync manwe fusion-sim` on the default 3-target, 3-sensor (visual + radar + acoustic)
 scenario — mean OSPA (lower is better) over 41 frames:

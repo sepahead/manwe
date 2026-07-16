@@ -339,6 +339,12 @@ jobs:
           verify_ultralytics_policy()
           print(f"verified ultralytics {ultralytics.__version__}")
           PY
+      - name: Verify calibration preprocessing against the pinned loader
+        working-directory: python
+        run: >-
+          uv run --no-sync pytest -q tests/test_runtime_boundaries.py
+          -k 'calibration_private_view_matches_actual_pinned_loader or
+          calibration_supported_formats_match_actual_pinned_loader'
       - name: Reject animated and multi-page inference inputs
         working-directory: python
         run: >-

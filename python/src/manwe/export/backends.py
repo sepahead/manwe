@@ -8,10 +8,13 @@ supported conversion target here.
 
 from __future__ import annotations
 
+import importlib
+import importlib.metadata
 import math
 import os
 import shutil
 import stat
+from collections.abc import Mapping
 from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
@@ -28,12 +31,111 @@ from ..common.config_io import open_directory_nofollow
 from ..common.dataset_manifest import snapshot_local_calibration_dataset
 from ..common.deps import require
 from ..common.logging import get_logger
-from ..common.ultralytics import harden_ultralytics_runtime, verify_ultralytics_policy
+from ..common.ultralytics import (
+    deterministic_ultralytics_validation_format,
+    harden_ultralytics_runtime,
+    verify_ultralytics_policy,
+)
 
 log = get_logger("manwe.export")
 
 _MAX_MODEL_STRIDES = 64
 _MAX_MODEL_STRIDE_NODES = 128
+
+
+def _preflight_tensorrt_int8(device_index: int) -> tuple[str, str | None]:
+    """Prove the pinned exporter will take its INT8 rather than silent-FP32 branch."""
+    if type(device_index) is not int or device_index < 0:
+        raise ValueError("TensorRT device index must be a nonnegative integer")
+    try:
+        import torch
+    except ImportError as exc:  # pragma: no cover - export dependency boundary
+        raise RuntimeError("TensorRT INT8 export requires installed PyTorch") from exc
+    try:
+        torch.cuda.set_device(device_index)
+    except Exception as exc:
+        raise RuntimeError(
+            f"TensorRT INT8 export could not select CUDA device {device_index}"
+        ) from exc
+    try:
+        import tensorrt as trt
+    except ImportError as exc:  # pragma: no cover - NVIDIA-only dependency boundary
+        raise RuntimeError(
+            "TensorRT INT8 export requires installed NVIDIA TensorRT Python bindings"
+        ) from exc
+
+    version = getattr(trt, "__version__", None)
+    if not isinstance(version, str) or not version or not version.isprintable():
+        raise RuntimeError("TensorRT must expose a printable version string")
+    try:
+        major = int(version.split(".", 1)[0])
+    except ValueError as exc:
+        raise RuntimeError("TensorRT version must start with an integer major version") from exc
+    if major < 7:
+        raise RuntimeError("TensorRT INT8 export requires TensorRT 7 or newer")
+    if major > 11:
+        raise RuntimeError(
+            "TensorRT versions newer than the audited 7-11 exporter branches are rejected"
+        )
+    release = version.split("+", 1)[0].split("-", 1)[0].split(".")
+    if len(release) > 1:
+        try:
+            minor = int(release[1])
+        except ValueError as exc:
+            raise RuntimeError("TensorRT version minor component must be an integer") from exc
+        if major == 10 and minor == 2:
+            raise RuntimeError("TensorRT 10.2 is rejected by the pinned Ultralytics exporter")
+
+    try:
+        logger = trt.Logger(trt.Logger.ERROR)
+        builder = trt.Builder(logger)
+        if builder is None:
+            raise RuntimeError("TensorRT could not create an engine builder")
+        # This intentionally mirrors Ultralytics 8.4.92 utils/export/engine.py.
+        # TRT 7-9 expose the capability flag; TRT 10+ removed it and upstream
+        # defaults the branch to True.
+        platform_has_fast_int8 = getattr(builder, "platform_has_fast_int8", True)
+    except RuntimeError:
+        raise
+    except Exception as exc:
+        raise RuntimeError("TensorRT INT8 capability could not be inspected") from exc
+    if not platform_has_fast_int8:
+        raise RuntimeError(
+            "TensorRT reports no fast INT8 capability; Ultralytics 8.4.92 would silently "
+            "build FP32 while labeling the request INT8"
+        )
+    modelopt_version = None
+    if major >= 11:
+        try:
+            from packaging.version import InvalidVersion, Version
+        except ImportError as exc:  # pragma: no cover - locked export dependency
+            raise RuntimeError("TensorRT 11 INT8 export requires the packaging runtime") from exc
+        try:
+            modelopt_version = importlib.metadata.version("nvidia-modelopt")
+        except importlib.metadata.PackageNotFoundError as exc:
+            raise RuntimeError(
+                "TensorRT 11 INT8 export requires locally installed nvidia-modelopt>=0.44"
+            ) from exc
+        if (
+            not isinstance(modelopt_version, str)
+            or not modelopt_version
+            or not modelopt_version.isprintable()
+            or len(modelopt_version.encode("utf-8")) > 128
+        ):
+            raise RuntimeError("ModelOpt must expose a bounded printable version string")
+        try:
+            parsed_modelopt_version = Version(modelopt_version)
+        except InvalidVersion as exc:
+            raise RuntimeError("ModelOpt must expose a valid PEP 440 version") from exc
+        if parsed_modelopt_version < Version("0.44"):
+            raise RuntimeError("TensorRT 11 INT8 export requires nvidia-modelopt>=0.44")
+        try:
+            importlib.import_module("modelopt.onnx.quantization")
+        except ImportError as exc:
+            raise RuntimeError(
+                "TensorRT 11 INT8 export requires the ModelOpt ONNX quantization runtime"
+            ) from exc
+    return version, modelopt_version
 
 
 def _checkpoint_max_stride(value: object) -> int:
@@ -226,6 +328,17 @@ def _ordered_class_names(value: object) -> tuple[str, ...]:
     return normalized
 
 
+def _checkpoint_input_channels(model_graph: object) -> int:
+    """Mirror the pinned exporter's ``model.yaml.get('channels', 3)`` input shape."""
+    model_yaml = getattr(model_graph, "yaml", None)
+    if not isinstance(model_yaml, Mapping):
+        raise ValueError("checkpoint model must expose mapping-valued yaml metadata")
+    channels = model_yaml.get("channels", 3)
+    if type(channels) is not int or channels <= 0:
+        raise ValueError("checkpoint input channels must be a positive integer")
+    return channels
+
+
 #: manwe format name → how to produce it + crebain backend + gotchas from research.
 EXPORT_FORMATS: dict[str, FormatSpec] = {
     "onnx": FormatSpec("onnx", "onnx", ".onnx", "pin opset, run onnxslim, keep NMS external"),
@@ -233,7 +346,7 @@ EXPORT_FORMATS: dict[str, FormatSpec] = {
         "engine",
         "tensorrt",
         ".engine",
-        "NVIDIA-only; ModelOpt explicit INT8 needs ≥1000 drone calib images (never COCO)",
+        "NVIDIA-only; INT8 requires ≥1000 unique effective val tensors + domain evidence",
     ),
     "coreml": FormatSpec(
         "coreml",
@@ -271,8 +384,8 @@ class _PreparedDestination:
 
     def close(self) -> None:
         if not self.closed:
-            os.close(self.parent_fd)
             self.closed = True
+            os.close(self.parent_fd)
 
 
 def _prepare_destination(path: str, allowed_suffixes: set[str]) -> _PreparedDestination:
@@ -432,20 +545,36 @@ def _publish_exclusive(source: Path, destination: Path | _PreparedDestination, d
                         | getattr(os, "O_NOFOLLOW", 0)
                     )
                     fd = os.open(anchor.path.name, flags, 0o600, dir_fd=anchor.parent_fd)
-                    metadata = os.fstat(fd)
-                    created_identity = (metadata.st_dev, metadata.st_ino)
-                    with snapshot.path.open("rb") as source_handle, os.fdopen(fd, "wb") as target:
-                        shutil.copyfileobj(source_handle, target, length=1 << 20)
-                        target.flush()
-                        os.fsync(target.fileno())
-                        os.fchmod(target.fileno(), 0o644)
+                    try:
+                        metadata = os.fstat(fd)
+                        created_identity = (metadata.st_dev, metadata.st_ino)
+                        with (
+                            snapshot.path.open("rb") as source_handle,
+                            os.fdopen(fd, "wb") as target,
+                        ):
+                            fd = -1
+                            shutil.copyfileobj(source_handle, target, length=1 << 20)
+                            target.flush()
+                            os.fsync(target.fileno())
+                            os.fchmod(target.fileno(), 0o644)
+                    finally:
+                        if fd >= 0:
+                            os.close(fd)
                 if _entry_identity_at(anchor.parent_fd, anchor.path.name) != created_identity:
                     raise RuntimeError(
                         "output destination was replaced while it was being published"
                     )
                 if sha256_artifact_at(anchor.parent_fd, anchor.path.name) != digest:
                     raise RuntimeError("published export digest differs from the verified artifact")
+                if _entry_identity_at(anchor.parent_fd, anchor.path.name) != created_identity:
+                    raise RuntimeError(
+                        "output destination was replaced while its digest was being verified"
+                    )
                 anchor.assert_parent_path()
+                if _entry_identity_at(anchor.parent_fd, anchor.path.name) != created_identity:
+                    raise RuntimeError(
+                        "output destination was replaced while the export was being published"
+                    )
                 os.fsync(anchor.parent_fd)
             except BaseException:
                 if (
@@ -531,21 +660,12 @@ def export_model(
         raise ValueError("INT8 conversion is currently verified only for TensorRT")
     if data is not None and not int8:
         raise ValueError("data is only accepted for TensorRT INT8 calibration")
+    if int8 and data is None:
+        raise ValueError("int8 export requires a calibration dataset manifest")
     calibration_snapshot = None
-    if int8:
-        if data is None:
-            raise ValueError("int8 export requires a calibration dataset manifest")
-        calibration_snapshot = snapshot_local_calibration_dataset(data)
-
     weights_snapshot = None
     destination: _PreparedDestination | None = None
     try:
-        destination = _prepare_destination(output, output_suffixes)
-        weights_snapshot = ArtifactSnapshot(weights, weights_sha256, allowed_suffixes={".pt"})
-        calibration_sha256 = (
-            calibration_snapshot.calibration_digest() if calibration_snapshot is not None else None
-        )
-
         from ..common.device import resolve_device
         from ..vision.train import resolve_ultralytics_device
 
@@ -553,6 +673,21 @@ def export_model(
         if export_format == "tensorrt" and resolved_device.kind != "cuda":
             raise RuntimeError("TensorRT export requires an available CUDA device")
         dev = resolve_ultralytics_device(resolved_device)
+        if int8:
+            assert data is not None
+            tensorrt_version, modelopt_version = _preflight_tensorrt_int8(resolved_device.index)
+            calibration_snapshot = snapshot_local_calibration_dataset(
+                data,
+                image_size=imgsz,
+                tensorrt_version=tensorrt_version,
+                modelopt_version=modelopt_version,
+            )
+
+        destination = _prepare_destination(output, output_suffixes)
+        weights_snapshot = ArtifactSnapshot(weights, weights_sha256, allowed_suffixes={".pt"})
+        calibration_sha256 = (
+            calibration_snapshot.sha256 if calibration_snapshot is not None else None
+        )
 
         harden_ultralytics_runtime()
         ultralytics = require("ultralytics", "export")
@@ -570,6 +705,10 @@ def export_model(
             raise ValueError(
                 "end-to-end detector exports are not supported until their output graph "
                 "can be independently inspected"
+            )
+        if int8 and _checkpoint_input_channels(model_graph) != 3:
+            raise ValueError(
+                "TensorRT INT8 calibration is verified only for 3-channel detector checkpoints"
             )
         max_stride = _checkpoint_max_stride(getattr(model_graph, "stride", None))
         if imgsz % max_stride != 0:
@@ -593,9 +732,17 @@ def export_model(
             assert calibration_snapshot is not None
             kwargs["int8"] = True
             kwargs["data"] = str(calibration_snapshot.path)
+            kwargs["batch"] = 1
+            kwargs["fraction"] = 1.0
+            kwargs["rect"] = False
+            kwargs["dynamic"] = False
 
         log.info("exporting verified checkpoint → %s (%s)", export_format, spec.notes)
-        produced_value = model.export(**kwargs)
+        if int8:
+            with deterministic_ultralytics_validation_format():
+                produced_value = model.export(**kwargs)
+        else:
+            produced_value = model.export(**kwargs)
         if not isinstance(produced_value, (str, Path)):
             raise RuntimeError(
                 f"{export_format} exporter returned an invalid artifact path {produced_value!r}"
@@ -632,12 +779,16 @@ def export_model(
             calibration_manifest_sha256=calibration_sha256,
         )
     finally:
-        if weights_snapshot is not None:
-            weights_snapshot.close()
-        if calibration_snapshot is not None:
-            calibration_snapshot.close()
-        if destination is not None:
-            destination.close()
+        try:
+            if weights_snapshot is not None:
+                weights_snapshot.close()
+        finally:
+            try:
+                if calibration_snapshot is not None:
+                    calibration_snapshot.close()
+            finally:
+                if destination is not None:
+                    destination.close()
 
 
 __all__ = ["FormatSpec", "ExportReceipt", "EXPORT_FORMATS", "export_model"]

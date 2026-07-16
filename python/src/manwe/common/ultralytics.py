@@ -6,6 +6,9 @@ import importlib
 import importlib.metadata
 import os
 import sys
+import threading
+from contextlib import contextmanager
+from urllib import parse
 
 _NETWORK_INTEGRATIONS = (
     "sync",
@@ -19,6 +22,7 @@ _NETWORK_INTEGRATIONS = (
     "wandb",
 )
 _VETTED_ULTRALYTICS_VERSION = "8.4.92"
+_FORMAT_PATCH_LOCK = threading.RLock()
 
 
 def _blocked_download(*_args, **_kwargs):
@@ -26,6 +30,82 @@ def _blocked_download(*_args, **_kwargs):
         "Ultralytics network downloads are disabled; provide every dependency and artifact "
         "through the locked environment and verified local paths"
     )
+
+
+def _offline_is_url(url, check: bool = False) -> bool:
+    """Recognize URL syntax without ever probing the network."""
+    try:
+        result = parse.urlparse(str(url))
+    except Exception:
+        return False
+    syntactically_valid = bool(result.scheme and result.netloc)
+    return syntactically_valid and not check
+
+
+def _ignore_dataset_cache(*_args, **_kwargs):
+    """Force the pinned dataset loader down its fresh local-scan path."""
+    raise FileNotFoundError("Ultralytics dataset cache loading is disabled")
+
+
+def _retain_cache_metadata_without_writing(_prefix, _path, payload, version) -> None:
+    """Preserve the loader's in-memory cache contract without creating a pickle file."""
+    payload["version"] = version
+
+
+def _deterministic_format_image(formatter, image):
+    """Match pinned Format._format_img while making validation BGR conversion total."""
+    import numpy as np
+    import torch
+
+    if len(image.shape) < 3:
+        image = image[..., None]
+    image = image.transpose(2, 0, 1)
+    bgr_probability = formatter.bgr
+    if bgr_probability != 0:
+        raise RuntimeError("deterministic calibration formatting requires Ultralytics bgr=0")
+    reverse_channels = image.shape[0] == 3
+    image = np.ascontiguousarray(image[::-1] if reverse_channels else image)
+    return torch.from_numpy(image)
+
+
+@contextmanager
+def deterministic_ultralytics_validation_format():
+    """Temporarily make the pinned validation BGR conversion deterministic."""
+    # Format._format_img is process-global. Holding the re-entrant lock for the
+    # complete export prevents overlapping contexts from restoring out of order.
+    with _FORMAT_PATCH_LOCK:
+        augment = importlib.import_module("ultralytics.data.augment")
+        format_class = augment.Format
+        original = format_class._format_img
+
+        def calibration_format_image(formatter, image):
+            # TensorRT may invoke Python calibrator callbacks from a builder
+            # thread. bgr=0 is the exact audited validation route and has the
+            # same deterministic channel reversal on every calling thread;
+            # unrelated nonzero-BGR formatters retain their original behavior.
+            if formatter.bgr == 0:
+                return _deterministic_format_image(formatter, image)
+            return original(formatter, image)
+
+        format_class._format_img = calibration_format_image
+        try:
+            if (
+                augment.Format is not format_class
+                or format_class._format_img is not calibration_format_image
+            ):
+                raise RuntimeError(
+                    "Ultralytics validation image formatting could not be made deterministic"
+                )
+            yield
+            if (
+                augment.Format is not format_class
+                or format_class._format_img is not calibration_format_image
+            ):
+                raise RuntimeError(
+                    "Ultralytics validation image formatting changed during calibration"
+                )
+        finally:
+            format_class._format_img = original
 
 
 def harden_ultralytics_runtime() -> None:
@@ -56,6 +136,19 @@ def harden_ultralytics_runtime() -> None:
     vars(checks)["ONLINE"] = False
     downloads = importlib.import_module("ultralytics.utils.downloads")
     vars(downloads)["safe_download"] = _blocked_download
+    vars(downloads)["is_url"] = _offline_is_url
+    data_utils = importlib.import_module("ultralytics.data.utils")
+    vars(data_utils)["load_dataset_cache_file"] = _ignore_dataset_cache
+    vars(data_utils)["save_dataset_cache_file"] = _retain_cache_metadata_without_writing
+    data_dataset = importlib.import_module("ultralytics.data.dataset")
+    vars(data_dataset)["load_dataset_cache_file"] = _ignore_dataset_cache
+    vars(data_dataset)["save_dataset_cache_file"] = _retain_cache_metadata_without_writing
+    patches = importlib.import_module("ultralytics.utils.patches")
+    from PIL import Image
+
+    original_image_open = getattr(patches, "_image_open", None)
+    if callable(original_image_open):
+        Image.open = original_image_open
     tasks = importlib.import_module("ultralytics.nn.tasks")
     vars(tasks)["SAFE_LOAD"] = True
     events_module = importlib.import_module("ultralytics.utils.events")
@@ -79,6 +172,12 @@ def verify_ultralytics_policy() -> None:
         )
     utils = importlib.import_module("ultralytics.utils")
     checks = importlib.import_module("ultralytics.utils.checks")
+    downloads = importlib.import_module("ultralytics.utils.downloads")
+    data_utils = importlib.import_module("ultralytics.data.utils")
+    data_dataset = importlib.import_module("ultralytics.data.dataset")
+    patches = importlib.import_module("ultralytics.utils.patches")
+    from PIL import Image
+
     tasks = importlib.import_module("ultralytics.nn.tasks")
     if getattr(utils, "AUTOINSTALL", None) is not False:
         raise RuntimeError("Ultralytics runtime dependency installation could not be disabled")
@@ -86,6 +185,23 @@ def verify_ultralytics_policy() -> None:
         raise RuntimeError("Ultralytics checks retained runtime dependency installation")
     if getattr(utils, "ONLINE", None) is not False or getattr(checks, "ONLINE", None) is not False:
         raise RuntimeError("Ultralytics runtime did not enter offline mode")
+    if (
+        getattr(downloads, "safe_download", None) is not _blocked_download
+        or getattr(downloads, "is_url", None) is not _offline_is_url
+    ):
+        raise RuntimeError("Ultralytics download and network-probe functions remain enabled")
+    if (
+        getattr(data_utils, "load_dataset_cache_file", None) is not _ignore_dataset_cache
+        or getattr(data_dataset, "load_dataset_cache_file", None) is not _ignore_dataset_cache
+        or getattr(data_utils, "save_dataset_cache_file", None)
+        is not _retain_cache_metadata_without_writing
+        or getattr(data_dataset, "save_dataset_cache_file", None)
+        is not _retain_cache_metadata_without_writing
+    ):
+        raise RuntimeError("Ultralytics dataset cache I/O could not be disabled")
+    original_image_open = getattr(patches, "_image_open", None)
+    if not callable(original_image_open) or Image.open is not original_image_open:
+        raise RuntimeError("Ultralytics optional-codec Pillow hook could not be disabled")
     if getattr(tasks, "SAFE_LOAD", None) is not True:
         raise RuntimeError("Ultralytics restricted checkpoint loading could not be enabled")
     safe_loader = getattr(tasks, "_SafeLoad", None)
@@ -103,4 +219,8 @@ def verify_ultralytics_policy() -> None:
         raise RuntimeError("Ultralytics analytics could not be disabled")
 
 
-__all__ = ["harden_ultralytics_runtime", "verify_ultralytics_policy"]
+__all__ = [
+    "deterministic_ultralytics_validation_format",
+    "harden_ultralytics_runtime",
+    "verify_ultralytics_policy",
+]

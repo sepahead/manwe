@@ -65,6 +65,12 @@ This is the first planned tagged alpha after the untagged Rust/Candle prototypes
 - Export contracts now accept only bounded canonical tensor metadata tied to the
   receipt's static image size and class count. Export preflight rejects stride-
   rounded image sizes and unsupported end-to-end heads before artifact creation.
+- TensorRT INT8 export now descriptor-pins the source manifest and dataset tree,
+  validates at least 1,000 unique effective `val` tensors, supplies an exact
+  hash-ranked 512-image private loader view, disables
+  cache/network/optional-codec side channels, binds the audited TensorRT and
+  ModelOpt route, rejects silent FP32 fallback and unbounded ModelOpt work, and
+  rechecks both the source manifest and declared dataset tree before publication.
 - The Metal benchmark harness now reuses the root model implementation, records
   digest-verified no-replace evidence, bounds work, validates the fixed COCO
   schema and every finite output value, and removes incomparable legacy runners.

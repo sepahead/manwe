@@ -6,13 +6,18 @@ import argparse
 import hashlib
 import importlib
 import logging
+import math
 import os
 import shutil
 import sys
+import threading
+from contextlib import nullcontext
+from importlib.util import find_spec
 from types import ModuleType, SimpleNamespace
 
 import numpy as np
 import pytest
+from PIL import Image, PngImagePlugin
 
 from manwe.cli import _cmd_vision_train
 from manwe.common.artifacts import ArtifactSnapshot
@@ -29,6 +34,20 @@ from manwe.vision.postprocess import nms, scale_boxes
 from manwe.vision.predict import Detector
 from manwe.vision.sahi_infer import SliceConfig
 from manwe.vision.train import VisionTrainConfig, train
+
+
+def _write_calibration_png(
+    path,
+    color: tuple[int, int, int],
+    *,
+    metadata: tuple[str, str] | None = None,
+    size: tuple[int, int] = (10, 10),
+) -> None:
+    pnginfo = None
+    if metadata is not None:
+        pnginfo = PngImagePlugin.PngInfo()
+        pnginfo.add_text(*metadata)
+    Image.new("RGB", size, color).save(path, format="PNG", pnginfo=pnginfo)
 
 
 def test_artifact_snapshot_binds_verified_bytes_and_bounds_directory_entries(tmp_path):
@@ -75,6 +94,34 @@ def test_directory_snapshot_enforces_byte_limit_during_copy(tmp_path, monkeypatc
     monkeypatch.setattr(artifacts, "_tree_entries", mutate_after_enumeration)
     with pytest.raises(ValueError, match="byte safety limit"):
         ArtifactSnapshot(bundle, expected, max_bytes=8)
+
+
+def test_descriptor_hashes_preserve_canonical_global_path_order(tmp_path):
+    from manwe.common.artifacts import (
+        sha256_artifact,
+        sha256_artifact_at,
+        sha256_directory_fd,
+    )
+    from manwe.common.config_io import open_directory_nofollow
+
+    bundle = tmp_path / "bundle.mlpackage"
+    (bundle / "a").mkdir(parents=True)
+    (bundle / "a" / "x").write_bytes(b"nested-a")
+    (bundle / "a!").write_bytes(b"prefix-sibling-a")
+    (bundle / "val").mkdir()
+    (bundle / "val" / "x").write_bytes(b"nested-val")
+    (bundle / "val.cache").write_bytes(b"prefix-sibling-val")
+    canonical = sha256_artifact(bundle)
+    root_fd = open_directory_nofollow(bundle, "test bundle")
+    parent_fd = open_directory_nofollow(bundle.parent, "test bundle parent")
+    try:
+        assert sha256_directory_fd(root_fd) == canonical
+        assert sha256_artifact_at(parent_fd, bundle.name) == canonical
+        with ArtifactSnapshot.from_directory_fd(root_fd, canonical) as snapshot:
+            assert snapshot.sha256 == canonical
+    finally:
+        os.close(parent_fd)
+        os.close(root_fd)
 
 
 def test_dataset_manifest_is_local_directive_free_private_snapshot(tmp_path):
@@ -168,6 +215,28 @@ def test_dataset_manifest_rejects_symlinked_path_components_and_special_splits(t
         validate_local_detection_manifest(manifest)
 
 
+def test_dataset_manifest_rejects_parent_directory_components(tmp_path):
+    manifest_parent = tmp_path / "manifests"
+    manifest_parent.mkdir()
+    dataset = tmp_path / "dataset"
+    (dataset / "train").mkdir(parents=True)
+    (dataset / "val").mkdir()
+    manifest = manifest_parent / "data.yaml"
+    manifest.write_text(
+        "path: ../dataset\ntrain: train\nval: val\nnames: [drone]\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="parent-directory components"):
+        validate_local_detection_manifest(manifest)
+
+    manifest.write_text(
+        f"path: {dataset}\ntrain: ../outside\nval: val\nnames: [drone]\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="inside the declared dataset root"):
+        validate_local_detection_manifest(manifest)
+
+
 def test_dataset_manifest_rejects_duplicate_or_nested_splits(tmp_path):
     train = tmp_path / "images"
     (train / "val").mkdir(parents=True)
@@ -182,6 +251,15 @@ def test_dataset_manifest_rejects_duplicate_or_nested_splits(tmp_path):
     with pytest.raises(ValueError, match="paths overlap"):
         validate_local_detection_manifest(manifest)
 
+    separate = tmp_path / "separate"
+    (separate / "nested").mkdir(parents=True)
+    manifest.write_text(
+        "path: .\ntrain: images\nval: [separate, separate/nested]\nnames: [drone]\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="would select files more than once"):
+        validate_local_detection_manifest(manifest)
+
 
 def test_calibration_digest_binds_dataset_content_and_enforces_coverage(tmp_path, monkeypatch):
     from manwe.common import dataset_manifest
@@ -191,7 +269,8 @@ def test_calibration_digest_binds_dataset_content_and_enforces_coverage(tmp_path
     val = root / "val"
     train.mkdir(parents=True)
     val.mkdir()
-    (train / "one.png").write_bytes(b"one")
+    _write_calibration_png(train / "not-calibration.png", (1, 2, 3))
+    _write_calibration_png(val / "one.png", (4, 5, 6))
     manifest = root / "data.yaml"
     manifest.write_text("path: .\ntrain: train\nval: val\nnames: [drone]\n", encoding="utf-8")
     monkeypatch.setattr(dataset_manifest, "_MIN_CALIBRATION_IMAGES", 2)
@@ -200,12 +279,285 @@ def test_calibration_digest_binds_dataset_content_and_enforces_coverage(tmp_path
         with pytest.raises(ValueError, match="at least 2"):
             snapshot.calibration_digest()
         second = val / "two.png"
-        second.write_bytes(b"two")
+        _write_calibration_png(second, (7, 8, 9))
         before = snapshot.calibration_digest()
-        second.write_bytes(b"changed")
+        assert snapshot.calibration_digest(image_size=320) != before
+        assert snapshot.calibration_digest(
+            tensorrt_version="10.1.0"
+        ) != snapshot.calibration_digest(
+            tensorrt_version="11.0.0",
+            modelopt_version="0.44.0",
+        )
+        assert snapshot.calibration_digest(
+            tensorrt_version="11.0.0",
+            modelopt_version="0.44.0",
+        ) != snapshot.calibration_digest(
+            tensorrt_version="11.0.0",
+            modelopt_version="0.45.0",
+        )
+        for rejected_modelopt in ("0.44.0rc5", "0.44.dev1"):
+            with pytest.raises(ValueError, match="nvidia-modelopt>=0.44"):
+                snapshot.calibration_digest(
+                    tensorrt_version="11.0.0",
+                    modelopt_version=rejected_modelopt,
+                )
+        modelopt_bytes_per_pixel = dataset_manifest._BACKEND_CALIBRATION_IMAGES * 3 * 10
+        max_safe_modelopt_image_size = math.isqrt(
+            dataset_manifest._MAX_MODELOPT_CALIBRATION_WORK_BYTES // modelopt_bytes_per_pixel
+        )
+        assert max_safe_modelopt_image_size == 747
+        snapshot.calibration_digest(
+            image_size=max_safe_modelopt_image_size,
+            tensorrt_version="11.0.0",
+            modelopt_version="0.44.0",
+        )
+        with pytest.raises(ValueError, match="peak-work safety limit"):
+            snapshot.calibration_digest(
+                image_size=max_safe_modelopt_image_size + 1,
+                tensorrt_version="11.0.0",
+                modelopt_version="0.44.0",
+            )
+        with pytest.raises(ValueError, match="10.2"):
+            snapshot.calibration_digest(tensorrt_version="10.2.0")
+        with pytest.raises(ValueError, match="newer than the audited"):
+            snapshot.calibration_digest(tensorrt_version="12.0.0")
+        _write_calibration_png(second, (10, 11, 12))
         assert snapshot.calibration_digest() != before
     finally:
         snapshot.close()
+
+
+@pytest.mark.parametrize("payload", [b"", b"not an image", b"\x89PNG\r\n\x1a\n"])
+def test_calibration_rejects_empty_or_corrupt_image_suffix_files(tmp_path, monkeypatch, payload):
+    from manwe.common import dataset_manifest
+
+    root = tmp_path / "dataset"
+    (root / "train").mkdir(parents=True)
+    val = root / "val"
+    val.mkdir()
+    (val / "counterfeit.png").write_bytes(payload)
+    manifest = root / "data.yaml"
+    manifest.write_text("path: .\ntrain: train\nval: val\nnames: [drone]\n", encoding="utf-8")
+    monkeypatch.setattr(dataset_manifest, "_MIN_CALIBRATION_IMAGES", 1)
+
+    with pytest.raises(ValueError, match="empty|invalid|cannot identify"):
+        snapshot_local_calibration_dataset(manifest)
+
+
+def test_calibration_rejects_suffix_content_mismatch_and_duplicate_pixels(tmp_path, monkeypatch):
+    from manwe.common import dataset_manifest
+
+    root = tmp_path / "dataset"
+    (root / "train").mkdir(parents=True)
+    val = root / "val"
+    val.mkdir()
+    first = val / "first.png"
+    second = val / "second.png"
+    _write_calibration_png(first, (1, 2, 3), metadata=("encoding", "one"))
+    _write_calibration_png(second, (1, 2, 3), metadata=("encoding", "two"))
+    assert first.read_bytes() != second.read_bytes()
+    manifest = root / "data.yaml"
+    manifest.write_text("path: .\ntrain: train\nval: val\nnames: [drone]\n", encoding="utf-8")
+    monkeypatch.setattr(dataset_manifest, "_MIN_CALIBRATION_IMAGES", 2)
+
+    with pytest.raises(ValueError, match="unique backend tensors"):
+        snapshot_local_calibration_dataset(manifest)
+
+    second.unlink()
+    counterfeit = val / "counterfeit.jpg"
+    counterfeit.write_bytes(first.read_bytes())
+    monkeypatch.setattr(dataset_manifest, "_MIN_CALIBRATION_IMAGES", 1)
+    with pytest.raises(ValueError, match="suffix/content mismatch"):
+        snapshot_local_calibration_dataset(manifest)
+
+
+def test_calibration_rejects_nonidentity_exif_orientation(tmp_path, monkeypatch):
+    from manwe.common import dataset_manifest
+
+    root = tmp_path / "dataset"
+    (root / "train").mkdir(parents=True)
+    val = root / "val"
+    val.mkdir()
+    image = Image.new("RGB", (20, 10), (1, 2, 3))
+    exif = Image.Exif()
+    exif[274] = 6
+    image.save(val / "rotated.jpg", format="JPEG", exif=exif)
+    manifest = root / "data.yaml"
+    manifest.write_text("path: .\ntrain: train\nval: val\nnames: [drone]\n", encoding="utf-8")
+    monkeypatch.setattr(dataset_manifest, "_MIN_CALIBRATION_IMAGES", 1)
+
+    with pytest.raises(ValueError, match="identity EXIF orientation"):
+        snapshot_local_calibration_dataset(manifest, image_size=32)
+
+
+def test_calibration_rejects_truncated_jpeg(tmp_path, monkeypatch):
+    from manwe.common import dataset_manifest
+
+    root = tmp_path / "dataset"
+    (root / "train").mkdir(parents=True)
+    val = root / "val"
+    val.mkdir()
+    image = val / "truncated.jpg"
+    Image.new("RGB", (20, 10), (1, 2, 3)).save(image, format="JPEG")
+    image.write_bytes(image.read_bytes()[:-2])
+    manifest = root / "data.yaml"
+    manifest.write_text("path: .\ntrain: train\nval: val\nnames: [drone]\n", encoding="utf-8")
+    monkeypatch.setattr(dataset_manifest, "_MIN_CALIBRATION_IMAGES", 1)
+
+    with pytest.raises(ValueError, match="truncated|EOI|invalid"):
+        snapshot_local_calibration_dataset(manifest, image_size=32)
+
+
+@pytest.mark.parametrize(
+    ("suffix", "image_format"),
+    ((".webp", "WEBP"), (".tiff", "TIFF")),
+)
+def test_calibration_rejects_animated_or_multiframe_images(
+    tmp_path,
+    monkeypatch,
+    suffix,
+    image_format,
+):
+    from manwe.common import dataset_manifest
+
+    root = tmp_path / "dataset"
+    (root / "train").mkdir(parents=True)
+    val = root / "val"
+    val.mkdir()
+    first = Image.new("RGB", (20, 10), (255, 0, 0))
+    second = Image.new("RGB", (20, 10), (0, 0, 255))
+    format_options = {"lossless": True, "loop": 0} if image_format == "WEBP" else {}
+    first.save(
+        val / f"multiple{suffix}",
+        format=image_format,
+        save_all=True,
+        append_images=[second],
+        duration=100,
+        **format_options,
+    )
+    manifest = root / "data.yaml"
+    manifest.write_text("path: .\ntrain: train\nval: val\nnames: [drone]\n", encoding="utf-8")
+    monkeypatch.setattr(dataset_manifest, "_MIN_CALIBRATION_IMAGES", 1)
+
+    with pytest.raises(ValueError, match="animated or multi-frame"):
+        snapshot_local_calibration_dataset(manifest, image_size=32)
+
+
+def test_calibration_rejects_distinct_sources_that_preprocess_identically(tmp_path, monkeypatch):
+    from manwe.common import dataset_manifest
+
+    root = tmp_path / "dataset"
+    (root / "train").mkdir(parents=True)
+    val = root / "val"
+    val.mkdir()
+    _write_calibration_png(val / "small.png", (1, 2, 3), size=(20, 20))
+    _write_calibration_png(val / "large.png", (1, 2, 3), size=(30, 30))
+    manifest = root / "data.yaml"
+    manifest.write_text("path: .\ntrain: train\nval: val\nnames: [drone]\n", encoding="utf-8")
+    monkeypatch.setattr(dataset_manifest, "_MIN_CALIBRATION_IMAGES", 2)
+
+    with pytest.raises(ValueError, match="unique backend tensors"):
+        snapshot_local_calibration_dataset(manifest, image_size=32)
+
+
+def test_calibration_encoded_work_limit_fails_before_decoding(tmp_path, monkeypatch):
+    from manwe.common import dataset_manifest
+
+    root = tmp_path / "dataset"
+    (root / "train").mkdir(parents=True)
+    val = root / "val"
+    val.mkdir()
+    _write_calibration_png(val / "one.png", (1, 2, 3))
+    _write_calibration_png(val / "two.png", (4, 5, 6))
+    manifest = root / "data.yaml"
+    manifest.write_text("path: .\ntrain: train\nval: val\nnames: [drone]\n", encoding="utf-8")
+    monkeypatch.setattr(dataset_manifest, "_MIN_CALIBRATION_IMAGES", 1)
+    monkeypatch.setattr(dataset_manifest, "_MAX_CALIBRATION_ENCODED_BYTES", 1)
+    monkeypatch.setattr(
+        dataset_manifest,
+        "_validate_calibration_image",
+        lambda *_args, **_kwargs: pytest.fail("encoded-byte bound must run before decoding"),
+    )
+
+    with pytest.raises(ValueError, match="encoded-work safety limit"):
+        snapshot_local_calibration_dataset(manifest, image_size=32)
+
+
+def test_calibration_source_tree_limit_fails_before_image_decoding(tmp_path, monkeypatch):
+    from manwe.common import dataset_manifest
+
+    root = tmp_path / "dataset"
+    (root / "train").mkdir(parents=True)
+    val = root / "val"
+    val.mkdir()
+    _write_calibration_png(val / "one.png", (1, 2, 3))
+    manifest = root / "data.yaml"
+    manifest.write_text("path: .\ntrain: train\nval: val\nnames: [drone]\n", encoding="utf-8")
+    monkeypatch.setattr(dataset_manifest, "_MIN_CALIBRATION_IMAGES", 1)
+    monkeypatch.setattr(dataset_manifest, "_MAX_DATASET_BYTES", 1)
+    monkeypatch.setattr(
+        dataset_manifest,
+        "_calibration_inventory",
+        lambda *_args, **_kwargs: pytest.fail("tree bound must run before image decoding"),
+    )
+
+    with pytest.raises(ValueError, match="calibration dataset exceeds"):
+        snapshot_local_calibration_dataset(manifest, image_size=32)
+
+
+def test_calibration_rejects_unknown_process_wide_pillow_hook(tmp_path, monkeypatch):
+    from manwe.common import dataset_manifest
+
+    root = tmp_path / "dataset"
+    (root / "train").mkdir(parents=True)
+    val = root / "val"
+    val.mkdir()
+    _write_calibration_png(val / "one.png", (1, 2, 3))
+    manifest = root / "data.yaml"
+    manifest.write_text("path: .\ntrain: train\nval: val\nnames: [drone]\n", encoding="utf-8")
+    monkeypatch.setattr(dataset_manifest, "_MIN_CALIBRATION_IMAGES", 1)
+
+    def untrusted_open(*_args, **_kwargs):
+        raise AssertionError("untrusted Pillow hook must not execute")
+
+    monkeypatch.setattr(Image, "open", untrusted_open)
+    with pytest.raises(RuntimeError, match="untrusted runtime hook"):
+        snapshot_local_calibration_dataset(manifest, image_size=32)
+
+
+@pytest.mark.parametrize(("mode", "color"), [("L", 1), ("RGBA", (1, 2, 3, 4))])
+def test_calibration_rejects_tiff_channel_mismatch(tmp_path, monkeypatch, mode, color):
+    from manwe.common import dataset_manifest
+
+    root = tmp_path / "dataset"
+    (root / "train").mkdir(parents=True)
+    val = root / "val"
+    val.mkdir()
+    Image.new(mode, (10, 10), color).save(val / "mismatch.tiff", format="TIFF")
+    manifest = root / "data.yaml"
+    manifest.write_text("path: .\ntrain: train\nval: val\nnames: [drone]\n", encoding="utf-8")
+    monkeypatch.setattr(dataset_manifest, "_MIN_CALIBRATION_IMAGES", 1)
+
+    with pytest.raises(ValueError, match="HxWx3 uint8"):
+        snapshot_local_calibration_dataset(manifest, image_size=32)
+
+
+def test_calibration_rejects_manifest_grayscale_preprocessing(tmp_path, monkeypatch):
+    from manwe.common import dataset_manifest
+
+    root = tmp_path / "dataset"
+    (root / "train").mkdir(parents=True)
+    (root / "val").mkdir()
+    _write_calibration_png(root / "val" / "one.png", (1, 2, 3))
+    manifest = root / "data.yaml"
+    manifest.write_text(
+        "path: .\ntrain: train\nval: val\nchannels: 1\nnames: [drone]\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(dataset_manifest, "_MIN_CALIBRATION_IMAGES", 1)
+
+    with pytest.raises(ValueError, match="default to 3 channels"):
+        snapshot_local_calibration_dataset(manifest, image_size=32)
 
 
 def test_calibration_snapshot_is_private_read_only_and_source_bound(tmp_path, monkeypatch):
@@ -218,32 +570,173 @@ def test_calibration_snapshot_is_private_read_only_and_source_bound(tmp_path, mo
     val.mkdir()
     first = train / "one.png"
     second = val / "two.png"
-    first.write_bytes(b"one")
-    second.write_bytes(b"two")
+    third = val / "three.png"
+    _write_calibration_png(first, (1, 2, 3))
+    _write_calibration_png(second, (4, 5, 6))
+    _write_calibration_png(third, (7, 8, 9))
     manifest = root / "data.yaml"
     manifest.write_text("path: .\ntrain: train\nval: val\nnames: [drone]\n", encoding="utf-8")
     monkeypatch.setattr(dataset_manifest, "_MIN_CALIBRATION_IMAGES", 2)
 
     snapshot = snapshot_local_calibration_dataset(manifest)
     private_root = snapshot.root
+    loader_root = snapshot.loader_root
     private_manifest = snapshot.path
     try:
         assert private_root != root
-        assert str(private_root) in private_manifest.read_text(encoding="utf-8")
+        assert loader_root != private_root
+        assert str(loader_root) in private_manifest.read_text(encoding="utf-8")
         assert (private_root.stat().st_mode & 0o222) == 0
         assert ((private_root / "train" / "one.png").stat().st_mode & 0o222) == 0
-        assert (private_root / "train" / "one.png").read_bytes() == b"one"
+        assert (private_root / "train" / "one.png").read_bytes() == first.read_bytes()
+        loader_images = sorted((loader_root / "calibration-images").iterdir())
+        assert len(loader_images) == 2
+        assert {image.read_bytes() for image in loader_images} == {
+            second.read_bytes(),
+            third.read_bytes(),
+        }
+        assert not list(loader_root.rglob("*.txt"))
+        assert not list(loader_root.rglob("*.cache"))
         bound_digest = snapshot.calibration_digest()
 
-        first.write_bytes(b"mutated")
-        assert (private_root / "train" / "one.png").read_bytes() == b"one"
+        _write_calibration_png(first, (10, 11, 12))
+        assert (private_root / "train" / "one.png").read_bytes() != first.read_bytes()
         assert snapshot.calibration_digest() == bound_digest == snapshot.sha256
         with pytest.raises(RuntimeError, match="source calibration dataset changed"):
             snapshot.assert_source_unchanged()
     finally:
         snapshot.close()
     assert not private_root.exists()
+    assert not loader_root.exists()
     assert not private_manifest.exists()
+
+
+def test_calibration_close_releases_all_resources_after_cleanup_error(tmp_path, monkeypatch):
+    from manwe.common import dataset_manifest
+
+    (tmp_path / "train").mkdir()
+    (tmp_path / "val").mkdir()
+    _write_calibration_png(tmp_path / "val" / "one.png", (1, 2, 3))
+    manifest = tmp_path / "data.yaml"
+    manifest.write_text("path: .\ntrain: train\nval: val\nnames: [drone]\n", encoding="utf-8")
+    monkeypatch.setattr(dataset_manifest, "_MIN_CALIBRATION_IMAGES", 1)
+    snapshot = snapshot_local_calibration_dataset(manifest)
+    released: list[str] = []
+    real_loader_close = snapshot._loader_snapshot.close
+    real_artifact_close = snapshot._artifact_snapshot.close
+    real_root_close = snapshot._source_root.close
+    real_manifest_close = snapshot._source_manifest.close
+
+    def fail_loader_close():
+        released.append("loader")
+        real_loader_close()
+        raise OSError("injected loader cleanup failure")
+
+    def close_artifact():
+        released.append("artifact")
+        real_artifact_close()
+
+    def close_root():
+        released.append("root")
+        real_root_close()
+
+    def close_manifest():
+        released.append("manifest")
+        real_manifest_close()
+
+    monkeypatch.setattr(snapshot._loader_snapshot, "close", fail_loader_close)
+    monkeypatch.setattr(snapshot._artifact_snapshot, "close", close_artifact)
+    monkeypatch.setattr(snapshot._source_root, "close", close_root)
+    monkeypatch.setattr(snapshot._source_manifest, "close", close_manifest)
+
+    with pytest.raises(OSError, match="loader cleanup failure"):
+        snapshot.close()
+    assert released == ["loader", "artifact", "root", "manifest"]
+    assert snapshot._closed
+
+
+def test_calibration_loader_constructor_closes_fd_when_fdopen_fails(tmp_path, monkeypatch):
+    from manwe.common import dataset_manifest
+
+    opened: list[int] = []
+
+    def fail_fdopen(fd, *_args, **_kwargs):
+        opened.append(fd)
+        raise OSError("injected fdopen failure")
+
+    monkeypatch.setattr(dataset_manifest.os, "fdopen", fail_fdopen)
+    with pytest.raises(OSError, match="fdopen failure"):
+        dataset_manifest._CalibrationLoaderSnapshot(
+            {"names": ["drone"], "nc": 1},
+            tmp_path,
+            (),
+        )
+    assert len(opened) == 1
+    with pytest.raises(OSError):
+        os.fstat(opened[0])
+
+
+def test_manifest_snapshot_constructor_closes_fd_when_fdopen_fails(tmp_path, monkeypatch):
+    from manwe.common import dataset_manifest
+
+    class SourceBinding:
+        closed = False
+
+        def close(self):
+            self.closed = True
+
+    source_manifest = SourceBinding()
+    source_root = SourceBinding()
+    opened: list[int] = []
+
+    def fail_fdopen(fd, *_args, **_kwargs):
+        opened.append(fd)
+        raise OSError("injected fdopen failure")
+
+    monkeypatch.setattr(dataset_manifest.os, "fdopen", fail_fdopen)
+    with pytest.raises(OSError, match="fdopen failure"):
+        dataset_manifest.DatasetManifestSnapshot(
+            {"path": str(tmp_path)},
+            source_manifest,
+            source_root,
+        )
+    assert len(opened) == 1
+    with pytest.raises(OSError):
+        os.fstat(opened[0])
+    assert source_root.closed
+    assert source_manifest.closed
+
+
+def test_calibration_backend_view_uses_fixed_hash_ranked_subset(tmp_path, monkeypatch):
+    import yaml
+
+    from manwe.common import dataset_manifest
+
+    root = tmp_path / "dataset"
+    (root / "train").mkdir(parents=True)
+    val = root / "val"
+    val.mkdir()
+    for index, color in enumerate(((1, 2, 3), (4, 5, 6), (7, 8, 9))):
+        _write_calibration_png(val / f"{index}.png", color)
+    manifest = root / "data.yaml"
+    manifest.write_text("path: .\ntrain: train\nval: val\nnames: [drone]\n", encoding="utf-8")
+    monkeypatch.setattr(dataset_manifest, "_MIN_CALIBRATION_IMAGES", 3)
+    monkeypatch.setattr(dataset_manifest, "_BACKEND_CALIBRATION_IMAGES", 2)
+
+    validated = validate_local_detection_manifest(manifest)
+    try:
+        _digest, _content_digest, all_images = validated._calibration_digests(640)
+    finally:
+        validated.close()
+    expected_hashes = tuple(
+        image.tensor_sha256
+        for image in sorted(all_images, key=lambda image: image.tensor_sha256)[:2]
+    )
+
+    with snapshot_local_calibration_dataset(manifest) as snapshot:
+        payload = yaml.safe_load(snapshot.path.read_text(encoding="utf-8"))
+        assert len(list((snapshot.loader_root / payload["val"]).iterdir())) == 2
+        assert tuple(image.tensor_sha256 for image in snapshot._images) == expected_hashes
 
 
 def test_calibration_snapshot_rejects_source_root_replacement(tmp_path, monkeypatch):
@@ -252,8 +745,9 @@ def test_calibration_snapshot_rejects_source_root_replacement(tmp_path, monkeypa
     root = tmp_path / "dataset"
     (root / "train").mkdir(parents=True)
     (root / "val").mkdir()
-    (root / "train" / "one.png").write_bytes(b"one")
-    (root / "val" / "two.png").write_bytes(b"two")
+    _write_calibration_png(root / "train" / "one.png", (1, 2, 3))
+    _write_calibration_png(root / "val" / "two.png", (4, 5, 6))
+    _write_calibration_png(root / "val" / "three.png", (7, 8, 9))
     manifest = root / "data.yaml"
     manifest.write_text("path: .\ntrain: train\nval: val\nnames: [drone]\n", encoding="utf-8")
     monkeypatch.setattr(dataset_manifest, "_MIN_CALIBRATION_IMAGES", 2)
@@ -267,6 +761,435 @@ def test_calibration_snapshot_rejects_source_root_replacement(tmp_path, monkeypa
             snapshot.assert_source_unchanged()
     finally:
         snapshot.close()
+
+
+@pytest.mark.parametrize("source_change", ["content", "replacement"])
+def test_calibration_snapshot_detects_external_manifest_change(
+    tmp_path, monkeypatch, source_change
+):
+    from manwe.common import dataset_manifest
+
+    root = tmp_path / "dataset"
+    (root / "train").mkdir(parents=True)
+    (root / "val").mkdir()
+    _write_calibration_png(root / "val" / "one.png", (1, 2, 3))
+    manifest = tmp_path / "data.yaml"
+    manifest.write_text(
+        "path: dataset\ntrain: train\nval: val\nnames: [drone]\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(dataset_manifest, "_MIN_CALIBRATION_IMAGES", 1)
+
+    snapshot = snapshot_local_calibration_dataset(manifest)
+    try:
+        original = manifest.read_bytes()
+        if source_change == "content":
+            manifest.write_bytes(original + b"# changed after snapshot\n")
+        else:
+            manifest.unlink()
+            manifest.write_bytes(original)
+        with pytest.raises(RuntimeError, match="source calibration manifest changed"):
+            snapshot.assert_source_unchanged()
+    finally:
+        snapshot.close()
+
+
+def test_manifest_binding_rechecks_visible_leaf_after_descriptor_read(tmp_path, monkeypatch):
+    from manwe.common import dataset_manifest
+
+    manifest = tmp_path / "data.yaml"
+    manifest.write_text("trusted", encoding="utf-8")
+    attacker = tmp_path / "attacker.yaml"
+    attacker.write_text("attacker", encoding="utf-8")
+    parked = tmp_path / "parked.yaml"
+    binding = dataset_manifest._BoundSourceManifest(manifest)
+    original_read = dataset_manifest._read_regular_utf8_at
+    replaced = False
+
+    def replace_leaf_after_read(*args, **kwargs):
+        nonlocal replaced
+        result = original_read(*args, **kwargs)
+        if not replaced:
+            manifest.rename(parked)
+            attacker.rename(manifest)
+            replaced = True
+        return result
+
+    monkeypatch.setattr(dataset_manifest, "_read_regular_utf8_at", replace_leaf_after_read)
+    try:
+        with pytest.raises(ValueError, match="manifest path was replaced"):
+            binding.assert_unchanged()
+    finally:
+        binding.close()
+
+
+def test_calibration_clone_failure_closes_previously_cloned_root(tmp_path, monkeypatch):
+    from manwe.common import dataset_manifest
+
+    (tmp_path / "train").mkdir()
+    (tmp_path / "val").mkdir()
+    manifest = tmp_path / "data.yaml"
+    manifest.write_text("path: .\ntrain: train\nval: val\nnames: [drone]\n", encoding="utf-8")
+    validated = validate_local_detection_manifest(manifest)
+
+    class FakeRootBinding:
+        closed = False
+
+        def close(self):
+            self.closed = True
+
+    cloned_root = FakeRootBinding()
+    monkeypatch.setattr(validated._source_root, "clone", lambda: cloned_root)
+
+    def fail_manifest_clone():
+        raise OSError("injected descriptor duplication failure")
+
+    monkeypatch.setattr(validated._source_manifest, "clone", fail_manifest_clone)
+    try:
+        with pytest.raises(OSError, match="descriptor duplication failure"):
+            dataset_manifest.CalibrationDatasetSnapshot(validated, 640, None, None)
+        assert cloned_root.closed
+    finally:
+        validated.close()
+
+
+def test_calibration_manifest_read_is_bound_to_original_parent_descriptor(tmp_path, monkeypatch):
+    from manwe.common import dataset_manifest
+
+    visible = tmp_path / "visible"
+    trusted = visible / "dataset"
+    (trusted / "train").mkdir(parents=True)
+    (trusted / "val").mkdir()
+    _write_calibration_png(trusted / "val" / "trusted.png", (1, 2, 3))
+    manifest = visible / "data.yaml"
+    manifest.write_text(
+        "path: dataset\ntrain: train\nval: val\nnames: [trusted]\n",
+        encoding="utf-8",
+    )
+
+    attacker_parent = tmp_path / "attacker"
+    attacker = attacker_parent / "dataset"
+    (attacker / "train").mkdir(parents=True)
+    (attacker / "val").mkdir()
+    _write_calibration_png(attacker / "val" / "attacker.png", (9, 8, 7))
+    (attacker_parent / "data.yaml").write_text(
+        "path: dataset\ntrain: train\nval: val\nnames: [attacker]\n",
+        encoding="utf-8",
+    )
+    parked = tmp_path / "parked"
+    original_read = dataset_manifest._read_regular_utf8_at
+
+    def swap_ancestor_during_read(*args, **kwargs):
+        visible.rename(parked)
+        attacker_parent.rename(visible)
+        try:
+            return original_read(*args, **kwargs)
+        finally:
+            visible.rename(attacker_parent)
+            parked.rename(visible)
+
+    monkeypatch.setattr(dataset_manifest, "_read_regular_utf8_at", swap_ancestor_during_read)
+    monkeypatch.setattr(dataset_manifest, "_MIN_CALIBRATION_IMAGES", 1)
+
+    with snapshot_local_calibration_dataset(manifest) as snapshot:
+        assert snapshot._images[0].relative_path == (trusted / "val" / "trusted.png").relative_to(
+            trusted
+        )
+        private_images = list((snapshot.loader_root / "calibration-images").iterdir())
+        assert [image.read_bytes() for image in private_images] == [
+            (trusted / "val" / "trusted.png").read_bytes()
+        ]
+
+
+def test_calibration_tree_copy_ignores_transient_ancestor_replacement(tmp_path, monkeypatch):
+    from manwe.common import artifacts, dataset_manifest
+
+    visible = tmp_path / "visible"
+    (visible / "train").mkdir(parents=True)
+    (visible / "val").mkdir()
+    trusted_image = visible / "val" / "trusted.png"
+    _write_calibration_png(trusted_image, (1, 2, 3))
+    manifest = visible / "data.yaml"
+    manifest.write_text(
+        "path: .\ntrain: train\nval: val\nnames: [trusted]\n",
+        encoding="utf-8",
+    )
+
+    attacker = tmp_path / "attacker"
+    (attacker / "train").mkdir(parents=True)
+    (attacker / "val").mkdir()
+    _write_calibration_png(attacker / "val" / "attacker.png", (9, 8, 7))
+    (attacker / "data.yaml").write_text(
+        "path: .\ntrain: train\nval: val\nnames: [attacker]\n",
+        encoding="utf-8",
+    )
+    parked = tmp_path / "parked"
+    original_snapshot = artifacts.ArtifactSnapshot.from_directory_fd.__func__
+
+    def swap_ancestor_during_copy(cls, *args, **kwargs):
+        visible.rename(parked)
+        attacker.rename(visible)
+        try:
+            return original_snapshot(cls, *args, **kwargs)
+        finally:
+            visible.rename(attacker)
+            parked.rename(visible)
+
+    monkeypatch.setattr(
+        artifacts.ArtifactSnapshot,
+        "from_directory_fd",
+        classmethod(swap_ancestor_during_copy),
+    )
+    monkeypatch.setattr(dataset_manifest, "_MIN_CALIBRATION_IMAGES", 1)
+
+    with snapshot_local_calibration_dataset(manifest) as snapshot:
+        private_images = list((snapshot.loader_root / "calibration-images").iterdir())
+        assert [image.read_bytes() for image in private_images] == [trusted_image.read_bytes()]
+        snapshot.assert_source_unchanged()
+
+
+def test_calibration_snapshot_detects_source_parent_replacement(tmp_path, monkeypatch):
+    from manwe.common import dataset_manifest
+
+    visible = tmp_path / "visible"
+    (visible / "train").mkdir(parents=True)
+    (visible / "val").mkdir()
+    _write_calibration_png(visible / "val" / "trusted.png", (1, 2, 3))
+    manifest = visible / "data.yaml"
+    manifest.write_text(
+        "path: .\ntrain: train\nval: val\nnames: [trusted]\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(dataset_manifest, "_MIN_CALIBRATION_IMAGES", 1)
+
+    snapshot = snapshot_local_calibration_dataset(manifest)
+    original = tmp_path / "original"
+    visible.rename(original)
+    shutil.copytree(original, visible)
+    try:
+        with pytest.raises(RuntimeError, match="root was replaced"):
+            snapshot.assert_source_unchanged()
+    finally:
+        snapshot.close()
+
+
+def test_calibration_source_check_brackets_retained_tree_digest(tmp_path, monkeypatch):
+    from manwe.common import dataset_manifest
+
+    root = tmp_path / "dataset"
+    (root / "train").mkdir(parents=True)
+    (root / "val").mkdir()
+    _write_calibration_png(root / "val" / "trusted.png", (1, 2, 3))
+    manifest = root / "data.yaml"
+    manifest.write_text("path: .\ntrain: train\nval: val\nnames: [trusted]\n", encoding="utf-8")
+    monkeypatch.setattr(dataset_manifest, "_MIN_CALIBRATION_IMAGES", 1)
+    snapshot = snapshot_local_calibration_dataset(manifest)
+
+    attacker = tmp_path / "attacker"
+    (attacker / "train").mkdir(parents=True)
+    (attacker / "val").mkdir()
+    _write_calibration_png(attacker / "val" / "attacker.png", (9, 8, 7))
+    (attacker / "data.yaml").write_text(
+        "path: .\ntrain: train\nval: val\nnames: [attacker]\n",
+        encoding="utf-8",
+    )
+    parked = tmp_path / "parked"
+    original_digest = snapshot._source_root.digest
+
+    def replace_visible_root_after_digest():
+        digest = original_digest()
+        root.rename(parked)
+        attacker.rename(root)
+        return digest
+
+    monkeypatch.setattr(snapshot._source_root, "digest", replace_visible_root_after_digest)
+    try:
+        with pytest.raises(RuntimeError, match="root was replaced"):
+            snapshot.assert_source_unchanged()
+    finally:
+        snapshot.close()
+
+
+def test_calibration_snapshot_detects_backend_view_mutation(tmp_path, monkeypatch):
+    from manwe.common import dataset_manifest
+
+    root = tmp_path / "dataset"
+    (root / "train").mkdir(parents=True)
+    (root / "val").mkdir()
+    _write_calibration_png(root / "val" / "one.png", (1, 2, 3))
+    manifest = root / "data.yaml"
+    manifest.write_text("path: .\ntrain: train\nval: val\nnames: [drone]\n", encoding="utf-8")
+    monkeypatch.setattr(dataset_manifest, "_MIN_CALIBRATION_IMAGES", 1)
+
+    snapshot = snapshot_local_calibration_dataset(manifest)
+    try:
+        snapshot.loader_root.chmod(0o700)
+        (snapshot.loader_root / "labels.cache").write_bytes(b"backend mutation")
+        with pytest.raises(RuntimeError, match="loader root changed|loader inventory changed"):
+            snapshot.calibration_digest()
+    finally:
+        snapshot.close()
+
+
+@pytest.mark.heavy
+def test_calibration_private_view_matches_actual_pinned_loader(tmp_path, monkeypatch):
+    if find_spec("torch") is None or find_spec("ultralytics") is None:
+        pytest.skip("requires the locked vision/export runtime")
+    from manwe.common import dataset_manifest
+    from manwe.common.ultralytics import (
+        deterministic_ultralytics_validation_format,
+        harden_ultralytics_runtime,
+        verify_ultralytics_policy,
+    )
+
+    root = tmp_path / "dataset"
+    (root / "train").mkdir(parents=True)
+    val = root / "val"
+    val.mkdir()
+    for index, color in enumerate(((1, 2, 3), (4, 5, 6), (7, 8, 9))):
+        _write_calibration_png(val / f"{index}.png", color, size=(17 + index, 19 + index))
+    (root / "val.cache").write_bytes(b"untrusted source cache")
+    (val / "0.txt").write_text("malformed label excluded from curated view\n", encoding="utf-8")
+    (val / "0.npy").write_bytes(b"untrusted adjacent array")
+    manifest = root / "data.yaml"
+    manifest.write_text("path: .\ntrain: train\nval: val\nnames: [drone]\n", encoding="utf-8")
+    monkeypatch.setattr(dataset_manifest, "_MIN_CALIBRATION_IMAGES", 3)
+    monkeypatch.setattr(dataset_manifest, "_BACKEND_CALIBRATION_IMAGES", 3)
+
+    harden_ultralytics_runtime()
+    from ultralytics.cfg import DEFAULT_CFG, get_cfg
+    from ultralytics.data import build_dataloader, build_yolo_dataset
+    from ultralytics.data.utils import check_det_dataset
+
+    verify_ultralytics_policy()
+
+    def reject_array_or_pickle_cache(*_args, **_kwargs):
+        raise AssertionError("the curated loader must never call numpy.load")
+
+    monkeypatch.setattr(np, "load", reject_array_or_pickle_cache)
+    with snapshot_local_calibration_dataset(manifest, image_size=32) as snapshot:
+        assert not list(snapshot.loader_root.rglob("*.cache"))
+        assert not list(snapshot.loader_root.rglob("*.txt"))
+        assert not list(snapshot.loader_root.rglob("*.npy"))
+        with deterministic_ultralytics_validation_format():
+            data = check_det_dataset(str(snapshot.path))
+            cfg = get_cfg(
+                DEFAULT_CFG,
+                {
+                    "imgsz": 32,
+                    "batch": 1,
+                    "task": "detect",
+                    "rect": False,
+                    "cache": False,
+                    "fraction": 1.0,
+                },
+            )
+            dataset = build_yolo_dataset(
+                cfg,
+                data["val"],
+                1,
+                data,
+                mode="val",
+                fraction=1.0,
+            )
+            loader = build_dataloader(dataset, batch=1, workers=0, drop_last=True)
+            actual_hashes = set()
+            for batch in loader:
+                tensor = batch["img"].numpy()[0]
+                hasher = hashlib.sha256(b"manwe-ultralytics-8.4.92-calibration-tensor-v1\0")
+                hasher.update((32).to_bytes(8, "big"))
+                hasher.update(tensor.tobytes())
+                actual_hashes.add(hasher.hexdigest())
+
+        assert actual_hashes == {image.tensor_sha256 for image in snapshot._images}
+        assert not list(snapshot.loader_root.rglob("*.cache"))
+        snapshot.calibration_digest()
+
+
+@pytest.mark.parametrize(
+    ("suffix", "image_format", "mode"),
+    (
+        (".jpg", "JPEG", "RGB"),
+        (".bmp", "BMP", "RGB"),
+        (".webp", "WEBP", "RGB"),
+        (".tiff", "TIFF", "RGB"),
+        (".png", "PNG", "P"),
+        (".png", "PNG", "RGBA"),
+    ),
+)
+@pytest.mark.heavy
+def test_calibration_supported_formats_match_actual_pinned_loader(
+    tmp_path,
+    monkeypatch,
+    suffix,
+    image_format,
+    mode,
+):
+    if find_spec("torch") is None or find_spec("ultralytics") is None:
+        pytest.skip("requires the locked vision/export runtime")
+    from manwe.common import dataset_manifest
+    from manwe.common.ultralytics import (
+        deterministic_ultralytics_validation_format,
+        harden_ultralytics_runtime,
+        verify_ultralytics_policy,
+    )
+
+    root = tmp_path / "dataset"
+    (root / "train").mkdir(parents=True)
+    val = root / "val"
+    val.mkdir()
+    if mode == "P":
+        image = Image.new(mode, (19, 17), 1)
+        palette = [0] * 768
+        palette[3:6] = [1, 2, 3]
+        image.putpalette(palette)
+    elif mode == "RGBA":
+        image = Image.new(mode, (19, 17), (1, 2, 3, 127))
+    else:
+        image = Image.new(mode, (19, 17), (1, 2, 3))
+    image.save(val / f"one{suffix}", format=image_format)
+    manifest = root / "data.yaml"
+    manifest.write_text("path: .\ntrain: train\nval: val\nnames: [drone]\n", encoding="utf-8")
+    monkeypatch.setattr(dataset_manifest, "_MIN_CALIBRATION_IMAGES", 1)
+    monkeypatch.setattr(dataset_manifest, "_BACKEND_CALIBRATION_IMAGES", 1)
+
+    harden_ultralytics_runtime()
+    from ultralytics.cfg import DEFAULT_CFG, get_cfg
+    from ultralytics.data import build_dataloader, build_yolo_dataset
+    from ultralytics.data.utils import check_det_dataset
+
+    verify_ultralytics_policy()
+    with snapshot_local_calibration_dataset(manifest, image_size=32) as snapshot:
+        with deterministic_ultralytics_validation_format():
+            data = check_det_dataset(str(snapshot.path))
+            cfg = get_cfg(
+                DEFAULT_CFG,
+                {
+                    "imgsz": 32,
+                    "batch": 1,
+                    "task": "detect",
+                    "rect": False,
+                    "cache": False,
+                    "fraction": 1.0,
+                },
+            )
+            dataset = build_yolo_dataset(
+                cfg,
+                data["val"],
+                1,
+                data,
+                mode="val",
+                fraction=1.0,
+            )
+            loader = build_dataloader(dataset, batch=1, workers=0, drop_last=True)
+            batch = next(iter(loader))
+            tensor = batch["img"].numpy()[0]
+
+        hasher = hashlib.sha256(b"manwe-ultralytics-8.4.92-calibration-tensor-v1\0")
+        hasher.update((32).to_bytes(8, "big"))
+        hasher.update(tensor.tobytes())
+        assert hasher.hexdigest() == snapshot._images[0].tensor_sha256
+        assert not list(snapshot.loader_root.rglob("*.cache"))
 
 
 def test_dataset_manifest_rejects_split_outside_declared_root(tmp_path):
@@ -283,6 +1206,110 @@ def test_dataset_manifest_rejects_split_outside_declared_root(tmp_path):
         validate_local_detection_manifest(manifest)
 
 
+def test_tensorrt_int8_preflight_rejects_pinned_silent_fp32_branch(
+    monkeypatch,
+):
+    backends = importlib.import_module("manwe.export.backends")
+    selected_devices = []
+    monkeypatch.setitem(
+        sys.modules,
+        "torch",
+        SimpleNamespace(cuda=SimpleNamespace(set_device=selected_devices.append)),
+    )
+
+    class FakeLogger:
+        ERROR = 1
+
+        def __init__(self, _severity):
+            pass
+
+    class NoInt8Builder:
+        platform_has_fast_int8 = False
+
+        def __init__(self, _logger):
+            pass
+
+    monkeypatch.setitem(
+        sys.modules,
+        "tensorrt",
+        SimpleNamespace(
+            __version__="8.6.1",
+            Logger=FakeLogger,
+            Builder=NoInt8Builder,
+        ),
+    )
+    with pytest.raises(RuntimeError, match="silently build FP32"):
+        backends._preflight_tensorrt_int8(2)
+    assert selected_devices == [2]
+
+    class TensorRT10Builder:
+        def __init__(self, _logger):
+            pass
+
+    monkeypatch.setitem(
+        sys.modules,
+        "tensorrt",
+        SimpleNamespace(
+            __version__="10.1.0",
+            Logger=FakeLogger,
+            Builder=TensorRT10Builder,
+        ),
+    )
+    assert backends._preflight_tensorrt_int8(1) == ("10.1.0", None)
+    assert selected_devices == [2, 1]
+
+    for version, message in (("10.2.0", "10.2"), ("12.0.0", "newer than the audited")):
+        monkeypatch.setitem(
+            sys.modules,
+            "tensorrt",
+            SimpleNamespace(
+                __version__=version,
+                Logger=FakeLogger,
+                Builder=TensorRT10Builder,
+            ),
+        )
+        with pytest.raises(RuntimeError, match=message):
+            backends._preflight_tensorrt_int8(0)
+
+    for name in ("modelopt", "modelopt.onnx", "modelopt.onnx.quantization"):
+        monkeypatch.setitem(sys.modules, name, ModuleType(name))
+    monkeypatch.setattr(
+        backends.importlib.metadata,
+        "version",
+        lambda name: (
+            "0.44.2"
+            if name == "nvidia-modelopt"
+            else pytest.fail(f"unexpected distribution lookup: {name}")
+        ),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "tensorrt",
+        SimpleNamespace(
+            __version__="11.0.0",
+            Logger=FakeLogger,
+            Builder=TensorRT10Builder,
+        ),
+    )
+    assert backends._preflight_tensorrt_int8(3) == ("11.0.0", "0.44.2")
+    for invalid_version, message in (
+        ("0.44.0rc5", "nvidia-modelopt>=0.44"),
+        ("0.44.dev1", "nvidia-modelopt>=0.44"),
+        ("not-a-version", "PEP 440"),
+    ):
+        monkeypatch.setattr(
+            backends.importlib.metadata,
+            "version",
+            lambda name, value=invalid_version: (
+                value
+                if name == "nvidia-modelopt"
+                else pytest.fail(f"unexpected distribution lookup: {name}")
+            ),
+        )
+        with pytest.raises(RuntimeError, match=message):
+            backends._preflight_tensorrt_int8(3)
+
+
 @pytest.mark.parametrize("source_change", ["transient-replacement", "persistent-mutation"])
 def test_int8_export_uses_digest_bound_private_snapshot_and_fails_closed(
     tmp_path, monkeypatch, source_change
@@ -295,12 +1322,25 @@ def test_int8_export_uses_digest_bound_private_snapshot_and_fails_closed(
     root = tmp_path / "dataset"
     (root / "train").mkdir(parents=True)
     (root / "val").mkdir()
-    (root / "train" / "one.png").write_bytes(b"one")
-    (root / "val" / "two.png").write_bytes(b"two")
+    train_image = root / "train" / "one.png"
+    val_image_one = root / "val" / "two.png"
+    val_image_two = root / "val" / "three.png"
+    _write_calibration_png(train_image, (1, 2, 3))
+    _write_calibration_png(val_image_one, (4, 5, 6))
+    _write_calibration_png(val_image_two, (7, 8, 9))
+    train_bytes = train_image.read_bytes()
+    val_bytes = {val_image_one.read_bytes(), val_image_two.read_bytes()}
+    (root / "val.cache").write_bytes(b"untrusted pickle-shaped cache")
+    (root / "val" / "two.txt").write_text("malformed label ignored by curated view\n")
+    (root / "val" / "two.npy").write_bytes(b"untrusted adjacent array cache")
     manifest = root / "data.yaml"
     manifest.write_text("path: .\ntrain: train\nval: val\nnames: [drone]\n", encoding="utf-8")
     monkeypatch.setattr(dataset_manifest, "_MIN_CALIBRATION_IMAGES", 2)
-    with snapshot_local_calibration_dataset(manifest) as expected_snapshot:
+    with snapshot_local_calibration_dataset(
+        manifest,
+        image_size=320,
+        tensorrt_version="10.1.0",
+    ) as expected_snapshot:
         expected_digest = expected_snapshot.sha256
 
     checkpoint = tmp_path / "model.pt"
@@ -311,11 +1351,25 @@ def test_int8_export_uses_digest_bound_private_snapshot_and_fails_closed(
     backends = importlib.import_module("manwe.export.backends")
     monkeypatch.setattr(backends, "harden_ultralytics_runtime", lambda: None)
     monkeypatch.setattr(backends, "verify_ultralytics_policy", lambda: None)
+    monkeypatch.setattr(
+        backends,
+        "deterministic_ultralytics_validation_format",
+        nullcontext,
+    )
+    monkeypatch.setattr(
+        backends,
+        "_preflight_tensorrt_int8",
+        lambda _index: ("10.1.0", None),
+    )
     monkeypatch.setattr(device_module, "resolve_device", lambda _device: Device("cuda", index=0))
 
     class FakeModel:
         task = "detect"
-        model = SimpleNamespace(end2end=False, stride=[8, 16, 32])
+        model = SimpleNamespace(
+            end2end=False,
+            stride=[8, 16, 32],
+            yaml={"channels": 3},
+        )
         names = {0: "drone"}
 
         def __init__(self, model_path):
@@ -328,8 +1382,20 @@ def test_int8_export_uses_digest_bound_private_snapshot_and_fails_closed(
             observed["private_manifest"] = private_manifest
             observed["private_root"] = private_root
             assert private_root != root
-            assert (private_root / "train" / "one.png").read_bytes() == b"one"
+            assert payload["train"] == payload["val"] == payload["test"] == "calibration-images"
+            assert payload["channels"] == 3
+            private_images = sorted((private_root / payload["val"]).iterdir())
+            assert len(private_images) == 2
+            assert {image.read_bytes() for image in private_images} == val_bytes
+            assert train_bytes not in {image.read_bytes() for image in private_images}
+            assert not list(private_root.rglob("*.txt"))
+            assert not list(private_root.rglob("*.cache"))
+            assert not list(private_root.rglob("*.npy"))
             assert (private_root.stat().st_mode & 0o222) == 0
+            assert kwargs["batch"] == 1
+            assert kwargs["fraction"] == 1.0
+            assert kwargs["rect"] is False
+            assert kwargs["dynamic"] is False
 
             if source_change == "transient-replacement":
                 original = tmp_path / "source-original"
@@ -337,19 +1403,20 @@ def test_int8_export_uses_digest_bound_private_snapshot_and_fails_closed(
                 try:
                     (root / "train").mkdir(parents=True)
                     (root / "val").mkdir()
-                    (root / "train" / "one.png").write_bytes(b"attacker")
-                    (root / "val" / "two.png").write_bytes(b"attacker")
+                    _write_calibration_png(root / "train" / "one.png", (10, 11, 12))
+                    _write_calibration_png(root / "val" / "two.png", (13, 14, 15))
+                    _write_calibration_png(root / "val" / "three.png", (16, 17, 18))
                     (root / "data.yaml").write_text(
                         "path: .\ntrain: train\nval: val\nnames: [attacker]\n",
                         encoding="utf-8",
                     )
-                    assert (private_root / "train" / "one.png").read_bytes() == b"one"
+                    assert {image.read_bytes() for image in private_images} == val_bytes
                 finally:
                     shutil.rmtree(root)
                     original.rename(root)
             else:
-                (root / "train" / "one.png").write_bytes(b"attacker")
-                assert (private_root / "train" / "one.png").read_bytes() == b"one"
+                _write_calibration_png(root / "train" / "one.png", (10, 11, 12))
+                assert {image.read_bytes() for image in private_images} == val_bytes
 
             produced = type(checkpoint)(self.model_path).with_suffix(".engine")
             produced.write_bytes(b"engine")
@@ -363,6 +1430,7 @@ def test_int8_export_uses_digest_bound_private_snapshot_and_fails_closed(
         "int8": True,
         "data": str(manifest),
         "device": "cuda:0",
+        "imgsz": 320,
     }
     if source_change == "persistent-mutation":
         with pytest.raises(RuntimeError, match="source calibration dataset changed"):
@@ -374,6 +1442,66 @@ def test_int8_export_uses_digest_bound_private_snapshot_and_fails_closed(
         assert output.read_bytes() == b"engine"
     assert not observed["private_manifest"].exists()
     assert not observed["private_root"].exists()
+
+
+def test_int8_export_rejects_non_three_channel_checkpoint(tmp_path, monkeypatch):
+    from manwe.common import dataset_manifest
+    from manwe.common import device as device_module
+
+    root = tmp_path / "dataset"
+    (root / "train").mkdir(parents=True)
+    (root / "val").mkdir()
+    _write_calibration_png(root / "val" / "one.png", (1, 2, 3))
+    manifest = root / "data.yaml"
+    manifest.write_text("path: .\ntrain: train\nval: val\nnames: [drone]\n", encoding="utf-8")
+    monkeypatch.setattr(dataset_manifest, "_MIN_CALIBRATION_IMAGES", 1)
+
+    checkpoint = tmp_path / "model.pt"
+    checkpoint.write_bytes(b"fixture")
+    output = tmp_path / "model.engine"
+    backends = importlib.import_module("manwe.export.backends")
+    monkeypatch.setattr(
+        backends,
+        "_preflight_tensorrt_int8",
+        lambda _index: ("10.1.0", None),
+    )
+    monkeypatch.setattr(backends, "harden_ultralytics_runtime", lambda: None)
+    monkeypatch.setattr(backends, "verify_ultralytics_policy", lambda: None)
+    monkeypatch.setattr(
+        backends,
+        "deterministic_ultralytics_validation_format",
+        nullcontext,
+    )
+    monkeypatch.setattr(device_module, "resolve_device", lambda _device: Device("cuda", index=0))
+
+    class FakeModel:
+        task = "detect"
+        model = SimpleNamespace(
+            end2end=False,
+            stride=[8, 16, 32],
+            yaml={"channels": 1},
+        )
+        names = {0: "drone"}
+
+        def __init__(self, _model_path):
+            pass
+
+        def export(self, **_kwargs):
+            raise AssertionError("channel mismatch must fail before backend export")
+
+    monkeypatch.setitem(sys.modules, "ultralytics", SimpleNamespace(YOLO=FakeModel))
+    with pytest.raises(ValueError, match="3-channel detector checkpoints"):
+        export_model(
+            str(checkpoint),
+            ["tensorrt"],
+            output=str(output),
+            weights_sha256=hashlib.sha256(b"fixture").hexdigest(),
+            allow_pickle_checkpoint=True,
+            int8=True,
+            data=str(manifest),
+            device="cuda:0",
+        )
+    assert not output.exists()
 
 
 def test_export_rejects_unproducible_coreml_suffix_before_loading_model(tmp_path):
@@ -449,6 +1577,30 @@ def test_directory_export_replacement_cannot_redirect_descriptor_relative_writes
     assert (moved / "weights.bin").read_bytes() == b"trusted"
 
 
+def test_export_publication_rechecks_identity_after_digest(tmp_path, monkeypatch):
+    from manwe.common.artifacts import sha256_artifact
+    from manwe.export import backends
+
+    source = tmp_path / "source.onnx"
+    source.write_bytes(b"trusted")
+    destination = tmp_path / "published.onnx"
+    moved = tmp_path / "moved-published.onnx"
+    digest = sha256_artifact(source)
+    original_hash = backends.sha256_artifact_at
+
+    def replace_after_hash(parent_fd, name):
+        value = original_hash(parent_fd, name)
+        destination.rename(moved)
+        destination.write_bytes(b"attacker")
+        return value
+
+    monkeypatch.setattr(backends, "sha256_artifact_at", replace_after_hash)
+    with pytest.raises(RuntimeError, match="digest was being verified"):
+        backends._publish_exclusive(source, destination, digest)
+    assert destination.read_bytes() == b"attacker"
+    assert moved.read_bytes() == b"trusted"
+
+
 def test_export_parent_replacement_cannot_redirect_publication(tmp_path, monkeypatch):
     from manwe.common.artifacts import sha256_artifact
     from manwe.export import backends
@@ -484,8 +1636,14 @@ def test_export_parent_replacement_cannot_redirect_publication(tmp_path, monkeyp
     assert not (moved_parent / destination.name).exists()
 
 
-def test_ultralytics_policy_disables_install_network_and_analytics(monkeypatch):
+def test_ultralytics_policy_disables_install_network_and_analytics(tmp_path, monkeypatch):
     policy = importlib.import_module("manwe.common.ultralytics")
+    pristine_pillow_open = Image.open
+
+    def unsafe_pillow_open(*_args, **_kwargs):
+        raise AssertionError("Ultralytics optional-codec hook must be removed")
+
+    monkeypatch.setattr(Image, "open", unsafe_pillow_open)
     root = ModuleType("ultralytics")
     root.SETTINGS = {"sync": True, "hub": True}  # type: ignore[attr-defined]
     utils = ModuleType("ultralytics.utils")
@@ -496,6 +1654,24 @@ def test_ultralytics_policy_disables_install_network_and_analytics(monkeypatch):
     checks.ONLINE = True  # type: ignore[attr-defined]
     downloads = ModuleType("ultralytics.utils.downloads")
     downloads.safe_download = lambda *_args, **_kwargs: None  # type: ignore[attr-defined]
+    downloads.is_url = lambda *_args, **_kwargs: True  # type: ignore[attr-defined]
+    data_utils = ModuleType("ultralytics.data.utils")
+    data_utils.load_dataset_cache_file = lambda *_args, **_kwargs: {}  # type: ignore[attr-defined]
+    data_utils.save_dataset_cache_file = lambda *_args, **_kwargs: None  # type: ignore[attr-defined]
+    data_dataset = ModuleType("ultralytics.data.dataset")
+    data_dataset.load_dataset_cache_file = data_utils.load_dataset_cache_file  # type: ignore[attr-defined]
+    data_dataset.save_dataset_cache_file = data_utils.save_dataset_cache_file  # type: ignore[attr-defined]
+
+    class FakeFormat:
+        bgr = 0.0
+
+        def _format_img(self, image):
+            return image
+
+    augment = ModuleType("ultralytics.data.augment")
+    augment.Format = FakeFormat  # type: ignore[attr-defined]
+    patches = ModuleType("ultralytics.utils.patches")
+    patches._image_open = pristine_pillow_open  # type: ignore[attr-defined]
     tasks = ModuleType("ultralytics.nn.tasks")
     tasks.SAFE_LOAD = False  # type: ignore[attr-defined]
     tasks._SafeLoad = SimpleNamespace(SUPPORTED=True)  # type: ignore[attr-defined]
@@ -506,6 +1682,10 @@ def test_ultralytics_policy_disables_install_network_and_analytics(monkeypatch):
         "ultralytics.utils": utils,
         "ultralytics.utils.checks": checks,
         "ultralytics.utils.downloads": downloads,
+        "ultralytics.data.utils": data_utils,
+        "ultralytics.data.dataset": data_dataset,
+        "ultralytics.data.augment": augment,
+        "ultralytics.utils.patches": patches,
         "ultralytics.nn.tasks": tasks,
         "ultralytics.utils.events": events_module,
     }.items():
@@ -519,14 +1699,123 @@ def test_ultralytics_policy_disables_install_network_and_analytics(monkeypatch):
     assert root.SETTINGS == {"sync": False, "hub": False}  # type: ignore[attr-defined]
     assert checks.AUTOINSTALL is False and checks.ONLINE is False  # type: ignore[attr-defined]
     assert events_module.events.enabled is False  # type: ignore[attr-defined]
+    assert Image.open is pristine_pillow_open
+    assert downloads.is_url("https://example.invalid", check=False) is True  # type: ignore[attr-defined]
+    assert downloads.is_url("https://example.invalid", check=True) is False  # type: ignore[attr-defined]
     with pytest.raises(RuntimeError, match="network downloads are disabled"):
         downloads.safe_download("https://example.invalid/model.pt")  # type: ignore[attr-defined]
+    with pytest.raises(FileNotFoundError, match="cache loading is disabled"):
+        data_dataset.load_dataset_cache_file(tmp_path / "labels.cache")  # type: ignore[attr-defined]
+    cache_payload = {}
+    cache_path = tmp_path / "labels.cache"
+    data_dataset.save_dataset_cache_file("", cache_path, cache_payload, "1.0")  # type: ignore[attr-defined]
+    assert cache_payload == {"version": "1.0"}
+    assert not cache_path.exists()
+
+    monkeypatch.setitem(sys.modules, "torch", SimpleNamespace(from_numpy=lambda value: value))
+    original_format = FakeFormat._format_img
+    with policy.deterministic_ultralytics_validation_format():
+        formatted = FakeFormat()._format_img(np.array([[[1, 2, 3]]], dtype=np.uint8))
+        assert formatted[:, 0, 0].tolist() == [3, 2, 1]
+        nondeterministic = FakeFormat()
+        nondeterministic.bgr = 0.5
+        original_image = np.array([[[1, 2, 3]]], dtype=np.uint8)
+        assert nondeterministic._format_img(original_image) is original_image
+    assert FakeFormat._format_img is original_format
 
     # The vetted-version gate is a safety control: an unvetted runtime must be
     # rejected outright, never merely hardened.
     monkeypatch.setattr(policy.importlib.metadata, "version", lambda _name: "8.4.0")
     with pytest.raises(RuntimeError, match="not the vetted"):
         policy.verify_ultralytics_policy()
+
+
+def test_deterministic_ultralytics_formatter_serializes_overlapping_contexts(monkeypatch):
+    policy = importlib.import_module("manwe.common.ultralytics")
+
+    class FakeFormat:
+        bgr = 1.0
+
+        def _format_img(self, image):
+            return image
+
+    augment = ModuleType("ultralytics.data.augment")
+    augment.Format = FakeFormat  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "ultralytics.data.augment", augment)
+    original = FakeFormat._format_img
+    first_entered = threading.Event()
+    release_first = threading.Event()
+    second_started = threading.Event()
+    second_entered = threading.Event()
+    errors: list[BaseException] = []
+    observer_results: list[object] = []
+    callback_results: list[np.ndarray] = []
+
+    def first_context() -> None:
+        try:
+            with policy.deterministic_ultralytics_validation_format():
+                first_entered.set()
+                if not release_first.wait(5):
+                    raise TimeoutError("first formatter context was not released")
+        except BaseException as exc:
+            errors.append(exc)
+
+    def second_context() -> None:
+        try:
+            if not first_entered.wait(5):
+                raise TimeoutError("first formatter context never started")
+            second_started.set()
+            with policy.deterministic_ultralytics_validation_format():
+                second_entered.set()
+        except BaseException as exc:
+            errors.append(exc)
+
+    first = threading.Thread(target=first_context)
+    second = threading.Thread(target=second_context)
+    first.start()
+    assert first_entered.wait(5)
+    observer = threading.Thread(
+        target=lambda: observer_results.append(FakeFormat()._format_img("original-thread-value"))
+    )
+    observer.start()
+    observer.join(5)
+    assert not observer.is_alive()
+    assert observer_results == ["original-thread-value"]
+    monkeypatch.setitem(sys.modules, "torch", SimpleNamespace(from_numpy=lambda value: value))
+
+    def callback_thread() -> None:
+        formatter = FakeFormat()
+        formatter.bgr = 0.0
+        callback_results.append(formatter._format_img(np.array([[[1, 2, 3]]], dtype=np.uint8)))
+
+    callback = threading.Thread(target=callback_thread)
+    callback.start()
+    callback.join(5)
+    assert not callback.is_alive()
+    assert callback_results[0][:, 0, 0].tolist() == [3, 2, 1]
+    second.start()
+    assert second_started.wait(5)
+    assert not second_entered.wait(0.1)
+    release_first.set()
+    first.join(5)
+    second.join(5)
+
+    assert not first.is_alive() and not second.is_alive()
+    assert not errors
+    assert second_entered.is_set()
+    assert FakeFormat._format_img is original
+    with (
+        pytest.raises(RuntimeError, match="fixture export failure"),
+        policy.deterministic_ultralytics_validation_format(),
+    ):
+        raise RuntimeError("fixture export failure")
+    assert FakeFormat._format_img is original
+    with (
+        pytest.raises(RuntimeError, match="changed during calibration"),
+        policy.deterministic_ultralytics_validation_format(),
+    ):
+        FakeFormat._format_img = original
+    assert FakeFormat._format_img is original
 
 
 def test_logger_cannot_mutate_the_process_root_logger():

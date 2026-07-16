@@ -75,6 +75,10 @@ rfdetr = [
 export = [
     "torch>=2.5,<3",
     "ultralytics==8.4.92",
+    "packaging>=23.2",
+    "opencv-python>=4.9",
+    "pillow>=10.0",
+    "pyyaml>=6.0",
     "onnx>=1.16",
     "onnxruntime>=1.18",
     "onnxslim>=0.1",
@@ -85,6 +89,9 @@ dev = [
     "pytest-cov>=5.0",
     # Config contract tests must execute in the core CI suite, not skip.
     "pyyaml>=6.0",
+    # INT8 calibration contract tests decode adversarial still-image fixtures.
+    "opencv-python>=4.9",
+    "pillow>=10.0",
     "ruff>=0.5",
     "mypy>=1.10",
 ]

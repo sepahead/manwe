@@ -56,8 +56,35 @@ are disabled; dataset YAML is replaced with a private directive-free snapshot.
 Raw export also requires an unoccupied caller-selected destination and returns an
 `ExportReceipt`; a manifest requires separately inspected tensor-signature evidence.
 TensorRT INT8 export additionally copies the bounded calibration tree into a
-read-only private snapshot, binds that exact tree plus normalized manifest in the
-receipt digest, and rechecks the caller-visible source before publication.
+read-only private snapshot. The ≥1,000-image floor applies to unique, fully
+decodable 3-channel `uint8` `val` tensors after the pinned resize/letterbox path,
+rather than filename suffixes or unrelated splits. Candidates require matching
+suffix/content, identity EXIF orientation, and bounded encoded/decoded work. The
+pinned backend receives a deterministic hash-ranked 512-image,
+label/cache/adjacent-array-free private view with batch 1 and fraction 1.0.
+Ultralytics cache I/O and network URL probes are disabled, and its process-global
+`bgr=0` validation formatting is serialized and deterministic only during
+calibration. This makes the consumed set stable across the legacy TensorRT
+calibrator and TensorRT 11 ModelOpt. Export fails if
+TensorRT reports the capability state that makes Ultralytics silently build FP32.
+The receipt digest binds the TensorRT version/route, loader policy, `imgsz`,
+validated inventory, exact tree, and normalized source manifest. The caller-visible
+manifest file and its declared source tree are pinned and rechecked through
+descriptor-relative POSIX I/O before publication. Dataset roots and splits must be
+absolute or descendant-relative (`..`, symlinks, and special path components are
+rejected). This
+is a technical hygiene contract, not
+proof that the images represent the deployment domain or that every engine layer
+executes in INT8; `precision="int8"` records the requested mixed-precision route.
+Retain separate dataset provenance, engine-inspector, and fidelity evidence.
+TensorRT 11 preflights locally installed `nvidia-modelopt>=0.44`, binds its exact
+version into the digest, and rejects image sizes whose conservative 10×
+tensor-materialization estimate exceeds 8 GiB. That version and route are not
+yet explicit receipt fields, so retain the build environment record.
+The descriptor boundary is not an operating-system filesystem snapshot:
+privileged mount changes, SHA-256 collisions, and malicious same-UID mutation of
+the process-owned private loader tree during backend reads require an isolated
+build worker or stronger OS containment.
 Contract JSON/Markdown sidecars use an adjacent private
 `.manwe-contract-*.in-progress` stage and no-replace hard links. If publication
 fails after either final link appears, Manwe deliberately preserves the final paths;
