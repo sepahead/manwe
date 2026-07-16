@@ -9,6 +9,7 @@ import logging
 import math
 import os
 import shutil
+import stat
 import sys
 import threading
 from contextlib import nullcontext
@@ -94,6 +95,282 @@ def test_directory_snapshot_enforces_byte_limit_during_copy(tmp_path, monkeypatc
     monkeypatch.setattr(artifacts, "_tree_entries", mutate_after_enumeration)
     with pytest.raises(ValueError, match="byte safety limit"):
         ArtifactSnapshot(bundle, expected, max_bytes=8)
+
+
+def test_artifact_snapshot_closes_source_when_private_destination_open_fails(
+    tmp_path,
+    monkeypatch,
+):
+    from pathlib import Path
+
+    from manwe.common import artifacts
+
+    source = tmp_path / "model.pt"
+    source.write_bytes(b"trusted")
+    digest = hashlib.sha256(b"trusted").hexdigest()
+    real_open = artifacts.os.open
+    source_fds: list[int] = []
+
+    def fail_private_destination(path, *args, **kwargs):
+        if isinstance(path, Path) and path.name == "artifact.pt":
+            raise OSError("injected destination open failure")
+        fd = real_open(path, *args, **kwargs)
+        if path == source.name and kwargs.get("dir_fd") is not None:
+            source_fds.append(fd)
+        return fd
+
+    monkeypatch.setattr(artifacts.os, "open", fail_private_destination)
+    with pytest.raises(OSError, match="injected destination open failure"):
+        ArtifactSnapshot(source, digest, allowed_suffixes={".pt"})
+    assert len(source_fds) == 1
+    with pytest.raises(OSError):
+        os.fstat(source_fds[0])
+
+
+def test_open_regular_nofollow_closes_file_fd_when_fdopen_fails(tmp_path, monkeypatch):
+    from manwe.common import config_io, fd_io
+
+    path = tmp_path / "config.yaml"
+    path.write_bytes(b"value")
+    opened_fds: list[int] = []
+
+    def fail_fdopen(fd, _mode):
+        opened_fds.append(fd)
+        raise OSError("injected fdopen failure")
+
+    monkeypatch.setattr(fd_io, "_nonowning_file", fail_fdopen)
+    with pytest.raises(OSError, match="injected fdopen failure"):
+        config_io.open_regular_nofollow(path.absolute(), "test config")
+    assert len(opened_fds) == 1
+    with pytest.raises(OSError):
+        os.fstat(opened_fds[0])
+
+
+def test_open_directory_nofollow_closes_both_fds_when_intermediate_close_fails(
+    tmp_path,
+    monkeypatch,
+):
+    from manwe.common import config_io
+
+    directory = tmp_path / "nested"
+    directory.mkdir()
+    real_open = config_io.os.open
+    real_close = config_io.os.close
+    opened_fds: list[int] = []
+    close_calls: list[int] = []
+    close_failed = False
+
+    def track_open(*args, **kwargs):
+        fd = real_open(*args, **kwargs)
+        opened_fds.append(fd)
+        return fd
+
+    def fail_first_close(fd):
+        nonlocal close_failed
+        close_calls.append(fd)
+        if not close_failed:
+            close_failed = True
+            # POSIX permits close(2) to have released the descriptor even when
+            # reporting an error. Retrying the same integer could then close an
+            # unrelated descriptor that another thread has already acquired.
+            real_close(fd)
+            raise OSError("injected close failure")
+        return real_close(fd)
+
+    monkeypatch.setattr(config_io.os, "open", track_open)
+    monkeypatch.setattr(config_io.os, "close", fail_first_close)
+    with pytest.raises(RuntimeError, match="descriptor could not be released"):
+        config_io.open_directory_nofollow(directory.absolute(), "test directory")
+    assert len(opened_fds) == 2
+    assert close_calls.count(opened_fds[0]) == 1
+    for fd in opened_fds:
+        with pytest.raises(OSError):
+            os.fstat(fd)
+
+
+def test_open_directory_nofollow_never_retries_indeterminate_pre_release_close(
+    tmp_path, monkeypatch
+):
+    from manwe.common import config_io
+
+    directory = tmp_path / "nested"
+    directory.mkdir()
+    real_open = config_io.os.open
+    real_close = config_io.os.close
+    opened_fds: list[int] = []
+    close_calls: list[int] = []
+    failed = False
+
+    def track_open(*args, **kwargs):
+        fd = real_open(*args, **kwargs)
+        opened_fds.append(fd)
+        return fd
+
+    def fail_before_release(fd):
+        nonlocal failed
+        close_calls.append(fd)
+        if not failed:
+            failed = True
+            raise OSError("injected pre-release close failure")
+        return real_close(fd)
+
+    monkeypatch.setattr(config_io.os, "open", track_open)
+    monkeypatch.setattr(config_io.os, "close", fail_before_release)
+    with pytest.raises(RuntimeError, match="descriptor could not be released"):
+        config_io.open_directory_nofollow(directory.absolute(), "test directory")
+    assert len(opened_fds) == 2
+    assert close_calls.count(opened_fds[0]) == 1
+    assert os.fstat(opened_fds[0])
+    with pytest.raises(OSError):
+        os.fstat(opened_fds[1])
+    monkeypatch.setattr(config_io.os, "close", real_close)
+    real_close(opened_fds[0])
+
+
+def test_descriptor_copy_preserves_fdopen_error_and_closes_raw_fds(tmp_path, monkeypatch):
+    from manwe.common import artifacts, fd_io
+    from manwe.common.config_io import open_directory_nofollow
+
+    source = tmp_path / "source"
+    destination = tmp_path / "destination"
+    source.mkdir()
+    destination.mkdir()
+    (source / "weights.bin").write_bytes(b"trusted")
+    source_fd = open_directory_nofollow(source, "source")
+    destination_fd = open_directory_nofollow(destination, "destination")
+    real_fdopen = fd_io._nonowning_file
+    opened_fds: list[int] = []
+
+    def fail_second_fdopen(fd, mode):
+        opened_fds.append(fd)
+        if len(opened_fds) == 2:
+            raise OSError("injected fdopen failure")
+        return real_fdopen(fd, mode)
+
+    monkeypatch.setattr(fd_io, "_nonowning_file", fail_second_fdopen)
+    try:
+        with pytest.raises(OSError, match="injected fdopen failure"):
+            artifacts._copy_directory_fd(
+                source_fd,
+                destination_fd,
+                display="test source",
+                max_bytes=1024,
+                max_entries=10,
+            )
+    finally:
+        os.close(destination_fd)
+        os.close(source_fd)
+    assert len(opened_fds) == 2
+    for fd in opened_fds:
+        with pytest.raises(OSError):
+            os.fstat(fd)
+
+
+def test_descriptor_entry_does_not_leak_leaf_when_parent_close_fails(tmp_path, monkeypatch):
+    from manwe.common import artifacts
+    from manwe.common.config_io import open_directory_nofollow
+
+    root = tmp_path / "root"
+    nested = root / "nested"
+    nested.mkdir(parents=True)
+    (nested / "weights.bin").write_bytes(b"trusted")
+    root_fd = open_directory_nofollow(root, "root")
+    real_close = artifacts.os.close
+    close_calls: list[int] = []
+    leaf_fds: list[int] = []
+    real_open = artifacts.os.open
+    failed = False
+    failed_fd: int | None = None
+
+    def track_open(path, *args, **kwargs):
+        fd = real_open(path, *args, **kwargs)
+        if path == "weights.bin":
+            leaf_fds.append(fd)
+        return fd
+
+    def fail_second_close_after_release(fd):
+        nonlocal failed, failed_fd
+        close_calls.append(fd)
+        if not failed and len(close_calls) == 2:
+            failed = True
+            failed_fd = fd
+            real_close(fd)
+            raise OSError("injected close failure")
+        return real_close(fd)
+
+    monkeypatch.setattr(artifacts.os, "open", track_open)
+    monkeypatch.setattr(artifacts.os, "close", fail_second_close_after_release)
+    try:
+        with pytest.raises(OSError, match="injected close failure"):
+            artifacts._open_descriptor_entry(root_fd, "nested/weights.bin", expect_directory=False)
+    finally:
+        real_close(root_fd)
+    assert failed_fd is not None
+    assert close_calls.count(failed_fd) == 1
+    assert len(leaf_fds) == 1
+    with pytest.raises(OSError):
+        os.fstat(leaf_fds[0])
+
+
+def test_artifact_snapshot_cleanup_never_masks_body_exception(tmp_path, monkeypatch):
+    source = tmp_path / "model.onnx"
+    source.write_bytes(b"trusted")
+    digest = hashlib.sha256(b"trusted").hexdigest()
+    snapshot = ArtifactSnapshot(source, digest, allowed_suffixes={".onnx"})
+    real_close = snapshot.close
+
+    class BodyError(Exception):
+        pass
+
+    def close_then_fail():
+        real_close()
+        raise OSError("injected snapshot cleanup failure")
+
+    monkeypatch.setattr(snapshot, "close", close_then_fail)
+    with pytest.raises(BodyError, match="body failure") as captured, snapshot:
+        raise BodyError("body failure")
+    assert isinstance(captured.value.__cause__, OSError)
+    assert any("artifact snapshot cleanup failed" in note for note in captured.value.__notes__)
+
+
+def test_bounded_regular_read_detects_ctime_only_mutation(tmp_path, monkeypatch):
+    from manwe.common import config_io
+
+    path = tmp_path / "config.yaml"
+    path.write_bytes(b"trusted")
+    original = path.stat()
+    real_fstat = config_io.os.fstat
+    matching_calls = 0
+
+    def mutate_after_read(fd):
+        nonlocal matching_calls
+        metadata = real_fstat(fd)
+        if (metadata.st_dev, metadata.st_ino) == (original.st_dev, original.st_ino):
+            matching_calls += 1
+            if matching_calls == 3:
+                path.write_bytes(b"altered")
+                os.utime(path, ns=(original.st_atime_ns, original.st_mtime_ns))
+                metadata = real_fstat(fd)
+        return metadata
+
+    monkeypatch.setattr(config_io.os, "fstat", mutate_after_read)
+    with pytest.raises(ValueError, match="changed while it was being read"):
+        config_io.read_bounded_regular_bytes(path.absolute(), 1024, "test config")
+
+
+def test_path_artifact_hash_rejects_excessive_directory_depth(tmp_path):
+    from manwe.common import artifacts
+
+    root = tmp_path / "bundle.mlpackage"
+    root.mkdir()
+    current = root
+    for _ in range(artifacts._MAX_DESCRIPTOR_TREE_DEPTH + 1):
+        current /= "d"
+        current.mkdir()
+    (current / "weights.bin").write_bytes(b"trusted")
+
+    with pytest.raises(ValueError, match="depth safety limit"):
+        artifacts.sha256_artifact(root)
 
 
 def test_descriptor_hashes_preserve_canonical_global_path_order(tmp_path):
@@ -656,15 +933,15 @@ def test_calibration_close_releases_all_resources_after_cleanup_error(tmp_path, 
 
 
 def test_calibration_loader_constructor_closes_fd_when_fdopen_fails(tmp_path, monkeypatch):
-    from manwe.common import dataset_manifest
+    from manwe.common import dataset_manifest, fd_io
 
     opened: list[int] = []
 
-    def fail_fdopen(fd, *_args, **_kwargs):
+    def fail_fdopen(fd, _mode):
         opened.append(fd)
         raise OSError("injected fdopen failure")
 
-    monkeypatch.setattr(dataset_manifest.os, "fdopen", fail_fdopen)
+    monkeypatch.setattr(fd_io, "_nonowning_file", fail_fdopen)
     with pytest.raises(OSError, match="fdopen failure"):
         dataset_manifest._CalibrationLoaderSnapshot(
             {"names": ["drone"], "nc": 1},
@@ -677,7 +954,7 @@ def test_calibration_loader_constructor_closes_fd_when_fdopen_fails(tmp_path, mo
 
 
 def test_manifest_snapshot_constructor_closes_fd_when_fdopen_fails(tmp_path, monkeypatch):
-    from manwe.common import dataset_manifest
+    from manwe.common import dataset_manifest, fd_io
 
     class SourceBinding:
         closed = False
@@ -689,11 +966,11 @@ def test_manifest_snapshot_constructor_closes_fd_when_fdopen_fails(tmp_path, mon
     source_root = SourceBinding()
     opened: list[int] = []
 
-    def fail_fdopen(fd, *_args, **_kwargs):
+    def fail_fdopen(fd, _mode):
         opened.append(fd)
         raise OSError("injected fdopen failure")
 
-    monkeypatch.setattr(dataset_manifest.os, "fdopen", fail_fdopen)
+    monkeypatch.setattr(fd_io, "_nonowning_file", fail_fdopen)
     with pytest.raises(OSError, match="fdopen failure"):
         dataset_manifest.DatasetManifestSnapshot(
             {"path": str(tmp_path)},
@@ -1518,7 +1795,16 @@ def test_export_rejects_unproducible_coreml_suffix_before_loading_model(tmp_path
         )
 
 
-def test_directory_export_publication_removes_partial_destination(tmp_path, monkeypatch):
+@pytest.mark.parametrize("output", ["published\n.onnx", "published\r.onnx", "bad\0.onnx"])
+def test_export_destination_rejects_control_characters_before_path_creation(tmp_path, output):
+    from manwe.export.backends import _prepare_destination
+
+    with pytest.raises(ValueError, match="bounded nonempty destination"):
+        _prepare_destination(str(tmp_path / output), {".onnx"})
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_directory_export_failure_preserves_private_partial_for_recovery(tmp_path, monkeypatch):
     from manwe.common.artifacts import sha256_artifact
     from manwe.export import backends
 
@@ -1540,14 +1826,90 @@ def test_directory_export_publication_removes_partial_destination(tmp_path, monk
         raise OSError("injected publication failure")
 
     monkeypatch.setattr(backends, "_copy_directory_fd_relative", fail_publication)
-    with pytest.raises(OSError, match="injected publication failure"):
+    with pytest.raises(OSError, match="injected publication failure") as captured:
         _publish_exclusive(source, destination, digest)
-    assert not destination.exists()
+    assert any("automatic output rollback is disabled" in note for note in captured.value.__notes__)
+    assert (destination / "partial").read_bytes() == b"partial"
+    assert stat.S_IMODE(destination.stat().st_mode) == 0o700
+
+
+def test_publication_preserves_original_error_and_recovery_evidence(tmp_path, monkeypatch):
+    from manwe.common.artifacts import sha256_artifact
+    from manwe.export import backends
+
+    source = tmp_path / "source.mlpackage"
+    source.mkdir()
+    (source / "Manifest.json").write_text("{}", encoding="utf-8")
+    destination = tmp_path / "published.mlpackage"
+    digest = sha256_artifact(source)
+
+    def fail_publication(_source, destination_fd):
+        fd = os.open(
+            "partial",
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+            0o600,
+            dir_fd=destination_fd,
+        )
+        os.close(fd)
+        raise ValueError("injected publication failure")
+
+    monkeypatch.setattr(backends, "_copy_directory_fd_relative", fail_publication)
+    with pytest.raises(ValueError, match="injected publication failure") as captured:
+        _publish_exclusive(source, destination, digest)
+    assert any(
+        "automatic output rollback is disabled" in note and str(destination) in note
+        for note in captured.value.__notes__
+    )
+    assert destination.is_dir()
+    assert (destination / "partial").is_file()
+
+
+def test_file_publication_rejects_private_snapshot_growth(tmp_path, monkeypatch):
+    from manwe.common.artifacts import sha256_artifact
+    from manwe.export import backends
+
+    source = tmp_path / "source.onnx"
+    source.write_bytes(b"trusted")
+    destination = tmp_path / "published.onnx"
+    digest = sha256_artifact(source)
+    real_copy = backends._copy_regular_snapshot
+
+    class GrowingReader:
+        def __init__(self, handle, path):
+            self._handle = handle
+            self._path = path
+            self._grown = False
+
+        def fileno(self):
+            return self._handle.fileno()
+
+        def read(self, size):
+            if not self._grown:
+                self._path.chmod(0o600)
+                with self._path.open("ab") as writer:
+                    writer.write(b"x")
+                self._grown = True
+            return self._handle.read(size)
+
+    def grow_during_copy(source_handle, destination_handle, *, display):
+        return real_copy(
+            GrowingReader(source_handle, display),
+            destination_handle,
+            display=display,
+        )
+
+    monkeypatch.setattr(backends, "_copy_regular_snapshot", grow_during_copy)
+    with pytest.raises(RuntimeError, match="grew while being published") as captured:
+        _publish_exclusive(source, destination, digest)
+    assert any("automatic output rollback is disabled" in note for note in captured.value.__notes__)
+    assert destination.read_bytes() == b""
+    assert stat.S_IMODE(destination.stat().st_mode) == 0o600
 
 
 def test_directory_export_replacement_cannot_redirect_descriptor_relative_writes(
     tmp_path, monkeypatch
 ):
+    from manwe.common import artifacts
     from manwe.common.artifacts import sha256_artifact
     from manwe.export import backends
 
@@ -1557,24 +1919,110 @@ def test_directory_export_replacement_cannot_redirect_descriptor_relative_writes
     destination = tmp_path / "published.mlpackage"
     moved = tmp_path / "moved-original.mlpackage"
     digest = sha256_artifact(source)
-    real_copy = backends.shutil.copyfileobj
+    real_fsync = artifacts.os.fsync
     replaced = False
 
-    def replace_root_during_copy(src, dst, *args, **kwargs):
+    def replace_root_during_copy(fd):
         nonlocal replaced
-        if not replaced:
+        metadata = os.fstat(fd)
+        if not replaced and destination.exists() and stat.S_ISREG(metadata.st_mode):
             destination.rename(moved)
             destination.mkdir()
             (destination / "foreign.txt").write_text("foreign", encoding="utf-8")
             replaced = True
-        return real_copy(src, dst, *args, **kwargs)
+        return real_fsync(fd)
 
-    monkeypatch.setattr(backends.shutil, "copyfileobj", replace_root_during_copy)
+    monkeypatch.setattr(artifacts.os, "fsync", replace_root_during_copy)
     with pytest.raises(RuntimeError, match="replaced"):
         backends._publish_exclusive(source, destination, digest)
     assert (destination / "foreign.txt").read_text(encoding="utf-8") == "foreign"
     assert not (destination / "weights.bin").exists()
     assert (moved / "weights.bin").read_bytes() == b"trusted"
+
+
+def test_directory_export_binds_the_directory_created_before_copy(tmp_path, monkeypatch):
+    from manwe.common.artifacts import sha256_artifact
+    from manwe.export import backends
+
+    source = tmp_path / "source.mlpackage"
+    source.mkdir()
+    (source / "weights.bin").write_bytes(b"trusted")
+    destination = tmp_path / "published.mlpackage"
+    moved = tmp_path / "moved-created.mlpackage"
+    digest = sha256_artifact(source)
+    real_open = backends.os.open
+    replaced = False
+
+    def replace_before_directory_open(path, flags, *args, **kwargs):
+        nonlocal replaced
+        if (
+            not replaced
+            and path == destination.name
+            and kwargs.get("dir_fd") is not None
+            and destination.is_dir()
+        ):
+            destination.rename(moved)
+            destination.mkdir()
+            (destination / "foreign.txt").write_text("foreign", encoding="utf-8")
+            replaced = True
+        return real_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(backends.os, "open", replace_before_directory_open)
+    with pytest.raises(RuntimeError, match="replaced while it was being opened"):
+        backends._publish_exclusive(source, destination, digest)
+    assert (destination / "foreign.txt").read_text(encoding="utf-8") == "foreign"
+    assert list(moved.iterdir()) == []
+
+
+def test_directory_export_failure_never_deletes_foreign_replacement(tmp_path, monkeypatch):
+    from manwe.common.artifacts import sha256_artifact
+    from manwe.export import backends
+
+    source = tmp_path / "source.mlpackage"
+    source.mkdir()
+    (source / "weights.bin").write_bytes(b"trusted")
+    destination = tmp_path / "published.mlpackage"
+    moved = tmp_path / "moved-partial.mlpackage"
+    digest = sha256_artifact(source)
+
+    def fail_copy(_source, destination_fd):
+        fd = os.open("partial", os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600, dir_fd=destination_fd)
+        os.close(fd)
+        destination.rename(moved)
+        destination.mkdir()
+        (destination / "foreign.txt").write_text("foreign", encoding="utf-8")
+        raise ValueError("injected publication failure")
+
+    monkeypatch.setattr(backends, "_copy_directory_fd_relative", fail_copy)
+    with pytest.raises(ValueError, match="injected publication failure") as captured:
+        backends._publish_exclusive(source, destination, digest)
+    assert any("automatic output rollback is disabled" in note for note in captured.value.__notes__)
+    assert (destination / "foreign.txt").read_text(encoding="utf-8") == "foreign"
+    assert (moved / "partial").is_file()
+
+
+def test_directory_export_copy_uses_bounded_descriptor_depth(tmp_path):
+    resource = pytest.importorskip("resource")
+    from manwe.common.artifacts import sha256_artifact
+
+    source = tmp_path / "source.mlpackage"
+    source.mkdir()
+    for index in range(80):
+        directory = source / f"directory-{index:03d}"
+        directory.mkdir()
+        (directory / "weights.bin").write_bytes(str(index).encode())
+    destination = tmp_path / "published.mlpackage"
+    digest = sha256_artifact(source)
+    soft_limit, hard_limit = resource.getrlimit(resource.RLIMIT_NOFILE)
+    constrained_limit = min(64, soft_limit)
+    if constrained_limit < 32:
+        pytest.skip("open-file limit is already too small for a stable pytest process")
+    resource.setrlimit(resource.RLIMIT_NOFILE, (constrained_limit, hard_limit))
+    try:
+        _publish_exclusive(source, destination, digest)
+    finally:
+        resource.setrlimit(resource.RLIMIT_NOFILE, (soft_limit, hard_limit))
+    assert sha256_artifact(destination) == digest
 
 
 def test_export_publication_rechecks_identity_after_digest(tmp_path, monkeypatch):
@@ -1613,27 +2061,31 @@ def test_export_parent_replacement_cannot_redirect_publication(tmp_path, monkeyp
     destination = parent / "published.onnx"
     digest = sha256_artifact(source)
     prepared = backends._prepare_destination(str(destination), {".onnx"})
-    real_copy = backends.shutil.copyfileobj
+    real_copy = backends._copy_regular_snapshot
     replaced = False
 
-    def replace_parent_during_copy(src, dst, *args, **kwargs):
+    def replace_parent_during_copy(source_handle, destination_handle, *, display):
         nonlocal replaced
         if not replaced:
             parent.rename(moved_parent)
             parent.mkdir()
             (parent / "foreign.txt").write_text("foreign", encoding="utf-8")
             replaced = True
-        return real_copy(src, dst, *args, **kwargs)
+        return real_copy(source_handle, destination_handle, display=display)
 
-    monkeypatch.setattr(backends.shutil, "copyfileobj", replace_parent_during_copy)
+    monkeypatch.setattr(backends, "_copy_regular_snapshot", replace_parent_during_copy)
+
     try:
-        with pytest.raises(RuntimeError, match="parent was replaced"):
+        with pytest.raises(RuntimeError, match="parent was replaced") as captured:
             backends._publish_exclusive(source, prepared, digest)
     finally:
         prepared.close()
     assert (parent / "foreign.txt").read_text(encoding="utf-8") == "foreign"
     assert not (parent / destination.name).exists()
-    assert not (moved_parent / destination.name).exists()
+    preserved = moved_parent / destination.name
+    assert preserved.read_bytes() == b"trusted"
+    assert stat.S_IMODE(preserved.stat().st_mode) == 0o600
+    assert any("automatic output rollback is disabled" in note for note in captured.value.__notes__)
 
 
 def test_ultralytics_policy_disables_install_network_and_analytics(tmp_path, monkeypatch):

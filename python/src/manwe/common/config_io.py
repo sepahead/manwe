@@ -5,9 +5,11 @@ from __future__ import annotations
 import os
 import pathlib
 import stat
+from contextlib import suppress
 from typing import Any, BinaryIO
 
 from .deps import require
+from .fd_io import owned_binary_reader
 
 MAX_YAML_TOKENS = 100_000
 MAX_YAML_NESTING = 64
@@ -56,8 +58,20 @@ def read_bounded_regular_bytes(
         after = os.fstat(handle.fileno())
     if len(value) > limit:
         raise ValueError(f"{subject} exceeds {limit} bytes: {path}")
-    identity_before = (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
-    identity_after = (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
+    identity_before = (
+        before.st_dev,
+        before.st_ino,
+        before.st_size,
+        before.st_mtime_ns,
+        before.st_ctime_ns,
+    )
+    identity_after = (
+        after.st_dev,
+        after.st_ino,
+        after.st_size,
+        after.st_mtime_ns,
+        after.st_ctime_ns,
+    )
     if identity_before != identity_after:
         raise ValueError(f"{subject} changed while it was being read: {path}")
     return value
@@ -69,7 +83,7 @@ def open_regular_nofollow(path: pathlib.Path, subject: str) -> BinaryIO:
         raise ValueError(f"{subject} path must be absolute after normalization")
     if ".." in path.parts:
         raise ValueError(f"{subject} path must not contain parent-directory components")
-    directory_fd = open_directory_nofollow(path.parent, subject)
+    directory_fd: int | None = open_directory_nofollow(path.parent, subject)
     # O_NONBLOCK is a no-op for regular-file reads but stops a FIFO at this path
     # from blocking os.open until a writer appears — the fstat below then rejects
     # it as a non-regular file instead of hanging this fail-closed read.
@@ -79,19 +93,33 @@ def open_regular_nofollow(path: pathlib.Path, subject: str) -> BinaryIO:
         | getattr(os, "O_NOFOLLOW", 0)
         | getattr(os, "O_NONBLOCK", 0)
     )
+    fd: int | None = None
     try:
-        fd = os.open(path.name, file_flags, dir_fd=directory_fd)
+        try:
+            fd = os.open(path.name, file_flags, dir_fd=directory_fd)
+        except FileNotFoundError as exc:
+            raise FileNotFoundError(f"{subject} path does not exist: {path}") from exc
+        except OSError as exc:
+            raise ValueError(f"{subject} path is a symbolic link or special file: {path}") from exc
         metadata = os.fstat(fd)
         if not stat.S_ISREG(metadata.st_mode):
-            os.close(fd)
             raise ValueError(f"{subject} path must be a regular file: {path}")
-        return os.fdopen(fd, "rb")
-    except FileNotFoundError as exc:
-        raise FileNotFoundError(f"{subject} path does not exist: {path}") from exc
-    except OSError as exc:
-        raise ValueError(f"{subject} path is a symbolic link or special file: {path}") from exc
+        if directory_fd is None:
+            raise RuntimeError(f"{subject} parent directory descriptor was lost")
+        previous_directory_fd = directory_fd
+        directory_fd = None
+        os.close(previous_directory_fd)
+        owned_fd = fd
+        fd = None
+        handle = owned_binary_reader(owned_fd)
+        return handle
     finally:
-        os.close(directory_fd)
+        if fd is not None:
+            with suppress(OSError):
+                os.close(fd)
+        if directory_fd is not None:
+            with suppress(OSError):
+                os.close(directory_fd)
 
 
 def open_directory_nofollow(path: pathlib.Path, subject: str) -> int:
@@ -116,8 +144,12 @@ def open_directory_nofollow(path: pathlib.Path, subject: str) -> int:
         directory_fd = os.open(path.anchor, directory_flags)
         for component in path.parts[1:]:
             next_fd = os.open(component, directory_flags, dir_fd=directory_fd)
-            os.close(directory_fd)
+            previous_fd = directory_fd
             directory_fd = next_fd
+            try:
+                os.close(previous_fd)
+            except OSError as exc:
+                raise RuntimeError(f"{subject} directory descriptor could not be released") from exc
         result = directory_fd
         directory_fd = None
         return result
@@ -129,7 +161,8 @@ def open_directory_nofollow(path: pathlib.Path, subject: str) -> int:
         ) from exc
     finally:
         if directory_fd is not None:
-            os.close(directory_fd)
+            with suppress(OSError):
+                os.close(directory_fd)
 
 
 def read_bounded_utf8_regular(path: pathlib.Path, limit: int, subject: str) -> str:

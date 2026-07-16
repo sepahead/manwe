@@ -8,8 +8,10 @@ import pathlib
 import stat
 import tempfile
 from collections.abc import Collection
+from contextlib import suppress
 
 from .config_io import open_regular_nofollow
+from .fd_io import attach_cleanup_failure, owned_binary_reader, owned_binary_writer
 
 TREE_HASH_DOMAIN = b"manwe-directory-tree-sha256-v1\0"
 DEFAULT_MAX_ARTIFACT_BYTES = 16 * 1024 * 1024 * 1024
@@ -88,25 +90,32 @@ def _copy_regular_bounded(source: pathlib.Path, destination: pathlib.Path, max_b
         | getattr(os, "O_CLOEXEC", 0)
         | getattr(os, "O_NOFOLLOW", 0)
     )
-    destination_fd = os.open(destination, flags, 0o400)
+    destination_fd = -1
     total = 0
     try:
-        with source_handle, os.fdopen(destination_fd, "wb") as destination_handle:
+        with source_handle:
+            destination_fd = os.open(destination, flags, 0o400)
+            owned_destination_fd = destination_fd
             destination_fd = -1
-            while True:
-                chunk = source_handle.read(min(1 << 20, max_bytes - total + 1))
-                if not chunk:
-                    break
-                total += len(chunk)
-                if total > max_bytes:
-                    raise ValueError(f"artifact directory exceeds the byte safety limit: {source}")
-                destination_handle.write(chunk)
-            destination_handle.flush()
-            os.fsync(destination_handle.fileno())
-            after = os.fstat(source_handle.fileno())
+            destination_handle = owned_binary_writer(owned_destination_fd)
+            with destination_handle:
+                while True:
+                    chunk = source_handle.read(min(1 << 20, max_bytes - total + 1))
+                    if not chunk:
+                        break
+                    total += len(chunk)
+                    if total > max_bytes:
+                        raise ValueError(
+                            f"artifact directory exceeds the byte safety limit: {source}"
+                        )
+                    destination_handle.write(chunk)
+                destination_handle.flush()
+                os.fsync(destination_handle.fileno())
+                after = os.fstat(source_handle.fileno())
     finally:
         if destination_fd >= 0:
-            os.close(destination_fd)
+            with suppress(OSError):
+                os.close(destination_fd)
     identity_before = (
         before.st_dev,
         before.st_ino,
@@ -139,6 +148,11 @@ def _tree_entries(
         if stat.S_ISLNK(metadata.st_mode):
             raise ValueError(f"artifact directory contains a symbolic link: {entry}")
         if stat.S_ISDIR(metadata.st_mode):
+            if len(entry.relative_to(path).parts) > _MAX_DESCRIPTOR_TREE_DEPTH:
+                raise ValueError(
+                    "artifact directory exceeds the "
+                    f"{_MAX_DESCRIPTOR_TREE_DEPTH}-level depth safety limit: {path}"
+                )
             kind = "directory"
         elif stat.S_ISREG(metadata.st_mode):
             kind = "file"
@@ -152,7 +166,8 @@ def _update_from_open_regular_fd(
     hasher, fd: int, display: str, *, max_bytes: int, require_nonempty: bool
 ) -> int:
     """Hash one already anchored regular-file descriptor and close it."""
-    with os.fdopen(fd, "rb") as handle:
+    handle = owned_binary_reader(fd)
+    with handle:
         before = os.fstat(handle.fileno())
         if not stat.S_ISREG(before.st_mode):
             raise ValueError(f"artifact entry is not a regular file: {display}")
@@ -226,13 +241,12 @@ def _descriptor_tree_entries(
                         f"{_MAX_DESCRIPTOR_TREE_DEPTH}-level depth safety limit: {display}"
                     )
                 child_fd = os.open(child_name, directory_flags, dir_fd=current_fd)
-                opened = os.fstat(child_fd)
-                if (opened.st_dev, opened.st_ino) != (metadata.st_dev, metadata.st_ino):
-                    os.close(child_fd)
-                    raise ValueError(
-                        f"artifact directory entry was replaced while opening: {relative}"
-                    )
                 try:
+                    opened = os.fstat(child_fd)
+                    if (opened.st_dev, opened.st_ino) != (metadata.st_dev, metadata.st_ino):
+                        raise ValueError(
+                            f"artifact directory entry was replaced while opening: {relative}"
+                        )
                     walk(child_fd, relative, depth + 1)
                 finally:
                     os.close(child_fd)
@@ -299,18 +313,29 @@ def _open_descriptor_entry(
     file_flags = os.O_RDONLY | cloexec | nofollow | getattr(os, "O_NONBLOCK", 0)
     components = relative.split("/")
     parent_fd = os.dup(root_fd)
+    fd = -1
     try:
         for component in components[:-1]:
             metadata = os.stat(component, dir_fd=parent_fd, follow_symlinks=False)
             if not stat.S_ISDIR(metadata.st_mode):
                 raise ValueError(f"artifact directory entry changed type: {relative}")
             next_fd = os.open(component, directory_flags, dir_fd=parent_fd)
-            opened = os.fstat(next_fd)
-            if (opened.st_dev, opened.st_ino) != (metadata.st_dev, metadata.st_ino):
-                os.close(next_fd)
-                raise ValueError(f"artifact directory entry was replaced while opening: {relative}")
-            os.close(parent_fd)
+            try:
+                opened = os.fstat(next_fd)
+                if (opened.st_dev, opened.st_ino) != (metadata.st_dev, metadata.st_ino):
+                    raise ValueError(
+                        f"artifact directory entry was replaced while opening: {relative}"
+                    )
+            except BaseException:
+                with suppress(OSError):
+                    os.close(next_fd)
+                raise
+            previous_fd = parent_fd
             parent_fd = next_fd
+            try:
+                os.close(previous_fd)
+            except OSError as exc:
+                raise RuntimeError("artifact directory descriptor could not be released") from exc
         leaf = components[-1]
         metadata = os.stat(leaf, dir_fd=parent_fd, follow_symlinks=False)
         expected_mode = stat.S_ISDIR if expect_directory else stat.S_ISREG
@@ -323,11 +348,20 @@ def _open_descriptor_entry(
         )
         opened = os.fstat(fd)
         if _descriptor_entry_identity(opened) != _descriptor_entry_identity(metadata):
-            os.close(fd)
             raise ValueError(f"artifact directory entry was replaced while opening: {relative}")
-        return fd, metadata
+        previous_fd = parent_fd
+        parent_fd = -1
+        os.close(previous_fd)
+        result = fd
+        fd = -1
+        return result, metadata
     finally:
-        os.close(parent_fd)
+        if fd >= 0:
+            with suppress(OSError):
+                os.close(fd)
+        if parent_fd >= 0:
+            with suppress(OSError):
+                os.close(parent_fd)
 
 
 def _descriptor_tree_signature(
@@ -422,8 +456,16 @@ def _copy_directory_fd(
     display: str,
     max_bytes: int,
     max_entries: int,
+    destination_directory_mode: int = 0o500,
+    destination_file_mode: int = 0o400,
 ) -> None:
     """Copy one authenticated directory tree without re-walking its source path."""
+    for value, name in (
+        (destination_directory_mode, "destination_directory_mode"),
+        (destination_file_mode, "destination_file_mode"),
+    ):
+        if type(value) is not int or not 0 <= value <= 0o777:
+            raise ValueError(f"{name} must be an integer permission mode in [0, 0o777]")
     nofollow = getattr(os, "O_NOFOLLOW", 0)
     cloexec = getattr(os, "O_CLOEXEC", 0)
     directory_flags = os.O_RDONLY | cloexec | getattr(os, "O_DIRECTORY", 0) | nofollow
@@ -466,12 +508,25 @@ def _copy_directory_fd(
                             f"artifact directory entry was replaced while opening: {relative}"
                         )
                     os.mkdir(child_name, mode=0o700, dir_fd=current_destination_fd)
+                    created = os.stat(
+                        child_name,
+                        dir_fd=current_destination_fd,
+                        follow_symlinks=False,
+                    )
                     child_destination_fd = os.open(
                         child_name, directory_flags, dir_fd=current_destination_fd
                     )
                     try:
+                        opened_destination = os.fstat(child_destination_fd)
+                        if (opened_destination.st_dev, opened_destination.st_ino) != (
+                            created.st_dev,
+                            created.st_ino,
+                        ):
+                            raise RuntimeError(
+                                f"artifact destination was replaced while opening: {relative}"
+                            )
                         copy_tree(child_source_fd, child_destination_fd, relative, depth + 1)
-                        os.fchmod(child_destination_fd, 0o500)
+                        os.fchmod(child_destination_fd, destination_directory_mode)
                         os.fsync(child_destination_fd)
                     finally:
                         os.close(child_destination_fd)
@@ -508,36 +563,41 @@ def _copy_directory_fd(
                 destination_file_fd = os.open(
                     child_name,
                     destination_flags,
-                    0o400,
+                    0o600,
                     dir_fd=current_destination_fd,
                 )
-                with (
-                    os.fdopen(source_file_fd, "rb") as source_handle,
-                    os.fdopen(destination_file_fd, "wb") as destination_handle,
-                ):
-                    source_file_fd = -1
+                owned_source_fd = source_file_fd
+                source_file_fd = -1
+                source_handle = owned_binary_reader(owned_source_fd)
+                with source_handle:
+                    owned_destination_fd = destination_file_fd
                     destination_file_fd = -1
-                    while True:
-                        chunk = source_handle.read(
-                            min(1 << 20, max_bytes - total_bytes - copied + 1)
-                        )
-                        if not chunk:
-                            break
-                        copied += len(chunk)
-                        if copied > max_bytes - total_bytes:
-                            raise ValueError(
-                                f"artifact directory exceeds the {max_bytes}-byte safety limit: "
-                                f"{display}"
+                    destination_handle = owned_binary_writer(owned_destination_fd)
+                    with destination_handle:
+                        while True:
+                            chunk = source_handle.read(
+                                min(1 << 20, max_bytes - total_bytes - copied + 1)
                             )
-                        destination_handle.write(chunk)
-                    destination_handle.flush()
-                    os.fsync(destination_handle.fileno())
-                    source_after = os.fstat(source_handle.fileno())
+                            if not chunk:
+                                break
+                            copied += len(chunk)
+                            if copied > max_bytes - total_bytes:
+                                raise ValueError(
+                                    f"artifact directory exceeds the {max_bytes}-byte safety limit: "
+                                    f"{display}"
+                                )
+                            destination_handle.write(chunk)
+                        destination_handle.flush()
+                        os.fchmod(destination_handle.fileno(), destination_file_mode)
+                        os.fsync(destination_handle.fileno())
+                        source_after = os.fstat(source_handle.fileno())
             finally:
                 if source_file_fd >= 0:
-                    os.close(source_file_fd)
+                    with suppress(OSError):
+                        os.close(source_file_fd)
                 if destination_file_fd >= 0:
-                    os.close(destination_file_fd)
+                    with suppress(OSError):
+                        os.close(destination_file_fd)
             if (
                 source_after.st_dev,
                 source_after.st_ino,
@@ -609,19 +669,25 @@ def sha256_artifact_at(
     hasher = hashlib.sha256()
     if stat.S_ISREG(root_metadata.st_mode):
         fd = os.open(name, file_flags, dir_fd=parent_fd)
-        opened = os.fstat(fd)
-        expected = _descriptor_entry_identity(root_metadata)
-        actual = _descriptor_entry_identity(opened)
-        if actual != expected:
-            os.close(fd)
-            raise ValueError(f"artifact was replaced while it was being opened: {name}")
-        _update_from_open_regular_fd(
-            hasher,
-            fd,
-            name,
-            max_bytes=max_bytes,
-            require_nonempty=True,
-        )
+        try:
+            opened = os.fstat(fd)
+            expected = _descriptor_entry_identity(root_metadata)
+            actual = _descriptor_entry_identity(opened)
+            if actual != expected:
+                raise ValueError(f"artifact was replaced while it was being opened: {name}")
+            owned_fd = fd
+            fd = -1
+            _update_from_open_regular_fd(
+                hasher,
+                owned_fd,
+                name,
+                max_bytes=max_bytes,
+                require_nonempty=True,
+            )
+        finally:
+            if fd >= 0:
+                with suppress(OSError):
+                    os.close(fd)
         current = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
         if _descriptor_entry_identity(current) != expected:
             raise ValueError(f"artifact was replaced while it was being hashed: {name}")
@@ -630,23 +696,21 @@ def sha256_artifact_at(
         raise ValueError(f"artifact is neither a regular file nor a directory: {name}")
 
     root_fd = os.open(name, directory_flags, dir_fd=parent_fd)
-    opened_root = os.fstat(root_fd)
-    expected_root = (
-        root_metadata.st_dev,
-        root_metadata.st_ino,
-        root_metadata.st_mtime_ns,
-        root_metadata.st_ctime_ns,
-    )
-    if (
-        opened_root.st_dev,
-        opened_root.st_ino,
-        opened_root.st_mtime_ns,
-        opened_root.st_ctime_ns,
-    ) != expected_root:
-        os.close(root_fd)
-        raise ValueError(f"artifact directory was replaced while it was opened: {name}")
-
     try:
+        opened_root = os.fstat(root_fd)
+        expected_root = (
+            root_metadata.st_dev,
+            root_metadata.st_ino,
+            root_metadata.st_mtime_ns,
+            root_metadata.st_ctime_ns,
+        )
+        if (
+            opened_root.st_dev,
+            opened_root.st_ino,
+            opened_root.st_mtime_ns,
+            opened_root.st_ctime_ns,
+        ) != expected_root:
+            raise ValueError(f"artifact directory was replaced while it was opened: {name}")
         digest = sha256_directory_fd(
             root_fd,
             display=name,
@@ -700,11 +764,11 @@ def sha256_artifact(
     entries = _tree_entries(artifact, max_entries)
     total_bytes = 0
     regular_files = 0
-    signature_before: list[tuple[str, str, int, int]] = []
+    signature_before: list[tuple[str, str, int, int, int, int, int]] = []
     for entry, kind, metadata in entries:
         relative_text = entry.relative_to(artifact).as_posix()
         relative = relative_text.encode("utf-8")
-        signature_before.append((relative_text, kind, metadata.st_size, metadata.st_mtime_ns))
+        signature_before.append((relative_text, kind, *_descriptor_entry_identity(metadata)))
         if kind == "directory":
             hasher.update(b"D")
             _hash_field(hasher, relative)
@@ -730,8 +794,7 @@ def sha256_artifact(
         (
             entry.relative_to(artifact).as_posix(),
             kind,
-            metadata.st_size,
-            metadata.st_mtime_ns,
+            *_descriptor_entry_identity(metadata),
         )
         for entry, kind, metadata in _tree_entries(artifact, max_entries)
     ]
@@ -819,26 +882,32 @@ class ArtifactSnapshot:
                     | getattr(os, "O_CLOEXEC", 0)
                     | getattr(os, "O_NOFOLLOW", 0)
                 )
-                destination_fd = os.open(destination, flags, 0o400)
+                destination_fd = -1
                 total = 0
                 try:
-                    with source_handle, os.fdopen(destination_fd, "wb") as target:
+                    with source_handle:
+                        destination_fd = os.open(destination, flags, 0o400)
+                        owned_destination_fd = destination_fd
                         destination_fd = -1
-                        while True:
-                            chunk = source_handle.read(min(1 << 20, max_bytes - total + 1))
-                            if not chunk:
-                                break
-                            total += len(chunk)
-                            if total > max_bytes:
-                                raise ValueError(
-                                    f"artifact exceeds the {max_bytes}-byte safety limit: {source}"
-                                )
-                            target.write(chunk)
-                        target.flush()
-                        os.fsync(target.fileno())
+                        target = owned_binary_writer(owned_destination_fd)
+                        with target:
+                            while True:
+                                chunk = source_handle.read(min(1 << 20, max_bytes - total + 1))
+                                if not chunk:
+                                    break
+                                total += len(chunk)
+                                if total > max_bytes:
+                                    raise ValueError(
+                                        f"artifact exceeds the {max_bytes}-byte safety limit: "
+                                        f"{source}"
+                                    )
+                                target.write(chunk)
+                            target.flush()
+                            os.fsync(target.fileno())
                 finally:
                     if destination_fd >= 0:
-                        os.close(destination_fd)
+                        with suppress(OSError):
+                            os.close(destination_fd)
             elif stat.S_ISDIR(metadata.st_mode):
                 entries = _tree_entries(source, max_entries)
                 destination.mkdir(mode=0o700)
@@ -868,8 +937,11 @@ class ArtifactSnapshot:
                 destination.chmod(0o400)
             self.path = destination
             self.sha256 = actual
-        except BaseException:
-            self._temporary.cleanup()
+        except BaseException as error:
+            try:
+                self._temporary.cleanup()
+            except BaseException as cleanup:
+                attach_cleanup_failure(error, cleanup, "artifact snapshot cleanup failed")
             raise
 
     def close(self) -> None:
@@ -928,15 +1000,23 @@ class ArtifactSnapshot:
             instance.path = destination
             instance.sha256 = actual
             return instance
-        except BaseException:
-            instance._temporary.cleanup()
+        except BaseException as error:
+            try:
+                instance._temporary.cleanup()
+            except BaseException as cleanup:
+                attach_cleanup_failure(error, cleanup, "artifact snapshot cleanup failed")
             raise
 
     def __enter__(self) -> ArtifactSnapshot:
         return self
 
     def __exit__(self, _exc_type, _exc, _traceback) -> None:
-        self.close()
+        try:
+            self.close()
+        except BaseException as cleanup:
+            if _exc is None:
+                raise
+            attach_cleanup_failure(_exc, cleanup, "artifact snapshot cleanup failed")
 
 
 __all__ = [

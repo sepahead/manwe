@@ -20,6 +20,7 @@ from .config_io import (
     open_directory_nofollow,
     open_regular_nofollow,
 )
+from .fd_io import owned_binary_reader, owned_binary_writer, owned_text_writer
 
 _MAX_MANIFEST_BYTES = 1 << 20
 _MAX_SPLIT_PATHS = 1024
@@ -219,8 +220,9 @@ def _read_regular_utf8_at(
         expected_identity = _regular_file_identity(metadata)
         if _regular_file_identity(opened) != expected_identity:
             raise ValueError(f"{subject} was replaced while it was being opened")
-        with os.fdopen(fd, "rb") as handle:
-            fd = -1
+        owned_fd = fd
+        fd = -1
+        with owned_binary_reader(owned_fd) as handle:
             if opened.st_size == 0 or opened.st_size > limit:
                 raise ValueError(f"{subject} must contain 1..{limit} bytes")
             value = handle.read(limit + 1)
@@ -886,8 +888,9 @@ class _CalibrationLoaderSnapshot:
             )
             fd = os.open(self.path, flags, 0o400)
             try:
-                with os.fdopen(fd, "wb") as handle:
-                    fd = -1
+                owned_fd = fd
+                fd = -1
+                with owned_binary_writer(owned_fd) as handle:
                     handle.write(manifest_bytes)
                     handle.flush()
                     os.fsync(handle.fileno())
@@ -981,8 +984,9 @@ class DatasetManifestSnapshot:
             )
             fd = os.open(self.path, flags, 0o400)
             try:
-                with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
-                    fd = -1
+                owned_fd = fd
+                fd = -1
+                with owned_text_writer(owned_fd, encoding="utf-8", newline="\n") as handle:
                     yaml.safe_dump(self._payload, handle, sort_keys=True)
                     handle.flush()
                     os.fsync(handle.fileno())

@@ -208,6 +208,78 @@ def test_coreml_directory_contract_and_save_digest_gate(tmp_path):
         save_contract(contract, package)
 
 
+def test_save_contract_success_is_not_reclassified_by_descriptor_close_errors(
+    tmp_path, monkeypatch
+):
+    from manwe.export import contract as contract_module
+
+    artifact = tmp_path / "model.onnx"
+    artifact.write_bytes(b"model")
+    contract = _build_contract(artifact)
+    real_cleanup = contract_module._cleanup_private_stage
+    real_close = contract_module.os.close
+    close_enabled = False
+    close_calls: list[int] = []
+
+    def enable_close_failures(*args, **kwargs):
+        nonlocal close_enabled
+        result = real_cleanup(*args, **kwargs)
+        close_enabled = True
+        return result
+
+    def close_after_release(fd):
+        close_calls.append(fd)
+        real_close(fd)
+        if close_enabled:
+            raise OSError("injected post-commit close failure")
+
+    monkeypatch.setattr(contract_module, "_cleanup_private_stage", enable_close_failures)
+    monkeypatch.setattr(contract_module.os, "close", close_after_release)
+    json_path, markdown_path = save_contract(contract, artifact)
+    assert json_path.is_file()
+    assert markdown_path.is_file()
+    assert close_calls
+
+
+def test_save_contract_anchors_relative_paths_to_one_cwd_snapshot(tmp_path, monkeypatch):
+    from pathlib import Path
+
+    from manwe.export import contract as contract_module
+
+    first = tmp_path / "first"
+    second = tmp_path / "second"
+    first.mkdir()
+    second.mkdir()
+    (first / "model.onnx").write_bytes(b"model")
+    (second / "model.onnx").write_bytes(b"model")
+    monkeypatch.chdir(first)
+    contract = _build_contract(Path("model.onnx"))
+    real_cwd = Path.cwd
+    changed = False
+
+    def snapshot_then_change(_cls):
+        nonlocal changed
+        captured = real_cwd()
+        if not changed:
+            changed = True
+            os.chdir(second)
+        return captured
+
+    monkeypatch.setattr(
+        contract_module.pathlib.Path,
+        "cwd",
+        classmethod(snapshot_then_change),
+    )
+    json_path, markdown_path = save_contract(contract, Path("model.onnx"))
+    assert changed
+    assert json_path.parent == first
+    assert markdown_path.parent == first
+    assert json_path.is_file()
+    assert markdown_path.is_file()
+    assert not (second / json_path.name).exists()
+    assert not (second / markdown_path.name).exists()
+
+
 def test_save_contract_refuses_incomplete_or_wrongly_targeted_contract(tmp_path):
     artifact = tmp_path / "model.onnx"
     other = tmp_path / "other.onnx"
@@ -317,6 +389,82 @@ def test_save_contract_preserves_same_inode_tampering_and_recovery_marker(tmp_pa
     assert artifact.with_suffix(".contract.json").read_bytes() == b"tampered"
     assert not artifact.with_suffix(".contract.md").exists()
     assert len(list(tmp_path.glob(".manwe-contract-*.in-progress"))) == 1
+
+
+def test_sidecar_match_rejects_path_replacement_during_descriptor_read(tmp_path, monkeypatch):
+    import hashlib
+
+    from manwe.export import contract as contract_module
+
+    sidecar = tmp_path / "contract.json"
+    payload = b"trusted!"
+    sidecar.write_bytes(payload)
+    metadata = sidecar.stat()
+    publication = contract_module._SidecarPublication(
+        identity=(metadata.st_dev, metadata.st_ino),
+        size=len(payload),
+        sha256=hashlib.sha256(payload).hexdigest(),
+    )
+    parent_fd = os.open(tmp_path, os.O_RDONLY)
+    real_fstat = contract_module.os.fstat
+    matching_calls = 0
+
+    def replace_after_read(fd):
+        nonlocal matching_calls
+        opened = real_fstat(fd)
+        if (opened.st_dev, opened.st_ino) == publication.identity:
+            matching_calls += 1
+            if matching_calls == 2:
+                sidecar.unlink()
+                sidecar.write_bytes(b"foreign!")
+        return opened
+
+    monkeypatch.setattr(contract_module.os, "fstat", replace_after_read)
+    try:
+        assert not contract_module._sidecar_matches(
+            parent_fd,
+            sidecar.name,
+            publication,
+        )
+    finally:
+        os.close(parent_fd)
+    assert sidecar.read_bytes() == b"foreign!"
+
+
+def test_sidecar_match_closes_raw_fd_when_fdopen_fails(tmp_path, monkeypatch):
+    import hashlib
+
+    from manwe.common import fd_io
+    from manwe.export import contract as contract_module
+
+    sidecar = tmp_path / "contract.json"
+    payload = b"trusted"
+    sidecar.write_bytes(payload)
+    metadata = sidecar.stat()
+    publication = contract_module._SidecarPublication(
+        identity=(metadata.st_dev, metadata.st_ino),
+        size=len(payload),
+        sha256=hashlib.sha256(payload).hexdigest(),
+    )
+    opened_fds: list[int] = []
+
+    def fail_fdopen(fd, _mode):
+        opened_fds.append(fd)
+        raise OSError("injected fdopen failure")
+
+    monkeypatch.setattr(fd_io, "_nonowning_file", fail_fdopen)
+    parent_fd = os.open(tmp_path, os.O_RDONLY)
+    try:
+        assert not contract_module._sidecar_matches(
+            parent_fd,
+            sidecar.name,
+            publication,
+        )
+    finally:
+        os.close(parent_fd)
+    assert len(opened_fds) == 1
+    with pytest.raises(OSError):
+        os.fstat(opened_fds[0])
 
 
 def test_save_contract_second_link_collision_preserves_partial_publication(tmp_path, monkeypatch):

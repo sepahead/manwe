@@ -9,6 +9,7 @@ import os
 import pathlib
 import secrets
 import stat
+from contextlib import suppress
 from dataclasses import dataclass
 
 from ..common.artifacts import sha256_artifact, sha256_artifact_at
@@ -20,6 +21,7 @@ from ..common.contracts import (
     ModelContract,
     TensorSpec,
 )
+from ..common.fd_io import attach_cleanup_failure, owned_binary_reader, owned_binary_writer
 from .backends import EXPORT_FORMATS, ExportReceipt
 
 # At the largest receipt image size (4096), a dense P2/P3/P4/P5 pyramid has
@@ -51,6 +53,13 @@ class _ContractCommitBoundary:
     artifact_name: str
     artifact_sha256: str
     final_publications: dict[str, _SidecarPublication]
+
+
+def _absolute_from_cwd(path: str | pathlib.Path, cwd: pathlib.Path) -> pathlib.Path:
+    expanded = pathlib.Path(path).expanduser()
+    if not expanded.is_absolute():
+        expanded = cwd / expanded
+    return pathlib.Path(os.path.normpath(expanded))
 
 
 def _assert_directory_path(
@@ -94,8 +103,9 @@ def _write_staged_text(directory_fd: int, name: str, value: str) -> _SidecarPubl
         fd = os.open(name, flags, 0o644, dir_fd=directory_fd)
         metadata = os.fstat(fd)
         created_identity = (metadata.st_dev, metadata.st_ino)
-        with os.fdopen(fd, "wb") as handle:
-            fd = None
+        owned_fd = fd
+        fd = None
+        with owned_binary_writer(owned_fd) as handle:
             handle.write(payload)
             handle.flush()
             os.fsync(handle.fileno())
@@ -130,20 +140,44 @@ def _sidecar_matches(
         fd = os.open(name, flags, dir_fd=directory_fd)
     except OSError:
         return False
+    raw_fd = fd
     try:
-        with os.fdopen(fd, "rb") as handle:
+        owned_fd = raw_fd
+        raw_fd = -1
+        handle = owned_binary_reader(owned_fd)
+        with handle:
             before = os.fstat(handle.fileno())
             if not stat.S_ISREG(before.st_mode):
                 return False
             payload = handle.read(publication.size + 1)
             after = os.fstat(handle.fileno())
+        named = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
     except OSError:
         return False
+    finally:
+        if raw_fd >= 0:
+            with suppress(OSError):
+                os.close(raw_fd)
     identity = (before.st_dev, before.st_ino)
-    stable = (before.st_size, before.st_mtime_ns) == (after.st_size, after.st_mtime_ns)
+    stable = (
+        before.st_size,
+        before.st_mtime_ns,
+        before.st_ctime_ns,
+    ) == (
+        after.st_size,
+        after.st_mtime_ns,
+        after.st_ctime_ns,
+    )
+    named_is_opened_file = (
+        stat.S_ISREG(named.st_mode)
+        and (named.st_dev, named.st_ino) == identity
+        and (named.st_size, named.st_mtime_ns, named.st_ctime_ns)
+        == (after.st_size, after.st_mtime_ns, after.st_ctime_ns)
+    )
     return (
         identity == publication.identity
         and stable
+        and named_is_opened_file
         and before.st_size == publication.size
         and len(payload) == publication.size
         and hashlib.sha256(payload).hexdigest() == publication.sha256
@@ -189,9 +223,16 @@ def _create_private_stage(parent_fd: int) -> tuple[str, int, tuple[int, int]]:
                 raise RuntimeError("contract staging directory was replaced while opening")
             os.fsync(parent_fd)
             return stage_name, stage_fd, identity
-        except BaseException:
+        except BaseException as error:
             if stage_fd is not None:
-                os.close(stage_fd)
+                try:
+                    os.close(stage_fd)
+                except BaseException as cleanup:
+                    attach_cleanup_failure(
+                        error,
+                        cleanup,
+                        "contract stage descriptor cleanup failed",
+                    )
             # Never check-then-remove a pathname after acquisition failed. The
             # private marker is safer recovery evidence than deleting a replacement.
             raise
@@ -540,9 +581,10 @@ def save_contract(
 ) -> tuple[pathlib.Path, pathlib.Path]:
     """Stage, verify, and no-replace publish JSON + Markdown contract sidecars."""
     contract.validate(check_artifact=False)
-    path = pathlib.Path(path)
-    artifact = pathlib.Path(contract.file_path)
-    if path.absolute() != artifact.absolute():
+    cwd = pathlib.Path.cwd()
+    path = _absolute_from_cwd(path, cwd)
+    artifact = _absolute_from_cwd(contract.file_path, cwd)
+    if path != artifact:
         raise ValueError(
             f"contract output path {path} does not identify its signed artifact {artifact}"
         )
@@ -550,7 +592,8 @@ def save_contract(
     md_path = path.with_suffix(".contract.md")
     json_value = contract.to_json()
     md_value = contract.to_markdown(check_artifact=False)
-    absolute_parent = path.absolute().parent
+    absolute_parent = path.parent
+    artifact_name = path.name
     parent_fd = open_directory_nofollow(absolute_parent, "contract parent")
     stage_fd: int | None = None
     stage_name: str | None = None
@@ -560,7 +603,7 @@ def save_contract(
         parent_metadata = os.fstat(parent_fd)
         parent_identity = (parent_metadata.st_dev, parent_metadata.st_ino)
         _assert_directory_path(absolute_parent, parent_fd, parent_identity)
-        actual_sha = sha256_artifact_at(parent_fd, path.absolute().name)
+        actual_sha = sha256_artifact_at(parent_fd, artifact_name)
         if actual_sha != contract.file_sha256.lower():
             raise ValueError(
                 "artifact SHA-256 no longer matches contract: "
@@ -583,7 +626,7 @@ def save_contract(
             stage_fd, _STAGE_MARKDOWN, md_publication
         ):
             raise RuntimeError("staged contract sidecars were replaced or modified")
-        if sha256_artifact_at(parent_fd, path.absolute().name) != contract.file_sha256.lower():
+        if sha256_artifact_at(parent_fd, artifact_name) != contract.file_sha256.lower():
             raise RuntimeError("artifact changed while contract sidecars were being published")
         _assert_directory_path(absolute_parent, parent_fd, parent_identity)
 
@@ -605,7 +648,7 @@ def save_contract(
             parent_fd, json_path.name, json_publication
         ) or not _sidecar_matches(parent_fd, md_path.name, md_publication):
             raise RuntimeError("published contract sidecars changed before commit")
-        if sha256_artifact_at(parent_fd, path.absolute().name) != contract.file_sha256.lower():
+        if sha256_artifact_at(parent_fd, artifact_name) != contract.file_sha256.lower():
             raise RuntimeError("artifact changed while contract sidecars were being published")
         _assert_directory_path(absolute_parent, parent_fd, parent_identity)
         os.fsync(parent_fd)
@@ -618,7 +661,7 @@ def save_contract(
             _ContractCommitBoundary(
                 parent_path=absolute_parent,
                 parent_identity=parent_identity,
-                artifact_name=path.absolute().name,
+                artifact_name=artifact_name,
                 artifact_sha256=contract.file_sha256.lower(),
                 final_publications={
                     json_path.name: json_publication,
@@ -636,9 +679,21 @@ def save_contract(
                 "contract sidecars are durable, but marker removal could not be synced; "
                 "commit state is indeterminate and the marker may reappear after a crash"
             )
-    finally:
+    except BaseException as error:
         if stage_fd is not None:
+            try:
+                os.close(stage_fd)
+            except BaseException as cleanup:
+                attach_cleanup_failure(error, cleanup, "contract stage descriptor cleanup failed")
+        try:
+            os.close(parent_fd)
+        except BaseException as cleanup:
+            attach_cleanup_failure(error, cleanup, "contract parent descriptor cleanup failed")
+        raise
+    if stage_fd is not None:
+        with suppress(OSError):
             os.close(stage_fd)
+    with suppress(OSError):
         os.close(parent_fd)
     return json_path, md_path
 

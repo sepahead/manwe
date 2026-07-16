@@ -12,17 +12,18 @@ import importlib
 import importlib.metadata
 import math
 import os
-import shutil
 import stat
 from collections.abc import Mapping
 from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
+from typing import BinaryIO
 
 from ..common.artifacts import (
+    DEFAULT_MAX_ARTIFACT_BYTES,
     DEFAULT_MAX_ARTIFACT_ENTRIES,
     ArtifactSnapshot,
-    _tree_entries,
+    _copy_directory_fd,
     require_pickle_acknowledgement,
     sha256_artifact,
     sha256_artifact_at,
@@ -30,6 +31,7 @@ from ..common.artifacts import (
 from ..common.config_io import open_directory_nofollow
 from ..common.dataset_manifest import snapshot_local_calibration_dataset
 from ..common.deps import require
+from ..common.fd_io import attach_cleanup_failure, owned_binary_writer
 from ..common.logging import get_logger
 from ..common.ultralytics import (
     deterministic_ultralytics_validation_format,
@@ -225,12 +227,7 @@ class ExportReceipt:
             ):
                 raise ValueError(f"{name} must be a 64-character hexadecimal digest")
             object.__setattr__(self, name, value.lower())
-        if (
-            not isinstance(self.artifact_path, str)
-            or not self.artifact_path.strip()
-            or any(character in self.artifact_path for character in "\0\r\n")
-            or len(self.artifact_path) > 4096
-        ):
+        if not _is_bounded_path_text(self.artifact_path):
             raise ValueError("artifact_path must be a bounded nonempty path string")
         if (
             not isinstance(self.source_suffix, str)
@@ -388,9 +385,18 @@ class _PreparedDestination:
             os.close(self.parent_fd)
 
 
+def _is_bounded_path_text(value: object) -> bool:
+    return (
+        isinstance(value, str)
+        and bool(value.strip())
+        and not any(character in value for character in "\0\r\n")
+        and len(value) <= 4096
+    )
+
+
 def _prepare_destination(path: str, allowed_suffixes: set[str]) -> _PreparedDestination:
-    if not isinstance(path, str) or not path.strip():
-        raise TypeError("output must be a nonempty destination path")
+    if not _is_bounded_path_text(path):
+        raise ValueError("output must be a bounded nonempty destination path string")
     destination = Path(path).expanduser().absolute()
     if destination.suffix.lower() not in allowed_suffixes:
         raise ValueError(
@@ -422,53 +428,75 @@ def _copy_directory_fd_relative(source: Path, destination_fd: int) -> None:
     subsequent writes remain attached to the originally created inode rather than
     being redirected through the replacement path.
     """
-    directory_flags = (
-        os.O_RDONLY
-        | getattr(os, "O_CLOEXEC", 0)
-        | getattr(os, "O_DIRECTORY", 0)
-        | getattr(os, "O_NOFOLLOW", 0)
-    )
-    directory_fds: dict[Path, int] = {Path("."): destination_fd}
-    owned_fds: list[int] = []
+    source_fd = open_directory_nofollow(source.absolute(), "private export bundle")
     try:
-        for entry, kind, _metadata in _tree_entries(source, DEFAULT_MAX_ARTIFACT_ENTRIES):
-            relative = entry.relative_to(source)
-            parent_fd = directory_fds[relative.parent]
-            if kind == "directory":
-                os.mkdir(relative.name, mode=0o700, dir_fd=parent_fd)
-                child_fd = os.open(relative.name, directory_flags, dir_fd=parent_fd)
-                directory_fds[relative] = child_fd
-                owned_fds.append(child_fd)
-                continue
-            destination_flags = (
-                os.O_WRONLY
-                | os.O_CREAT
-                | os.O_EXCL
-                | getattr(os, "O_CLOEXEC", 0)
-                | getattr(os, "O_NOFOLLOW", 0)
-            )
-            source_flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
-            source_fd = os.open(entry, source_flags)
-            with os.fdopen(source_fd, "rb") as source_handle:
-                output_fd = os.open(
-                    relative.name,
-                    destination_flags,
-                    0o600,
-                    dir_fd=parent_fd,
-                )
-                with os.fdopen(output_fd, "wb") as destination_handle:
-                    shutil.copyfileobj(source_handle, destination_handle, length=1 << 20)
-                    destination_handle.flush()
-                    os.fsync(destination_handle.fileno())
-                    os.fchmod(destination_handle.fileno(), 0o644)
-        for fd in reversed(owned_fds):
-            os.fchmod(fd, 0o755)
-        for fd in reversed(tuple(directory_fds.values())):
-            os.fsync(fd)
-    finally:
-        for fd in reversed(owned_fds):
-            with suppress(OSError):
-                os.close(fd)
+        _copy_directory_fd(
+            source_fd,
+            destination_fd,
+            display=str(source),
+            max_bytes=DEFAULT_MAX_ARTIFACT_BYTES,
+            max_entries=DEFAULT_MAX_ARTIFACT_ENTRIES,
+            destination_directory_mode=0o755,
+            destination_file_mode=0o644,
+        )
+    except BaseException as error:
+        try:
+            os.close(source_fd)
+        except BaseException as cleanup:
+            attach_cleanup_failure(error, cleanup, "private export source cleanup failed")
+        raise
+    os.close(source_fd)
+
+
+def _copy_regular_snapshot(
+    source_handle: BinaryIO,
+    destination_handle: BinaryIO,
+    *,
+    display: Path,
+) -> None:
+    """Copy exactly one stable verified file without allowing concurrent growth."""
+    before = os.fstat(source_handle.fileno())
+    if not stat.S_ISREG(before.st_mode):
+        raise RuntimeError(f"private export artifact is not a regular file: {display}")
+    if before.st_size <= 0 or before.st_size > DEFAULT_MAX_ARTIFACT_BYTES:
+        raise RuntimeError(
+            f"private export artifact size is outside the bounded publication contract: {display}"
+        )
+    total = 0
+    while True:
+        chunk = source_handle.read(min(1 << 20, before.st_size - total + 1))
+        if not chunk:
+            break
+        total += len(chunk)
+        if total > before.st_size:
+            raise RuntimeError(f"private export artifact grew while being published: {display}")
+        destination_handle.write(chunk)
+    destination_handle.flush()
+    destination_metadata = os.fstat(destination_handle.fileno())
+    after = os.fstat(source_handle.fileno())
+    before_identity = (
+        before.st_dev,
+        before.st_ino,
+        before.st_size,
+        before.st_mtime_ns,
+        before.st_ctime_ns,
+    )
+    after_identity = (
+        after.st_dev,
+        after.st_ino,
+        after.st_size,
+        after.st_mtime_ns,
+        after.st_ctime_ns,
+    )
+    if (
+        total != before.st_size
+        or destination_metadata.st_size != total
+        or after_identity != before_identity
+    ):
+        raise RuntimeError(f"private export artifact changed while being published: {display}")
+    os.fsync(destination_handle.fileno())
+    if os.fstat(destination_handle.fileno()).st_size != total:
+        raise RuntimeError(f"private export artifact changed while being published: {display}")
 
 
 def _entry_identity_at(parent_fd: int, name: str) -> tuple[int, int] | None:
@@ -479,24 +507,31 @@ def _entry_identity_at(parent_fd: int, name: str) -> tuple[int, int] | None:
     return metadata.st_dev, metadata.st_ino
 
 
-def _remove_tree_contents_fd(directory_fd: int) -> None:
-    for name in os.listdir(directory_fd):
-        metadata = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
-        if stat.S_ISDIR(metadata.st_mode) and not stat.S_ISLNK(metadata.st_mode):
-            flags = (
-                os.O_RDONLY
-                | getattr(os, "O_CLOEXEC", 0)
-                | getattr(os, "O_DIRECTORY", 0)
-                | getattr(os, "O_NOFOLLOW", 0)
-            )
-            child_fd = os.open(name, flags, dir_fd=directory_fd)
-            try:
-                _remove_tree_contents_fd(child_fd)
-            finally:
-                os.close(child_fd)
-            os.rmdir(name, dir_fd=directory_fd)
-        else:
-            os.unlink(name, dir_fd=directory_fd)
+def _finalize_published_mode(
+    parent_fd: int,
+    name: str,
+    identity: tuple[int, int],
+    *,
+    is_directory: bool,
+) -> None:
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    if is_directory:
+        flags |= getattr(os, "O_DIRECTORY", 0)
+    else:
+        flags |= getattr(os, "O_NONBLOCK", 0)
+    fd = os.open(name, flags, dir_fd=parent_fd)
+    try:
+        metadata = os.fstat(fd)
+        expected_kind = stat.S_ISDIR if is_directory else stat.S_ISREG
+        if not expected_kind(metadata.st_mode) or (metadata.st_dev, metadata.st_ino) != identity:
+            raise RuntimeError("output destination was replaced before permission finalization")
+        os.fchmod(fd, 0o755 if is_directory else 0o644)
+        os.fsync(fd)
+    except BaseException:
+        with suppress(OSError):
+            os.close(fd)
+        raise
+    os.close(fd)
 
 
 def _publish_exclusive(source: Path, destination: Path | _PreparedDestination, digest: str) -> None:
@@ -520,6 +555,15 @@ def _publish_exclusive(source: Path, destination: Path | _PreparedDestination, d
             try:
                 if snapshot.path.is_dir():
                     os.mkdir(anchor.path.name, mode=0o700, dir_fd=anchor.parent_fd)
+                    created = os.stat(
+                        anchor.path.name,
+                        dir_fd=anchor.parent_fd,
+                        follow_symlinks=False,
+                    )
+                    if not stat.S_ISDIR(created.st_mode):
+                        raise RuntimeError("output destination is not the directory just created")
+                    created_identity = (created.st_dev, created.st_ino)
+                    created_is_directory = True
                     flags = (
                         os.O_RDONLY
                         | getattr(os, "O_CLOEXEC", 0)
@@ -529,10 +573,14 @@ def _publish_exclusive(source: Path, destination: Path | _PreparedDestination, d
                     root_fd = os.open(anchor.path.name, flags, dir_fd=anchor.parent_fd)
                     try:
                         metadata = os.fstat(root_fd)
-                        created_identity = (metadata.st_dev, metadata.st_ino)
-                        created_is_directory = True
+                        if (
+                            not stat.S_ISDIR(metadata.st_mode)
+                            or (metadata.st_dev, metadata.st_ino) != created_identity
+                        ):
+                            raise RuntimeError(
+                                "output destination was replaced while it was being opened"
+                            )
                         _copy_directory_fd_relative(snapshot.path, root_fd)
-                        os.fchmod(root_fd, 0o755)
                         os.fsync(root_fd)
                     finally:
                         os.close(root_fd)
@@ -548,15 +596,16 @@ def _publish_exclusive(source: Path, destination: Path | _PreparedDestination, d
                     try:
                         metadata = os.fstat(fd)
                         created_identity = (metadata.st_dev, metadata.st_ino)
-                        with (
-                            snapshot.path.open("rb") as source_handle,
-                            os.fdopen(fd, "wb") as target,
-                        ):
+                        with snapshot.path.open("rb") as source_handle:
+                            owned_fd = fd
                             fd = -1
-                            shutil.copyfileobj(source_handle, target, length=1 << 20)
-                            target.flush()
-                            os.fsync(target.fileno())
-                            os.fchmod(target.fileno(), 0o644)
+                            target = owned_binary_writer(owned_fd)
+                            with target:
+                                _copy_regular_snapshot(
+                                    source_handle,
+                                    target,
+                                    display=snapshot.path,
+                                )
                     finally:
                         if fd >= 0:
                             os.close(fd)
@@ -570,37 +619,41 @@ def _publish_exclusive(source: Path, destination: Path | _PreparedDestination, d
                     raise RuntimeError(
                         "output destination was replaced while its digest was being verified"
                     )
+                if created_identity is None:
+                    raise RuntimeError("output destination identity was not established")
+                anchor.assert_parent_path()
+                _finalize_published_mode(
+                    anchor.parent_fd,
+                    anchor.path.name,
+                    created_identity,
+                    is_directory=created_is_directory,
+                )
                 anchor.assert_parent_path()
                 if _entry_identity_at(anchor.parent_fd, anchor.path.name) != created_identity:
                     raise RuntimeError(
                         "output destination was replaced while the export was being published"
                     )
                 os.fsync(anchor.parent_fd)
-            except BaseException:
-                if (
-                    created_identity is not None
-                    and _entry_identity_at(anchor.parent_fd, anchor.path.name) == created_identity
-                ):
-                    if created_is_directory:
-                        flags = (
-                            os.O_RDONLY
-                            | getattr(os, "O_CLOEXEC", 0)
-                            | getattr(os, "O_DIRECTORY", 0)
-                            | getattr(os, "O_NOFOLLOW", 0)
-                        )
-                        root_fd = os.open(anchor.path.name, flags, dir_fd=anchor.parent_fd)
-                        try:
-                            _remove_tree_contents_fd(root_fd)
-                        finally:
-                            os.close(root_fd)
-                        os.rmdir(anchor.path.name, dir_fd=anchor.parent_fd)
-                    else:
-                        os.unlink(anchor.path.name, dir_fd=anchor.parent_fd)
-                    os.fsync(anchor.parent_fd)
+            except BaseException as error:
+                if created_identity is not None and hasattr(error, "add_note"):
+                    error.add_note(
+                        "automatic output rollback is disabled because POSIX cannot unlink "
+                        "a pathname conditionally by inode; inspect the private-mode destination "
+                        f"before manual recovery: {anchor.path}"
+                    )
                 raise
-    finally:
+    except BaseException as error:
         if owns_anchor:
+            try:
+                anchor.close()
+            except BaseException as cleanup:
+                attach_cleanup_failure(error, cleanup, "output parent cleanup failed")
+        raise
+    if owns_anchor:
+        try:
             anchor.close()
+        except OSError as cleanup:
+            log.warning("published output but could not close its parent descriptor: %s", cleanup)
 
 
 def export_model(
@@ -665,6 +718,7 @@ def export_model(
     calibration_snapshot = None
     weights_snapshot = None
     destination: _PreparedDestination | None = None
+    receipt: ExportReceipt | None = None
     try:
         from ..common.device import resolve_device
         from ..vision.train import resolve_ultralytics_device
@@ -763,7 +817,7 @@ def export_model(
         artifact_sha256 = sha256_artifact(produced)
         _publish_exclusive(produced, destination, artifact_sha256)
         precision = "int8" if int8 else "float16" if half else "float32"
-        return ExportReceipt(
+        receipt = ExportReceipt(
             format=export_format,
             artifact_path=str(destination.path),
             artifact_sha256=artifact_sha256,
@@ -778,17 +832,33 @@ def export_model(
             end_to_end=False,
             calibration_manifest_sha256=calibration_sha256,
         )
-    finally:
-        try:
-            if weights_snapshot is not None:
-                weights_snapshot.close()
-        finally:
+    except BaseException as error:
+        for resource, label in (
+            (weights_snapshot, "weights snapshot cleanup failed"),
+            (calibration_snapshot, "calibration snapshot cleanup failed"),
+            (destination, "output parent cleanup failed"),
+        ):
+            if resource is None:
+                continue
             try:
-                if calibration_snapshot is not None:
-                    calibration_snapshot.close()
-            finally:
-                if destination is not None:
-                    destination.close()
+                resource.close()
+            except BaseException as cleanup:
+                attach_cleanup_failure(error, cleanup, label)
+        raise
+    for resource, label in (
+        (weights_snapshot, "weights snapshot"),
+        (calibration_snapshot, "calibration snapshot"),
+        (destination, "output parent descriptor"),
+    ):
+        if resource is None:
+            continue
+        try:
+            resource.close()
+        except BaseException as cleanup:
+            log.warning("export succeeded but %s cleanup failed: %s", label, cleanup)
+    if receipt is None:
+        raise RuntimeError("export completed without constructing a receipt")
+    return receipt
 
 
 __all__ = ["FormatSpec", "ExportReceipt", "EXPORT_FORMATS", "export_model"]
