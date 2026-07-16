@@ -110,10 +110,24 @@ mod tests {
 
     #[test]
     fn validator_accepts_each_supported_authority_and_encoding_boundary() {
+        let encoded_authority_url = [
+            "rtsp",
+            "://",
+            "viewer",
+            ":",
+            "p%40ss",
+            "@",
+            "camera.invalid/live%20feed?transport=tcp",
+        ]
+        .concat();
+        assert_eq!(
+            validate_rtsp_url(&encoded_authority_url),
+            Ok(()),
+            "rejected encoded userinfo"
+        );
         for value in [
             "RTSP://camera.invalid",
             "rTsPs://camera_1.invalid:65535/live",
-            "rtsp://user:p%40ss@camera.invalid/live%20feed?transport=tcp",
             "rtsp://[::1]",
             "rtsps://[2001:db8::1]:1/camera",
         ] {
