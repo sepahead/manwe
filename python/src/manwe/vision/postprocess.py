@@ -42,6 +42,30 @@ def _require_representable_coordinates(value: np.ndarray, name: str) -> None:
         )
 
 
+def _real_numeric_array(value: object, error_message: str) -> np.ndarray:
+    try:
+        raw = np.asarray(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(error_message) from exc
+    if raw.dtype.kind not in "iuf":
+        raise ValueError(error_message)
+    try:
+        with np.errstate(over="ignore", invalid="ignore"):
+            return np.asarray(raw, dtype=float)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(error_message) from exc
+
+
+def _real_numeric_scalar(value: object, error_message: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float, np.integer, np.floating)):
+        raise ValueError(error_message)
+    try:
+        with np.errstate(over="ignore", invalid="ignore"):
+            return float(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(error_message) from exc
+
+
 def _round_ratio_ties_to_even(numerator: int, denominator: int) -> int:
     """Round a nonnegative rational exactly using Python's ties-to-even rule."""
     quotient, remainder = divmod(numerator, denominator)
@@ -52,10 +76,10 @@ def _round_ratio_ties_to_even(numerator: int, denominator: int) -> int:
 
 
 def _boxes(value: np.ndarray, name: str, *, require_positive_area: bool = True) -> np.ndarray:
-    try:
-        boxes = np.asarray(value, dtype=float)
-    except (TypeError, ValueError) as exc:
-        raise ValueError(f"{name} must be a numeric array ending in four coordinates") from exc
+    boxes = _real_numeric_array(
+        value,
+        f"{name} must be a real numeric array ending in four coordinates",
+    )
     if boxes.shape == (4,):
         boxes = boxes.reshape(1, 4)
     if boxes.ndim != 2 or boxes.shape[1:] != (4,):
@@ -100,10 +124,10 @@ def letterbox_params(
 
 def xywh2xyxy(boxes: np.ndarray) -> np.ndarray:
     """Convert ``[cx, cy, w, h]`` boxes to ``[x1, y1, x2, y2]``."""
-    try:
-        boxes = np.asarray(boxes, dtype=float)
-    except (TypeError, ValueError) as exc:
-        raise ValueError("boxes must be a numeric array ending in four coordinates") from exc
+    boxes = _real_numeric_array(
+        boxes,
+        "boxes must be a real numeric array ending in four coordinates",
+    )
     if boxes.shape == (4,):
         boxes = boxes.reshape(1, 4)
     if boxes.ndim < 2 or boxes.shape[-1] != 4:
@@ -129,20 +153,12 @@ def scale_boxes(
 ) -> np.ndarray:
     """Map boxes from letterboxed space back to original image pixels."""
     boxes = _boxes(boxes_xyxy, "boxes_xyxy").copy()
-    if isinstance(ratio, bool):
-        raise ValueError("ratio must be finite and positive")
-    try:
-        ratio = float(ratio)
-    except (TypeError, ValueError) as exc:
-        raise ValueError("ratio must be finite and positive") from exc
+    ratio = _real_numeric_scalar(ratio, "ratio must be finite and positive")
     if not np.isfinite(ratio) or ratio <= 0:
         raise ValueError("ratio must be finite and positive")
     if not isinstance(pad, tuple) or len(pad) != 2:
         raise ValueError("pad must be a finite (pad_w, pad_h) tuple")
-    try:
-        pad_values = np.asarray(pad, dtype=float)
-    except (TypeError, ValueError) as exc:
-        raise ValueError("pad must be a finite (pad_w, pad_h) tuple") from exc
+    pad_values = _real_numeric_array(pad, "pad must be a finite (pad_w, pad_h) tuple")
     if pad_values.shape != (2,) or not np.all(np.isfinite(pad_values)):
         raise ValueError("pad must be a finite (pad_w, pad_h) tuple")
     _require_representable_coordinates(pad_values, "pad")
@@ -173,10 +189,7 @@ def nms(
 ) -> list[int]:
     """Greedy NMS, optionally class-aware, returning score-descending indices."""
     boxes = _boxes(boxes_xyxy, "boxes_xyxy")
-    try:
-        scores = np.asarray(scores, dtype=float)
-    except (TypeError, ValueError) as exc:
-        raise ValueError("scores must be a numeric one-dimensional array") from exc
+    scores = _real_numeric_array(scores, "scores must be a real numeric one-dimensional array")
     if scores.ndim != 1 or len(scores) != len(boxes):
         raise ValueError("scores must have shape (N,) and match the box count")
     if not np.all(np.isfinite(scores)) or np.any((scores < 0.0) | (scores > 1.0)):
@@ -192,11 +205,8 @@ def nms(
             raise ValueError("labels must contain integer class indices")
         if np.any(validated_labels < 0):
             raise ValueError("labels must contain nonnegative class indices")
-    if (
-        isinstance(iou_threshold, bool)
-        or not np.isfinite(iou_threshold)
-        or not 0.0 <= iou_threshold <= 1.0
-    ):
+    iou_threshold = _real_numeric_scalar(iou_threshold, "iou_threshold must be in [0, 1]")
+    if not np.isfinite(iou_threshold) or not 0.0 <= iou_threshold <= 1.0:
         raise ValueError("iou_threshold must be in [0, 1]")
     if len(boxes) == 0:
         return []

@@ -140,6 +140,37 @@ def test_postprocess_rejects_malformed_or_nonfinite_outputs():
         )
 
 
+def test_postprocess_rejects_coercive_and_unrepresentable_numeric_inputs():
+    huge = 10**1000
+    valid_boxes = np.array([[0.0, 0.0, 1.0, 1.0]])
+    for boxes in (
+        [["0", "0", "1", "1"]],
+        [[False, False, True, True]],
+        np.ones((1, 4), dtype=complex),
+        [[0, 0, huge, 1]],
+    ):
+        with pytest.raises(ValueError, match="real numeric array"):
+            nms(boxes, np.array([0.5]))
+
+    for scores in (["0.5"], [True], np.array([0.5 + 0.0j]), [huge]):
+        with pytest.raises(ValueError, match="real numeric one-dimensional"):
+            nms(valid_boxes, scores)
+
+    for threshold in ("0.5", True, huge, np.array([0.5])):
+        with pytest.raises(ValueError, match="iou_threshold"):
+            nms(valid_boxes, np.array([0.5]), threshold)
+
+    for ratio in ("1", True, huge):
+        with pytest.raises(ValueError, match="ratio"):
+            scale_boxes(valid_boxes, ratio, (0.0, 0.0), (2, 2))
+    for pad in (("0", "0"), (False, False), (huge, 0)):
+        with pytest.raises(ValueError, match="pad"):
+            scale_boxes(valid_boxes, 1.0, pad, (2, 2))
+
+    with pytest.raises(ValueError, match="real numeric array"):
+        xywh2xyxy([["1", "1", "1", "1"]])
+
+
 def test_postprocess_threshold_boundaries_are_exact_and_ties_are_stable():
     boxes = np.array([[0.0, 0.0, 2.0, 1.0], [0.0, 0.0, 1.0, 1.0]])
     # Standard NMS suppresses only overlaps strictly above the threshold.
