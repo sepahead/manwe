@@ -35,9 +35,10 @@ uv sync --locked --extra vision --extra export # vetted local-only training/expo
 uv sync --locked --extra rfdetr                # vetted RF-DETR 1.8 architecture construction
 uv sync --locked --extra all --extra dev       # supported optional stack + tooling
 
-uv run --no-sync manwe doctor      # hardware + installed extras
-uv run --no-sync manwe fusion-sim  # synthetic KF/EKF/UKF/PF/IMM comparison
-uv run --no-sync pytest tests      # core suite + config-contract dependency
+uv run --locked --no-sync -- .venv/bin/manwe doctor      # hardware + installed extras
+uv run --locked --no-sync -- .venv/bin/manwe fusion-sim  # synthetic filter comparison
+PYTHONWARNINGS=error uv run --locked --no-sync -- \
+  .venv/bin/python -m pytest tests  # core suite + config-contract dependency
 ```
 
 The example YAML files under `configs/` are repository fixtures and are not wheel

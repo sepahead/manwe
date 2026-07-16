@@ -90,14 +90,15 @@ uv sync --locked --extra all                    # combined supported optional st
 The `manwe` CLI:
 
 ```bash
-uv run --no-sync manwe doctor                    # hardware + installed extras
-uv run --no-sync manwe models --track accuracy   # detector zoo and licenses
-uv run --no-sync manwe data                      # dataset registry
-uv run --no-sync manwe synth /tmp/smoke          # offline synthetic dataset
-uv run --no-sync manwe fusion-sim                # synthetic multi-sensor comparison
+uv run --locked --no-sync -- .venv/bin/manwe doctor                   # hardware + extras
+uv run --locked --no-sync -- .venv/bin/manwe models --track accuracy  # model licenses
+uv run --locked --no-sync -- .venv/bin/manwe data                     # dataset registry
+uv run --locked --no-sync -- .venv/bin/manwe synth /tmp/smoke         # offline dataset
+uv run --locked --no-sync -- .venv/bin/manwe fusion-sim               # fusion comparison
 # First replace the example dataset paths in configs/vision/data.example.yaml:
-uv run --no-sync manwe vision-train configs/vision/aerial.yaml  # from-scratch training
-uv run --no-sync manwe export /abs/best.pt -f onnx \
+uv run --locked --no-sync -- .venv/bin/manwe vision-train \
+  configs/vision/aerial.yaml  # from-scratch training
+uv run --locked --no-sync -- .venv/bin/manwe export /abs/best.pt -f onnx \
   --weights-sha256 <64-hex> --allow-pickle-checkpoint \
   --output /abs/candidate.onnx --allow-unverified
 ```
@@ -140,7 +141,8 @@ SHA-256 collisions, and malicious same-UID mutation of the process-owned private
 loader tree during backend reads require an isolated build worker or stronger OS
 containment.
 
-`uv run --no-sync manwe fusion-sim` on the default 3-target, 3-sensor (visual + radar + acoustic)
+`uv run --locked --no-sync -- .venv/bin/manwe fusion-sim` on the default
+3-target, 3-sensor (visual + radar + acoustic)
 scenario — mean OSPA (lower is better) over 41 frames:
 
 ```

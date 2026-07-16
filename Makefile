@@ -1,6 +1,6 @@
 # manwe — common tasks. Python training ground lives in ./python.
 # (Recipes cd into python/ and use the checked-in uv lock.)
-UV_RUN := uv run --no-sync
+UV_RUN := uv run --locked --no-sync --
 
 .PHONY: help setup setup-all test test-core lint fmt typecheck secret-scan smoke fusion-sim rust-build rust-check rust-bench-check clean
 
@@ -15,29 +15,29 @@ setup-all: ## Install everything incl. heavy pillars (use Python 3.11–3.12)
 	cd python && uv sync --locked --extra all --extra dev
 
 test: ## Run the full pytest suite
-	cd python && $(UV_RUN) pytest tests
+	cd python && PYTHONWARNINGS=error $(UV_RUN) .venv/bin/python -m pytest tests
 
 test-core: ## Run the same core/config suite in the prepared development environment
-	cd python && $(UV_RUN) pytest tests
+	cd python && PYTHONWARNINGS=error $(UV_RUN) .venv/bin/python -m pytest tests
 
 lint: ## Ruff lint
-	cd python && $(UV_RUN) ruff check src tests
+	cd python && $(UV_RUN) .venv/bin/ruff check src tests
 
 fmt: ## Ruff format
-	cd python && $(UV_RUN) ruff format src tests
+	cd python && $(UV_RUN) .venv/bin/ruff format src tests
 
 typecheck: ## mypy on the package
-	cd python && $(UV_RUN) mypy src/manwe
+	cd python && $(UV_RUN) .venv/bin/python -m mypy src/manwe
 
 secret-scan: ## Scan current Git files for common credential material
 	python3 scripts/check_secrets.py
 
 smoke: ## Generate an offline synthetic dataset
 	tmp=$$(mktemp -d); trap 'rm -rf "$$tmp"' EXIT; \
-	  cd python && $(UV_RUN) manwe synth "$$tmp/dataset"
+	  cd python && $(UV_RUN) .venv/bin/python -m manwe.cli synth "$$tmp/dataset"
 
 fusion-sim: ## Compare all filters on a synthetic multi-sensor scenario
-	cd python && $(UV_RUN) manwe fusion-sim
+	cd python && $(UV_RUN) .venv/bin/python -m manwe.cli fusion-sim
 
 rust-build: ## Build the Rust inference CLI (CPU)
 	cargo build --release --locked --no-default-features

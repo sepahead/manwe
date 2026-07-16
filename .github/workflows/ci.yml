@@ -47,12 +47,15 @@ jobs:
         working-directory: python
         env:
           PYTHONWARNINGS: error
-        run: uv run --no-sync pytest
+        run: uv run --locked --no-sync -- .venv/bin/python -m pytest
       - name: Audit runtime and build dependencies for this Python marker set
         working-directory: python
         run: |
-          uv -q export --locked --extra all --no-dev --group build --no-emit-project --output-file /tmp/manwe-requirements.txt
-          uv run --no-sync pip-audit --require-hashes --disable-pip --strict -r /tmp/manwe-requirements.txt
+          uv -q export --locked --extra all --no-dev --group build --no-emit-project \
+            --output-file "$RUNNER_TEMP/manwe-requirements.txt"
+          uv run --locked --no-sync -- .venv/bin/python -m pip_audit \
+            --require-hashes --disable-pip --strict \
+            -r "$RUNNER_TEMP/manwe-requirements.txt"
 
   python-quality:
     name: Python lint, types, and package smoke test
@@ -225,19 +228,29 @@ jobs:
       - name: Ruff
         working-directory: python
         run: |
-          uv run --no-sync ruff check src tests
-          uv run --no-sync ruff format --check src tests
+          uv run --locked --no-sync -- .venv/bin/ruff check src tests
+          uv run --locked --no-sync -- .venv/bin/ruff format --check src tests
       - name: Mypy
         working-directory: python
-        run: uv run --no-sync mypy src
+        run: uv run --locked --no-sync -- .venv/bin/python -m mypy src
       - name: Build source and wheel distributions
         working-directory: python
         run: |
           uv export --locked --offline --only-group build --no-emit-project \
-            --output-file /tmp/manwe-build-constraints.txt
+            --output-file "$RUNNER_TEMP/manwe-build-constraints.txt"
+          # Lock-based sync installs these packages without necessarily caching
+          # the registry candidates required by a later isolated offline build.
+          # Warm that cache from the hash-pinned wheel set, then discard the
+          # temporary install before building the project in PEP 517 isolation.
+          rm -rf "$RUNNER_TEMP/manwe-build-prefetch"
+          uv pip install --python .venv/bin/python --no-sources \
+            --target "$RUNNER_TEMP/manwe-build-prefetch" \
+            --require-hashes --only-binary :all: \
+            -r "$RUNNER_TEMP/manwe-build-constraints.txt"
+          rm -rf "$RUNNER_TEMP/manwe-build-prefetch"
           rm -rf dist
           uv build --no-sources --offline --require-hashes \
-            --build-constraints /tmp/manwe-build-constraints.txt --sdist
+            --build-constraints "$RUNNER_TEMP/manwe-build-constraints.txt" --sdist
           mapfile -t sdists < <(
             find dist -maxdepth 1 -type f -name '*.tar.gz' -print
           )
@@ -246,7 +259,7 @@ jobs:
             exit 1
           fi
           uv build --no-sources --offline --require-hashes \
-            --build-constraints /tmp/manwe-build-constraints.txt \
+            --build-constraints "$RUNNER_TEMP/manwe-build-constraints.txt" \
             --wheel "${sdists[0]}"
           mapfile -t wheels < <(
             find dist -maxdepth 1 -type f -name '*.whl' -print
@@ -259,10 +272,10 @@ jobs:
         working-directory: python
         run: |
           uv export --locked --offline --no-default-groups --no-emit-project \
-            --output-file /tmp/manwe-core-requirements.txt
+            --output-file "$RUNNER_TEMP/manwe-core-requirements.txt"
           uv venv --python 3.12 .wheel-venv
           uv pip install --python .wheel-venv/bin/python --offline \
-            --require-hashes -r /tmp/manwe-core-requirements.txt
+            --require-hashes -r "$RUNNER_TEMP/manwe-core-requirements.txt"
           mapfile -t wheels < <(
             find dist -maxdepth 1 -type f -name '*.whl' -print
           )
@@ -329,7 +342,7 @@ jobs:
         run: uv sync --locked --extra dev --no-install-project
       - name: Run tests without resolving dependencies
         working-directory: python
-        run: uv run --no-sync pytest
+        run: uv run --locked --no-sync -- .venv/bin/python -m pytest
 
   python-vision-policy:
     name: Locked vision runtime safety policy
@@ -360,7 +373,7 @@ jobs:
       - name: Verify no-install, offline, safe-load, and analytics policy
         working-directory: python
         run: |
-          uv run --no-sync python - <<'PY'
+          uv run --locked --no-sync -- .venv/bin/python - <<'PY'
           from manwe.common.ultralytics import harden_ultralytics_runtime, verify_ultralytics_policy
 
           harden_ultralytics_runtime()
@@ -372,13 +385,15 @@ jobs:
       - name: Verify calibration preprocessing against the pinned loader
         working-directory: python
         run: >-
-          uv run --no-sync pytest -q tests/test_runtime_boundaries.py
+          uv run --locked --no-sync -- .venv/bin/python -m pytest
+          -q tests/test_runtime_boundaries.py
           -k 'calibration_private_view_matches_actual_pinned_loader or
           calibration_supported_formats_match_actual_pinned_loader'
       - name: Reject animated and multi-page inference inputs
         working-directory: python
         run: >-
-          uv run --no-sync pytest -q tests/test_runtime_boundaries.py
+          uv run --locked --no-sync -- .venv/bin/python -m pytest
+          -q tests/test_runtime_boundaries.py
           -k inference_input_is_one_owned_bounded_local_image
 
   rust-cpu:

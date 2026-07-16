@@ -36,10 +36,10 @@ uv sync --locked --extra dev        # core + pytest/ruff/mypy
 # Optional heavy stack (use a supported Python/platform and review the lock diff):
 uv sync --locked --extra all --extra dev
 
-uv run --no-sync pytest tests
-uv run --no-sync ruff check src tests
-uv run --no-sync ruff format --check src tests
-uv run --no-sync mypy src/manwe
+PYTHONWARNINGS=error uv run --locked --no-sync -- .venv/bin/python -m pytest tests
+uv run --locked --no-sync -- .venv/bin/ruff check src tests
+uv run --locked --no-sync -- .venv/bin/ruff format --check src tests
+uv run --locked --no-sync -- .venv/bin/python -m mypy src/manwe
 ```
 
 The locked `rfdetr` extra covers construction/inference only. Do not install the
