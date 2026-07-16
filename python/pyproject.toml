@@ -103,6 +103,14 @@ all = [
     "manwe-perception[config,vision,rfdetr,export]",
 ]
 
+[dependency-groups]
+# Keep the isolated PEP 517 environment reproducible without publishing build
+# tooling as a runtime extra. CI exports this group from uv.lock as hash-pinned
+# build constraints.
+build = [
+    "hatchling==1.31.0",
+]
+
 [project.scripts]
 manwe = "manwe.cli:main"
 

@@ -42,16 +42,16 @@ jobs:
           cache-dependency-glob: python/uv.lock
       - name: Install locked core, test, and audit dependencies
         working-directory: python
-        run: uv sync --locked --extra dev --extra audit
+        run: uv sync --locked --extra dev --extra audit --no-install-project
       - name: Run tests without resolving dependencies
         working-directory: python
         env:
           PYTHONWARNINGS: error
         run: uv run --no-sync pytest
-      - name: Audit runtime extras for this Python marker set
+      - name: Audit runtime and build dependencies for this Python marker set
         working-directory: python
         run: |
-          uv -q export --locked --extra all --no-dev --no-emit-project --output-file /tmp/manwe-requirements.txt
+          uv -q export --locked --extra all --no-dev --group build --no-emit-project --output-file /tmp/manwe-requirements.txt
           uv run --no-sync pip-audit --require-hashes --disable-pip --strict -r /tmp/manwe-requirements.txt
 
   python-quality:
@@ -78,7 +78,7 @@ jobs:
           cache-dependency-glob: python/uv.lock
       - name: Install locked quality dependencies
         working-directory: python
-        run: uv sync --locked --extra dev
+        run: uv sync --locked --extra dev --group build --no-install-project
       - name: Verify source and lock files are tracked-eligible
         run: |
           test -f Cargo.lock
@@ -233,17 +233,46 @@ jobs:
       - name: Build source and wheel distributions
         working-directory: python
         run: |
-          uv build --no-sources --sdist
-          sdist=$(find dist -maxdepth 1 -name '*.tar.gz' -print -quit)
-          test -n "$sdist"
-          uv build --no-sources --wheel "$sdist"
+          uv export --locked --offline --only-group build --no-emit-project \
+            --output-file /tmp/manwe-build-constraints.txt
+          rm -rf dist
+          uv build --no-sources --offline --require-hashes \
+            --build-constraints /tmp/manwe-build-constraints.txt --sdist
+          mapfile -t sdists < <(
+            find dist -maxdepth 1 -type f -name '*.tar.gz' -print
+          )
+          if (( ${#sdists[@]} != 1 )); then
+            printf 'expected exactly one sdist, found %s\n' "${#sdists[@]}" >&2
+            exit 1
+          fi
+          uv build --no-sources --offline --require-hashes \
+            --build-constraints /tmp/manwe-build-constraints.txt \
+            --wheel "${sdists[0]}"
+          mapfile -t wheels < <(
+            find dist -maxdepth 1 -type f -name '*.whl' -print
+          )
+          if (( ${#wheels[@]} != 1 )); then
+            printf 'expected exactly one wheel, found %s\n' "${#wheels[@]}" >&2
+            exit 1
+          fi
       - name: Install and inspect wheel in isolation
         working-directory: python
         run: |
+          uv export --locked --offline --no-default-groups --no-emit-project \
+            --output-file /tmp/manwe-core-requirements.txt
           uv venv --python 3.12 .wheel-venv
-          wheel=$(find dist -maxdepth 1 -name '*.whl' -print -quit)
-          test -n "$wheel"
-          uv pip install --python .wheel-venv/bin/python "$wheel"
+          uv pip install --python .wheel-venv/bin/python --offline \
+            --require-hashes -r /tmp/manwe-core-requirements.txt
+          mapfile -t wheels < <(
+            find dist -maxdepth 1 -type f -name '*.whl' -print
+          )
+          if (( ${#wheels[@]} != 1 )); then
+            printf 'expected exactly one wheel, found %s\n' "${#wheels[@]}" >&2
+            exit 1
+          fi
+          uv pip install --python .wheel-venv/bin/python --offline \
+            --no-deps "${wheels[0]}"
+          uv pip check --python .wheel-venv/bin/python
           .wheel-venv/bin/python -I - <<'PY'
           import importlib.metadata
           import pkgutil
@@ -297,7 +326,7 @@ jobs:
           cache-dependency-glob: python/uv.lock
       - name: Install the locked core development environment
         working-directory: python
-        run: uv sync --locked --extra dev
+        run: uv sync --locked --extra dev --no-install-project
       - name: Run tests without resolving dependencies
         working-directory: python
         run: uv run --no-sync pytest
@@ -309,6 +338,7 @@ jobs:
     env:
       UV_PYTHON: "3.12"
       PYTHONWARNINGS: error
+      PYTHONPATH: src
     steps:
       - name: Check out repository
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -326,7 +356,7 @@ jobs:
           cache-dependency-glob: python/uv.lock
       - name: Install the exact locked vision adapter
         working-directory: python
-        run: uv sync --locked --extra vision --extra dev
+        run: uv sync --locked --extra vision --extra dev --no-install-project
       - name: Verify no-install, offline, safe-load, and analytics policy
         working-directory: python
         run: |
