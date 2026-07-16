@@ -7,7 +7,7 @@ from typing import Any
 
 import numpy as np
 
-from .doa import SPEED_OF_SOUND, srp_peak_prominence, srp_phat
+from .doa import SPEED_OF_SOUND, _signal_matrix, srp_peak_prominence, srp_phat
 from .features import sound_pressure_level_db
 
 MAX_CLASS_LABEL_BYTES = 256
@@ -40,10 +40,12 @@ def _finite_vector(value: Any, name: str) -> np.ndarray:
         raise ValueError(f"{name} must contain real numeric values") from exc
     if raw.dtype.kind not in "iuf":
         raise ValueError(f"{name} must contain real numeric values")
+    if raw.size != 3:
+        raise ValueError(f"{name} must contain three values")
+    if not np.isfinite(raw).all():
+        raise ValueError(f"{name} must contain only finite values")
     with np.errstate(over="ignore", invalid="ignore"):
         vector = np.asarray(raw, dtype=float)
-    if vector.size != 3:
-        raise ValueError(f"{name} must contain three values")
     vector = vector.reshape(3)
     if not np.isfinite(vector).all():
         raise ValueError(f"{name} must contain only finite values")
@@ -66,9 +68,13 @@ def _rotation(value: np.ndarray | None) -> np.ndarray:
         raise ValueError("sensor_rotation must be a real numeric matrix") from exc
     if raw.dtype.kind not in "iuf":
         raise ValueError("sensor_rotation must be a real numeric matrix")
+    if raw.shape != (3, 3):
+        raise ValueError("sensor_rotation must be a finite 3x3 matrix")
+    if not np.isfinite(raw).all():
+        raise ValueError("sensor_rotation must be a finite 3x3 matrix")
     with np.errstate(over="ignore", invalid="ignore"):
         rotation = np.asarray(raw, dtype=float)
-    if rotation.shape != (3, 3) or not np.isfinite(rotation).all():
+    if not np.isfinite(rotation).all():
         raise ValueError("sensor_rotation must be a finite 3x3 matrix")
     with np.errstate(over="ignore", invalid="ignore"):
         gram = np.einsum("ik,jk->ij", rotation, rotation)
@@ -275,7 +281,7 @@ def detect_from_array(
     )
     prominence = srp_peak_prominence(power)
     confidence = float(np.clip(prominence / 10.0, 0.0, 1.0))
-    signal_array = np.asarray(signals, dtype=float)
+    signal_array = _signal_matrix(signals)
     # Channel ordering is arbitrary, and SRP can succeed when the first channel
     # is silent. Use the highest RMS level across valid microphones.
     spl = max(sound_pressure_level_db(channel) for channel in signal_array)

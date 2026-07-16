@@ -38,13 +38,17 @@ def _finite_scalar(
     return value
 
 
-def _real_array(value: Any, name: str) -> np.ndarray:
+def _raw_real_array(value: Any, name: str) -> np.ndarray:
     try:
         raw = np.asarray(value)
     except (TypeError, ValueError) as exc:
         raise ValueError(f"{name} must contain real numeric values") from exc
     if raw.dtype.kind not in "iuf":
         raise ValueError(f"{name} must contain real numeric values")
+    return raw
+
+
+def _float_array(raw: np.ndarray, name: str) -> np.ndarray:
     try:
         with np.errstate(over="ignore", invalid="ignore"):
             return np.asarray(raw, dtype=float)
@@ -53,13 +57,16 @@ def _real_array(value: Any, name: str) -> np.ndarray:
 
 
 def _finite_signal(signal: np.ndarray) -> np.ndarray:
-    array = _real_array(signal, "signal")
-    if array.ndim != 1:
+    raw = _raw_real_array(signal, "signal")
+    if raw.ndim != 1:
         raise ValueError("signal must be a one-dimensional array")
-    if array.size == 0:
+    if raw.size == 0:
         raise ValueError("signal must contain at least one sample")
-    if array.size > MAX_SIGNAL_SAMPLES:
+    if raw.size > MAX_SIGNAL_SAMPLES:
         raise ValueError(f"signal exceeds the {MAX_SIGNAL_SAMPLES}-sample safety limit")
+    if not np.isfinite(raw).all():
+        raise ValueError("signal must contain only finite samples")
+    array = _float_array(raw, "signal")
     if not np.isfinite(array).all():
         raise ValueError("signal must contain only finite samples")
     return array

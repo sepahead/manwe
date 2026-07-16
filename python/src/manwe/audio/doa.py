@@ -44,13 +44,17 @@ def _positive_int(value: Any, name: str) -> int:
     return int(value)
 
 
-def _real_array(value: Any, name: str) -> np.ndarray:
+def _raw_real_array(value: Any, name: str) -> np.ndarray:
     try:
         raw = np.asarray(value)
     except (TypeError, ValueError) as exc:
         raise ValueError(f"{name} must contain real numeric values") from exc
     if raw.dtype.kind not in "iuf":
         raise ValueError(f"{name} must contain real numeric values")
+    return raw
+
+
+def _float_array(raw: np.ndarray, name: str) -> np.ndarray:
     try:
         with np.errstate(over="ignore", invalid="ignore"):
             return np.asarray(raw, dtype=float)
@@ -59,16 +63,38 @@ def _real_array(value: Any, name: str) -> np.ndarray:
 
 
 def _signal(value: np.ndarray, name: str) -> np.ndarray:
-    signal = _real_array(value, name)
-    if signal.ndim != 1:
+    raw = _raw_real_array(value, name)
+    if raw.ndim != 1:
         raise ValueError(f"{name} must be a one-dimensional array")
-    if signal.size == 0:
+    if raw.size == 0:
         raise ValueError(f"{name} must contain at least one sample")
-    if signal.size > MAX_SIGNAL_SAMPLES:
+    if raw.size > MAX_SIGNAL_SAMPLES:
         raise ValueError(f"{name} exceeds the {MAX_SIGNAL_SAMPLES}-sample safety limit")
+    if not np.isfinite(raw).all():
+        raise ValueError(f"{name} must contain only finite samples")
+    signal = _float_array(raw, name)
     if not np.isfinite(signal).all():
         raise ValueError(f"{name} must contain only finite samples")
     return signal
+
+
+def _signal_matrix(value: np.ndarray) -> np.ndarray:
+    raw = _raw_real_array(value, "signals")
+    if raw.ndim != 2:
+        raise ValueError("signals must have shape (n_mics, n_samples)")
+    n_mics, n_samples = raw.shape
+    if n_mics < 2 or n_samples < 2:
+        raise ValueError("signals require at least two microphones and two samples")
+    if n_mics > MAX_MICROPHONES or n_samples > MAX_SIGNAL_SAMPLES:
+        raise ValueError("signals exceed the microphone or sample safety limit")
+    if raw.size > MAX_SIGNAL_CELLS:
+        raise ValueError(f"signals exceed the {MAX_SIGNAL_CELLS}-value safety limit")
+    if not np.isfinite(raw).all():
+        raise ValueError("signals must contain only finite samples")
+    signals = _float_array(raw, "signals")
+    if not np.isfinite(signals).all():
+        raise ValueError("signals must contain only finite samples")
+    return signals
 
 
 def _rms(signal: np.ndarray) -> float:
@@ -88,9 +114,14 @@ def _stable_norm(vector: np.ndarray) -> float:
 
 
 def _search_grid(value: np.ndarray, name: str) -> np.ndarray:
-    grid = _real_array(value, name)
-    if grid.ndim != 1 or grid.size == 0:
+    raw = _raw_real_array(value, name)
+    if raw.ndim != 1 or raw.size == 0:
         raise ValueError(f"{name} must be a non-empty one-dimensional array")
+    if raw.size > MAX_SEARCH_CELLS:
+        raise ValueError(f"{name} exceeds the {MAX_SEARCH_CELLS}-value safety limit")
+    if not np.isfinite(raw).all():
+        raise ValueError(f"{name} must contain only finite values")
+    grid = _float_array(raw, name)
     if not np.isfinite(grid).all():
         raise ValueError(f"{name} must contain only finite values")
     return grid
@@ -217,8 +248,15 @@ def _validate_search_observability(
 
 def srp_peak_prominence(power: np.ndarray) -> float:
     """Return a robust, dimensionless prominence score for an SRP map."""
-    power = _real_array(power, "power")
-    if power.size == 0 or not np.isfinite(power).all():
+    raw = _raw_real_array(power, "power")
+    if raw.size == 0:
+        raise ValueError("power must be a non-empty finite array")
+    if raw.size > MAX_SEARCH_CELLS:
+        raise ValueError(f"power exceeds the {MAX_SEARCH_CELLS}-value safety limit")
+    if not np.isfinite(raw).all():
+        raise ValueError("power must be a non-empty finite array")
+    power = _float_array(raw, "power")
+    if not np.isfinite(power).all():
         raise ValueError("power must be a non-empty finite array")
     scale = float(np.max(np.abs(power)))
     if scale == 0:
@@ -252,22 +290,15 @@ def srp_phat(
     confident but arbitrary grid cell; set ``min_peak_prominence=None`` only when
     a caller has its own quality gate.
     """
-    signals = _real_array(signals, "signals")
-    if signals.ndim != 2:
-        raise ValueError("signals must have shape (n_mics, n_samples)")
+    signals = _signal_matrix(signals)
     n_mics, n_samples = signals.shape
-    if n_mics < 2 or n_samples < 2:
-        raise ValueError("signals require at least two microphones and two samples")
-    if n_mics > MAX_MICROPHONES or n_samples > MAX_SIGNAL_SAMPLES:
-        raise ValueError("signals exceed the microphone or sample safety limit")
-    if signals.size > MAX_SIGNAL_CELLS:
-        raise ValueError(f"signals exceed the {MAX_SIGNAL_CELLS}-value safety limit")
-    if not np.isfinite(signals).all():
-        raise ValueError("signals must contain only finite samples")
 
-    microphones = _real_array(mic_positions, "mic_positions")
-    if microphones.shape != (n_mics, 3):
+    raw_microphones = _raw_real_array(mic_positions, "mic_positions")
+    if raw_microphones.shape != (n_mics, 3):
         raise ValueError(f"mic_positions must have shape ({n_mics}, 3)")
+    if not np.isfinite(raw_microphones).all():
+        raise ValueError("mic_positions must contain only finite values")
+    microphones = _float_array(raw_microphones, "mic_positions")
     if not np.isfinite(microphones).all():
         raise ValueError("mic_positions must contain only finite values")
     fs = _finite_scalar(fs, "fs", positive=True)
@@ -395,9 +426,12 @@ def synth_plane_wave(
     seed: int = 0,
 ) -> np.ndarray:
     """Synthesize a broadband far-field plane wave for tests and demos."""
-    direction = _real_array(source, "source")
-    if direction.size != 3:
+    raw_direction = _raw_real_array(source, "source")
+    if raw_direction.size != 3:
         raise ValueError("source must contain three values")
+    if not np.isfinite(raw_direction).all():
+        raise ValueError("source must be a finite, non-zero direction")
+    direction = _float_array(raw_direction, "source")
     direction = direction.reshape(3)
     if not np.isfinite(direction).all():
         raise ValueError("source must be a finite, non-zero direction")
@@ -410,11 +444,18 @@ def synth_plane_wave(
         raise ValueError("source must be a finite, non-zero direction")
     direction = scaled_direction / scaled_norm
 
-    microphones = _real_array(mic_positions, "mic_positions")
-    if microphones.ndim != 2 or microphones.shape[1:] != (3,) or microphones.shape[0] == 0:
+    raw_microphones = _raw_real_array(mic_positions, "mic_positions")
+    if (
+        raw_microphones.ndim != 2
+        or raw_microphones.shape[1:] != (3,)
+        or raw_microphones.shape[0] == 0
+    ):
         raise ValueError("mic_positions must have shape (n_mics, 3)")
-    if microphones.shape[0] > MAX_MICROPHONES:
+    if raw_microphones.shape[0] > MAX_MICROPHONES:
         raise ValueError(f"mic_positions exceeds the {MAX_MICROPHONES}-microphone safety limit")
+    if not np.isfinite(raw_microphones).all():
+        raise ValueError("mic_positions must contain only finite values")
+    microphones = _float_array(raw_microphones, "mic_positions")
     if not np.isfinite(microphones).all():
         raise ValueError("mic_positions must contain only finite values")
     fs = _finite_scalar(fs, "fs", positive=True)

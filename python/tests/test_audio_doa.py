@@ -597,3 +597,84 @@ def test_audio_work_budgets_fail_before_large_allocations():
             fs=16000,
             duration=100.0,
         )
+
+
+def test_audio_input_caps_precede_float_widening(monkeypatch):
+    from manwe.audio import doa as doa_module
+    from manwe.audio import features as features_module
+
+    oversized_gcc_signal = np.broadcast_to(
+        np.array(1, dtype=np.int8),
+        (doa_module.MAX_SIGNAL_SAMPLES + 1,),
+    )
+    oversized_signal_matrix = np.broadcast_to(
+        np.array(1, dtype=np.int8),
+        (9, 888_889),
+    )
+    oversized_grid = np.broadcast_to(
+        np.array(1, dtype=np.int8),
+        (doa_module.MAX_SEARCH_CELLS + 1,),
+    )
+    oversized_source = np.broadcast_to(np.array(1, dtype=np.int8), (4,))
+    oversized_microphones = np.broadcast_to(np.array(1, dtype=np.int8), (65, 3))
+    oversized_feature_signal = np.broadcast_to(
+        np.array(1, dtype=np.int8),
+        (features_module.MAX_SIGNAL_SAMPLES + 1,),
+    )
+    forbidden_doa_inputs = (
+        oversized_gcc_signal,
+        oversized_signal_matrix,
+        oversized_grid,
+        oversized_source,
+        oversized_microphones,
+    )
+    real_doa_float_array = doa_module._float_array
+    real_feature_float_array = features_module._float_array
+
+    def guarded_doa_float_array(raw, name):
+        if any(
+            raw.shape == forbidden.shape and np.shares_memory(raw, forbidden)
+            for forbidden in forbidden_doa_inputs
+        ):
+            pytest.fail(f"{name} was widened before its raw shape/size limit")
+        return real_doa_float_array(raw, name)
+
+    def guarded_feature_float_array(raw, name):
+        if raw.shape == oversized_feature_signal.shape and np.shares_memory(
+            raw, oversized_feature_signal
+        ):
+            pytest.fail(f"{name} was widened before its raw shape/size limit")
+        return real_feature_float_array(raw, name)
+
+    monkeypatch.setattr(doa_module, "_float_array", guarded_doa_float_array)
+    monkeypatch.setattr(features_module, "_float_array", guarded_feature_float_array)
+
+    with pytest.raises(ValueError, match="sample safety limit"):
+        gcc_phat(oversized_gcc_signal, np.ones(2), fs=16000)
+    with pytest.raises(ValueError, match="value safety limit"):
+        srp_phat(
+            oversized_signal_matrix,
+            np.zeros((9, 3)),
+            fs=16000,
+            min_peak_prominence=None,
+        )
+    with pytest.raises(ValueError, match="value safety limit"):
+        doa_module._search_grid(oversized_grid, "az_grid")
+    with pytest.raises(ValueError, match="value safety limit"):
+        srp_peak_prominence(oversized_grid)
+    with pytest.raises(ValueError, match="three values"):
+        synth_plane_wave(
+            oversized_source,
+            np.zeros((2, 3)),
+            fs=100,
+            duration=0.02,
+        )
+    with pytest.raises(ValueError, match="microphone safety limit"):
+        synth_plane_wave(
+            np.ones(3),
+            oversized_microphones,
+            fs=100,
+            duration=0.02,
+        )
+    with pytest.raises(ValueError, match="sample safety limit"):
+        stft(oversized_feature_signal, n_fft=8)
