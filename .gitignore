@@ -144,6 +144,7 @@ dmypy.json
 .pyre/
 .pytype/
 .ruff_cache/
+mutants.out/
 nosetests.xml
 *.cover
 
