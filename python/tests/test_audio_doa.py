@@ -318,6 +318,35 @@ def test_signed_elevation_rejects_planar_microphone_geometry():
         )
 
 
+def test_srp_observability_excludes_subthreshold_microphones():
+    fs = 16000
+    microphones = _tetrahedral_mics()
+    signals = synth_plane_wave(
+        np.array([1.0, 0.0, 0.0]),
+        microphones,
+        fs,
+        duration=0.05,
+        seed=20260716,
+    )
+    # Only the first baseline is energetic. The other two channels are nonzero,
+    # but PHAT normalization must not promote their sub-threshold signals into
+    # geometric evidence. That active line cannot identify a full 3-D direction.
+    signals[2:] *= 1e-20
+    active_baseline = microphones[0] - microphones[1]
+    assert active_baseline @ np.array([1.0, 0.0, 0.0]) == active_baseline @ np.array(
+        [-1.0, 0.0, 0.0]
+    )
+
+    with pytest.raises(ValueError, match="cannot uniquely observe"):
+        srp_phat(
+            signals,
+            microphones,
+            fs,
+            min_rms=1e-8,
+            min_peak_prominence=None,
+        )
+
+
 def test_srp_rejects_a_prominent_but_unobservable_collinear_array_peak():
     fs = 16000
     microphones = np.array([[-0.1, 0.0, 0.0], [0.1, 0.0, 0.0]])
@@ -418,7 +447,8 @@ def test_huge_python_integers_are_rejected_as_values_not_type_errors():
 
 def test_detect_from_array_supports_negative_spl_and_silent_first_channel():
     fs = 16000
-    microphones = _tetrahedral_mics()
+    # Leave a full-rank tetrahedral sub-array after silencing the first channel.
+    microphones = np.vstack((np.zeros((1, 3)), _tetrahedral_mics()))
     signals = synth_plane_wave(np.array([1.0, 0.0, 0.0]), microphones, fs, seed=30)
     signals *= 1e-6
     signals[0] = 0.0

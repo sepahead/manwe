@@ -245,10 +245,12 @@ def srp_phat(
 ) -> tuple[float, float, np.ndarray]:
     """Estimate a dominant source over a configurable signed-elevation grid.
 
-    At least two energetic channels are required. The default prominence gate
-    rejects silence and incoherent noise rather than emitting a confident but
-    arbitrary grid cell; set ``min_peak_prominence=None`` only when a caller has
-    its own quality gate.
+    At least two energetic channels are required. Channels at or below
+    ``min_rms`` are excluded from both the steered power and the observability
+    proof: a silent microphone cannot supply a geometric constraint. The default
+    prominence gate rejects silence and incoherent noise rather than emitting a
+    confident but arbitrary grid cell; set ``min_peak_prominence=None`` only when
+    a caller has its own quality gate.
     """
     signals = _real_array(signals, "signals")
     if signals.ndim != 2:
@@ -286,8 +288,18 @@ def srp_phat(
         where=channel_peaks[:, None] > 0.0,
     )
     channel_rms = channel_peaks * np.sqrt(np.mean(normalized_signals**2, axis=1))
-    if np.count_nonzero(channel_rms > min_rms) < 2:
+    active_channels = channel_rms > min_rms
+    active_count = int(np.count_nonzero(active_channels))
+    if active_count < 2:
         raise ValueError("SRP-PHAT requires at least two non-silent microphone channels")
+
+    # PHAT normalization removes amplitude. Retaining a sub-threshold channel
+    # would therefore promote arbitrarily small noise to unit spectral weight,
+    # while retaining its baselines would falsely increase the rank used by the
+    # observability proof below. Restrict both arrays before constructing pairs.
+    normalized_signals = normalized_signals[active_channels]
+    microphones = microphones[active_channels]
+    n_mics = active_count
 
     pairs = [(first, second) for first in range(n_mics) for second in range(first + 1, n_mics)]
     baselines: dict[tuple[int, int], np.ndarray] = {}
