@@ -81,18 +81,32 @@ def test_directory_snapshot_enforces_byte_limit_during_copy(tmp_path, monkeypatc
     member = bundle / "weights.bin"
     member.write_bytes(b"a")
     expected = artifacts.sha256_artifact(bundle)
-    real_entries = artifacts._tree_entries
+    real_entries = artifacts._descriptor_tree_entries
     mutated = False
 
-    def mutate_after_enumeration(path, max_entries):
+    def mutate_before_descriptor_enumeration(
+        directory_fd,
+        *,
+        display,
+        max_entries,
+        **kwargs,
+    ):
         nonlocal mutated
-        entries = real_entries(path, max_entries)
-        if path == bundle and not mutated:
+        if not mutated:
             member.write_bytes(b"x" * 100)
             mutated = True
-        return entries
+        return real_entries(
+            directory_fd,
+            display=display,
+            max_entries=max_entries,
+            **kwargs,
+        )
 
-    monkeypatch.setattr(artifacts, "_tree_entries", mutate_after_enumeration)
+    monkeypatch.setattr(
+        artifacts,
+        "_descriptor_tree_entries",
+        mutate_before_descriptor_enumeration,
+    )
     with pytest.raises(ValueError, match="byte safety limit"):
         ArtifactSnapshot(bundle, expected, max_bytes=8)
 
@@ -101,8 +115,6 @@ def test_artifact_snapshot_closes_source_when_private_destination_open_fails(
     tmp_path,
     monkeypatch,
 ):
-    from pathlib import Path
-
     from manwe.common import artifacts
 
     source = tmp_path / "model.pt"
@@ -112,7 +124,7 @@ def test_artifact_snapshot_closes_source_when_private_destination_open_fails(
     source_fds: list[int] = []
 
     def fail_private_destination(path, *args, **kwargs):
-        if isinstance(path, Path) and path.name == "artifact.pt":
+        if path == "artifact.pt" and kwargs.get("dir_fd") is not None:
             raise OSError("injected destination open failure")
         fd = real_open(path, *args, **kwargs)
         if path == source.name and kwargs.get("dir_fd") is not None:
