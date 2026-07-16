@@ -686,8 +686,18 @@ fn decode_u64(bytes: [u8; 8], little_endian: bool) -> u64 {
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
 fn validate_native_executable(file: &File, file_len: u64, path: &Path) -> Result<()> {
+    let mut magic = [0_u8; 4];
+    read_exact_at(file, &mut magic, 0)
+        .with_context(|| format!("failed to read ELF magic from {}", path.display()))?;
+    if &magic != b"\x7fELF" {
+        anyhow::bail!(
+            "child executable is not a native ELF container: {}",
+            path.display()
+        )
+    }
     let mut header = [0_u8; 64];
-    read_exact_at(file, &mut header, 0)
+    header[..magic.len()].copy_from_slice(&magic);
+    read_exact_at(file, &mut header[magic.len()..], magic.len() as u64)
         .with_context(|| format!("failed to read ELF header from {}", path.display()))?;
     validate_elf_header(&header, file_len, path)
 }
@@ -1470,6 +1480,25 @@ mod tests {
         let error = executable.require_native_executable().unwrap_err();
 
         assert!(error.to_string().contains("not a native"));
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn native_executable_validation_rejects_a_truncated_elf_header() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = test_directory("truncated-elf");
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir(&directory).unwrap();
+        let executable_path = directory.join("tool");
+        std::fs::write(&executable_path, b"\x7fELF").unwrap();
+        std::fs::set_permissions(&executable_path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let executable = resolve_executable(&executable_path).unwrap();
+
+        let error = executable.require_native_executable().unwrap_err();
+
+        assert!(error.to_string().contains("truncated"));
         std::fs::remove_dir_all(directory).unwrap();
     }
 
