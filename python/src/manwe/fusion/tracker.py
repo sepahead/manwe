@@ -258,6 +258,8 @@ class TrackerConfig:
         _positive_int(self.max_substeps, "max_substeps", maximum=MAX_SUBSTEPS)
         _positive_int(self.max_measurements, "max_measurements", maximum=MAX_MEASUREMENTS)
         _positive_int(self.n_particles, "n_particles", maximum=MAX_PARTICLES)
+        if self.filter == "particle" and self.n_particles < 2:
+            raise ValueError("particle tracking requires at least 2 particles")
         _finite_number(self.max_position_cov_volume, "max_position_cov_volume", positive=True)
         _finite_number(self.init_vel_var, "init_vel_var", positive=True)
         _finite_number(self.init_merge_dist, "init_merge_dist", nonnegative=True)

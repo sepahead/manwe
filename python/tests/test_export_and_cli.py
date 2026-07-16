@@ -2,12 +2,15 @@
 
 import builtins
 import hashlib
+import sys
 import tempfile
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
 
 from manwe.cli import main
+from manwe.common.artifacts import require_pickle_acknowledgement
 from manwe.common.contracts import TensorSpec
 from manwe.eval.detection import Detections, GroundTruth
 from manwe.export import (
@@ -18,6 +21,12 @@ from manwe.export import (
 )
 
 _SOURCE_CLASSES = ("drone", "bird", "aircraft", "helicopter", "unknown")
+
+
+@pytest.mark.parametrize("acknowledgement", [1, "yes", object(), np.bool_(True)])
+def test_pickle_acknowledgement_rejects_truthy_non_booleans(tmp_path, acknowledgement):
+    with pytest.raises(TypeError, match="must be a boolean"):
+        require_pickle_acknowledgement(tmp_path / "model.pt", acknowledgement)
 
 
 def _export_pair(
@@ -401,3 +410,158 @@ def test_cli_numpy_only_commands(capsys, monkeypatch):
         )
         == 0
     )
+
+
+@pytest.mark.parametrize(
+    "broken_module",
+    ["torch", "ultralytics", "rfdetr", "sahi", "onnxruntime", "coremltools"],
+)
+def test_doctor_reports_broken_optional_native_module_without_crashing(
+    broken_module, capsys, monkeypatch
+):
+    real_import = builtins.__import__
+    optional_modules = {
+        "torch",
+        "ultralytics",
+        "rfdetr",
+        "sahi",
+        "onnxruntime",
+        "coremltools",
+    }
+
+    def import_with_broken_optional_module(name, *args, **kwargs):
+        if name == broken_module:
+            raise OSError("simulated broken native library")
+        if name in optional_modules:
+            raise ImportError(f"simulated absent optional dependency: {name}")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", import_with_broken_optional_module)
+
+    assert main(["doctor"]) == 0
+    output = capsys.readouterr().out
+    assert f"{broken_module:14s} ✗ installed but failed to load (native-library error)" in output
+    if broken_module != "torch":
+        assert "simulated broken native library" not in output
+
+
+@pytest.mark.parametrize("failure_call", [1, 2])
+def test_doctor_reports_deferred_torch_native_probe_failure_without_crashing(
+    failure_call, capsys, monkeypatch
+):
+    class BrokenCuda:
+        calls = 0
+
+        def is_available(self):
+            self.calls += 1
+            if self.calls == failure_call:
+                raise OSError("simulated deferred CUDA library failure")
+            return False
+
+    fake_torch = SimpleNamespace(
+        __version__="fixture",
+        cuda=BrokenCuda(),
+        backends=SimpleNamespace(mps=None),
+    )
+    monkeypatch.setitem(sys.modules, "torch", fake_torch)
+    real_import = builtins.__import__
+    absent_optional_modules = {
+        "ultralytics",
+        "rfdetr",
+        "sahi",
+        "onnxruntime",
+        "coremltools",
+    }
+
+    def import_without_other_optional_modules(name, *args, **kwargs):
+        if name in absent_optional_modules:
+            raise ImportError(f"simulated absent optional dependency: {name}")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", import_without_other_optional_modules)
+
+    assert main(["doctor"]) == 0
+    output = capsys.readouterr().out
+    if failure_call == 1:
+        assert '"torch_error": "simulated deferred CUDA library failure"' in output
+    else:
+        assert '"torch_error": null' in output
+        assert "resolved device: cpu (torch hardware probe failed)" in output
+    assert "torch          ✗ installed but failed to load (native-library error)" in output
+
+
+def test_device_resolution_does_not_probe_irrelevant_broken_backend(monkeypatch):
+    from manwe.common.device import resolve_device
+
+    class HealthyCuda:
+        @staticmethod
+        def is_available():
+            return True
+
+        @staticmethod
+        def device_count():
+            return 1
+
+        @staticmethod
+        def get_device_name(_index):
+            return "fixture CUDA"
+
+        @staticmethod
+        def get_device_capability(_index):
+            return (8, 0)
+
+    class BrokenMps:
+        calls = 0
+
+        def is_available(self):
+            self.calls += 1
+            raise OSError("irrelevant broken MPS backend")
+
+    broken_mps = BrokenMps()
+    monkeypatch.setitem(
+        sys.modules,
+        "torch",
+        SimpleNamespace(cuda=HealthyCuda(), backends=SimpleNamespace(mps=broken_mps)),
+    )
+
+    assert resolve_device("cuda").torch_device == "cuda:0"
+    assert resolve_device("auto").torch_device == "cuda:0"
+    assert broken_mps.calls == 0
+
+
+def test_device_resolution_and_description_isolate_broken_cuda_from_mps(monkeypatch):
+    from manwe.common.device import describe_hardware, resolve_device
+
+    class BrokenCuda:
+        calls = 0
+
+        def is_available(self):
+            self.calls += 1
+            raise OSError("broken CUDA probe")
+
+    class HealthyMps:
+        @staticmethod
+        def is_available():
+            return True
+
+        @staticmethod
+        def is_built():
+            return True
+
+    broken_cuda = BrokenCuda()
+    monkeypatch.setitem(
+        sys.modules,
+        "torch",
+        SimpleNamespace(
+            __version__="fixture",
+            cuda=broken_cuda,
+            backends=SimpleNamespace(mps=HealthyMps()),
+        ),
+    )
+
+    assert resolve_device("mps").torch_device == "mps"
+    assert broken_cuda.calls == 0
+    assert resolve_device("auto").torch_device == "mps"
+    hardware = describe_hardware()
+    assert hardware["mps"] == {"available": True, "built": True}
+    assert hardware["torch_error"] == "broken CUDA probe"

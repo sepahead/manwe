@@ -85,9 +85,14 @@ def _cmd_doctor(_args) -> int:
     from .common.device import describe_hardware, resolve_device
 
     hw = describe_hardware()
+    resolved_device = resolve_device("auto")
+    torch_probe_failed = hw.get("torch_error") is not None or resolved_device.name in {
+        "torch failed to load",
+        "torch hardware probe failed",
+    }
     print(f"manwe {__version__}")
     print(json.dumps(hw, indent=2))
-    print(f"resolved device: {resolve_device('auto')}")
+    print(f"resolved device: {resolved_device}")
     print("\noptional extras:")
     for mod, extra in [
         ("torch", "vision"),
@@ -99,12 +104,18 @@ def _cmd_doctor(_args) -> int:
     ]:
         try:
             __import__(mod)
-            status = "✓ installed"
+            status = (
+                "✗ installed but failed to load (native-library error)"
+                if mod == "torch" and torch_probe_failed
+                else "✓ installed"
+            )
         except ImportError:
             status = (
                 f"— missing (local extra manwe-perception[{extra}]: "
                 f"uv sync --locked --extra {extra})"
             )
+        except OSError:
+            status = "✗ installed but failed to load (native-library error)"
         print(f"  {mod:14s} {status}")
     return 0
 

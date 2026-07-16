@@ -703,10 +703,10 @@ class ParticleFilter:
         self.sigma_a = _validate_nonnegative_scalar(sigma_a, "sigma_a")
         self.H = position_measurement_matrix(self.dim)
         if isinstance(n_particles, bool) or not isinstance(n_particles, (int, np.integer)):
-            raise ValueError("n_particles must be a positive integer")
+            raise ValueError("n_particles must be an integer of at least 2")
         self.n_particles = int(n_particles)
-        if not 1 <= self.n_particles <= MAX_FILTER_PARTICLES:
-            raise ValueError(f"n_particles must be an integer in [1, {MAX_FILTER_PARTICLES}]")
+        if not 2 <= self.n_particles <= MAX_FILTER_PARTICLES:
+            raise ValueError(f"n_particles must be an integer in [2, {MAX_FILTER_PARTICLES}]")
         if rng is not None and not isinstance(rng, np.random.Generator):
             raise TypeError("rng must be a numpy.random.Generator or None")
         self.rng = rng if rng is not None else np.random.default_rng()

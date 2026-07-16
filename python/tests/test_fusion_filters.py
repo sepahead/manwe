@@ -499,7 +499,7 @@ def test_ukf_preserves_an_exact_singular_covariance_without_fake_jitter():
     assert np.array_equal(ukf.state.P, np.zeros((6, 6)))
 
 
-@pytest.mark.parametrize("n_particles", [0, -1, 1.5, True, 100_001])
+@pytest.mark.parametrize("n_particles", [0, -1, 1, 1.5, True, 100_001])
 def test_particle_filter_rejects_invalid_particle_counts(n_particles):
     with pytest.raises(ValueError):
         ParticleFilter(np.zeros(6), np.eye(6), n_particles=n_particles)

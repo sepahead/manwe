@@ -407,6 +407,8 @@ def verify_artifact(
 
 def require_pickle_acknowledgement(path: pathlib.Path, allowed: bool) -> None:
     """Require an explicit trust decision before a pickle-backed model can load."""
+    if type(allowed) is not bool:
+        raise TypeError("pickle acknowledgement must be a boolean")
     if path.suffix.lower() in {".pt", ".pth", ".ckpt", ".pkl", ".pickle"} and not allowed:
         raise ValueError(
             "pickle-backed checkpoints can execute code while loading; pass "

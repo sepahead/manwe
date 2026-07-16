@@ -111,6 +111,7 @@ def test_measurement_rejects_noncanonical_radar_elevation(elevation):
             "max_measurements": 1,
             "n_particles": 20_001,
         },
+        {"filter": "particle", "n_particles": 1},
         {"max_measurements": 10**1000},
     ],
 )
