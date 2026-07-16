@@ -11,7 +11,12 @@ from ..common.contracts import CREBAIN_CLASSES
 from ..common.deps import require
 from ..common.ultralytics import harden_ultralytics_runtime, verify_ultralytics_policy
 from .input import prepare_single_image
-from .postprocess import _real_numeric_array, _real_numeric_scalar, crebain_class_map
+from .postprocess import (
+    _float_numeric_array,
+    _raw_real_numeric_array,
+    _real_numeric_scalar,
+    crebain_class_map,
+)
 
 _MAX_PIXEL_MAGNITUDE = 1e9
 _MAX_DETECTIONS = 100_000
@@ -46,14 +51,18 @@ class Detection:
     class_index: int
 
     def __post_init__(self) -> None:
-        bbox = _real_numeric_array(
+        bbox_error = "bbox must contain four real numeric xyxy coordinates"
+        raw_bbox = _raw_real_numeric_array(
             self.bbox,
-            "bbox must contain four real numeric xyxy coordinates",
+            bbox_error,
         )
-        if bbox.shape != (4,) or not np.all(np.isfinite(bbox)):
+        if raw_bbox.shape != (4,) or not np.all(np.isfinite(raw_bbox)):
             raise ValueError("bbox must contain four finite xyxy coordinates")
-        if np.any(np.abs(bbox) > _MAX_PIXEL_MAGNITUDE):
+        if np.any(np.abs(raw_bbox) > _MAX_PIXEL_MAGNITUDE):
             raise ValueError(f"bbox coordinates must not exceed {_MAX_PIXEL_MAGNITUDE:g} pixels")
+        bbox = _float_numeric_array(raw_bbox, bbox_error)
+        if not np.all(np.isfinite(bbox)):
+            raise ValueError("bbox must contain four finite xyxy coordinates")
         if bbox[2] <= bbox[0] or bbox[3] <= bbox[1]:
             raise ValueError("bbox must have positive area")
         confidence = _real_numeric_scalar(
@@ -112,32 +121,41 @@ def results_to_detections(
     unit-tested without torch.
     """
     remap = crebain_class_map(model_names)
-    boxes = _real_numeric_array(boxes_xyxy, "detector boxes must be real numeric arrays")
-    scores = _real_numeric_array(confidences, "detector confidences must be real numeric arrays")
+    box_error = "detector boxes must be real numeric arrays"
+    score_error = "detector confidences must be real numeric arrays"
+    raw_boxes = _raw_real_numeric_array(boxes_xyxy, box_error)
+    raw_scores = _raw_real_numeric_array(confidences, score_error)
     try:
         raw_ids = np.asarray(class_ids)
     except (TypeError, ValueError, OverflowError) as exc:
         raise ValueError("detector class_ids must be a numeric array") from exc
-    if boxes.shape == (0,):
-        boxes = boxes.reshape(0, 4)
-    elif boxes.shape == (4,):
-        boxes = boxes.reshape(1, 4)
-    if boxes.ndim != 2 or boxes.shape[1:] != (4,):
-        raise ValueError(f"boxes_xyxy must have shape (N, 4), got {boxes.shape}")
-    if len(boxes) > _MAX_DETECTIONS:
+    if raw_boxes.shape == (0,):
+        raw_boxes = raw_boxes.reshape(0, 4)
+    elif raw_boxes.shape == (4,):
+        raw_boxes = raw_boxes.reshape(1, 4)
+    if raw_boxes.ndim != 2 or raw_boxes.shape[1:] != (4,):
+        raise ValueError(f"boxes_xyxy must have shape (N, 4), got {raw_boxes.shape}")
+    if len(raw_boxes) > _MAX_DETECTIONS:
         raise ValueError(f"detector output exceeds the {_MAX_DETECTIONS}-detection safety limit")
-    if scores.ndim != 1 or raw_ids.ndim != 1:
+    if raw_scores.ndim != 1 or raw_ids.ndim != 1:
         raise ValueError("confidences and class_ids must be one-dimensional")
-    if len(scores) != len(boxes) or len(raw_ids) != len(boxes):
+    if len(raw_scores) != len(raw_boxes) or len(raw_ids) != len(raw_boxes):
         raise ValueError("boxes, confidences, and class_ids must have equal lengths")
-    if not np.all(np.isfinite(boxes)) or (
-        len(boxes) and (np.any(boxes[:, 2] <= boxes[:, 0]) or np.any(boxes[:, 3] <= boxes[:, 1]))
+    if not np.all(np.isfinite(raw_boxes)) or (
+        len(raw_boxes)
+        and (
+            np.any(raw_boxes[:, 2] <= raw_boxes[:, 0]) or np.any(raw_boxes[:, 3] <= raw_boxes[:, 1])
+        )
     ):
         raise ValueError("boxes_xyxy must contain finite positive-area boxes")
-    if np.any(np.abs(boxes) > _MAX_PIXEL_MAGNITUDE):
+    if np.any(np.abs(raw_boxes) > _MAX_PIXEL_MAGNITUDE):
         raise ValueError(f"box coordinates must not exceed {_MAX_PIXEL_MAGNITUDE:g} pixels")
-    if not np.all(np.isfinite(scores)) or np.any((scores < 0.0) | (scores > 1.0)):
+    if not np.all(np.isfinite(raw_scores)) or np.any((raw_scores < 0.0) | (raw_scores > 1.0)):
         raise ValueError("confidences must contain finite probabilities in [0, 1]")
+    boxes = _float_numeric_array(raw_boxes, box_error)
+    scores = _float_numeric_array(raw_scores, score_error)
+    if not np.all(np.isfinite(boxes)) or not np.all(np.isfinite(scores)):
+        raise ValueError("detector outputs must remain finite in float64")
     if np.issubdtype(raw_ids.dtype, np.bool_):
         raise ValueError("class_ids must contain finite nonnegative integer indices")
     if np.issubdtype(raw_ids.dtype, np.integer):

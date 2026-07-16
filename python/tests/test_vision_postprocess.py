@@ -238,6 +238,85 @@ def test_nms_exact_boundary_is_scale_invariant():
         assert nms(scaled, scores, iou_threshold=0.0) == [0]
 
 
+def test_vision_shape_and_work_caps_precede_float_widening(monkeypatch):
+    from manwe.vision import postprocess as postprocess_module
+    from manwe.vision import predict as predict_module
+
+    oversized_xywh = np.broadcast_to(
+        np.array([1, 1, 1, 1], dtype=np.int8),
+        (postprocess_module._MAX_BOX_ARRAY_BOXES + 1, 4),
+    )
+    oversized_nms = np.broadcast_to(
+        np.array([0, 0, 1, 1], dtype=np.int8),
+        (postprocess_module._MAX_NMS_BOXES + 1, 4),
+    )
+    malformed_boxes = np.broadcast_to(np.array(1, dtype=np.int8), (1, 4_000_000))
+    mismatched_scores = np.broadcast_to(np.array(1, dtype=np.int8), (4_000_000,))
+    oversized_detector_boxes = np.broadcast_to(
+        np.array([0, 0, 1, 1], dtype=np.int8),
+        (predict_module._MAX_DETECTIONS + 1, 4),
+    )
+    forbidden = (
+        oversized_xywh,
+        oversized_nms,
+        malformed_boxes,
+        mismatched_scores,
+        oversized_detector_boxes,
+    )
+    real_float_array = postprocess_module._float_numeric_array
+
+    def guarded_float_array(raw, error_message):
+        if any(
+            raw.shape == rejected.shape and np.shares_memory(raw, rejected)
+            for rejected in forbidden
+        ):
+            pytest.fail("vision input was widened before raw shape/work admission")
+        return real_float_array(raw, error_message)
+
+    monkeypatch.setattr(postprocess_module, "_float_numeric_array", guarded_float_array)
+    monkeypatch.setattr(predict_module, "_float_numeric_array", guarded_float_array)
+
+    with pytest.raises(ValueError, match="box safety limit"):
+        xywh2xyxy(oversized_xywh)
+    with pytest.raises(ValueError, match="box safety limit"):
+        scale_boxes(oversized_xywh, 1.0, (0.0, 0.0), (2, 2))
+    with pytest.raises(ValueError, match="quadratic-work limit"):
+        nms(oversized_nms, np.ones(len(oversized_nms), dtype=np.int8))
+    with pytest.raises(ValueError, match=r"shape \(\.\.\., 4\)"):
+        xywh2xyxy(malformed_boxes)
+    with pytest.raises(ValueError, match="match the box count"):
+        nms(np.array([[0, 0, 1, 1]], dtype=np.int8), mismatched_scores)
+    with pytest.raises(ValueError, match="equal lengths"):
+        results_to_detections(
+            np.array([[0, 0, 1, 1]], dtype=np.int8),
+            mismatched_scores,
+            np.array([0], dtype=np.int8),
+            {0: "drone"},
+        )
+    with pytest.raises(ValueError, match="detection safety limit"):
+        results_to_detections(
+            oversized_detector_boxes,
+            np.ones(len(oversized_detector_boxes), dtype=np.int8),
+            np.zeros(len(oversized_detector_boxes), dtype=np.int8),
+            {0: "drone"},
+        )
+    with pytest.raises(ValueError, match="four finite"):
+        Detection(malformed_boxes, 0.5, "drone", 0)
+
+
+def test_vision_fixed_shapes_reject_object_coercion_without_calling_float():
+    class Coercive:
+        calls = 0
+
+        def __float__(self):
+            type(self).calls += 1
+            return 1.0
+
+    with pytest.raises(ValueError, match="real numeric"):
+        Detection(np.full(4, Coercive(), dtype=object), 0.5, "drone", 0)
+    assert Coercive.calls == 0
+
+
 def test_resolve_ultralytics_device():
     assert resolve_ultralytics_device(Device("cuda", index=1)) == "1"
     assert resolve_ultralytics_device(Device("mps")) == "mps"

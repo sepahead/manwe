@@ -13,6 +13,7 @@ from ..common.contracts import CREBAIN_CLASSES, coco_to_crebain, crebain_class_i
 
 _MAX_COORDINATE_MAGNITUDE = np.sqrt(np.finfo(np.float64).max) / 4.0
 _MAX_EXACT_IMAGE_DIMENSION = 2**53
+_MAX_BOX_ARRAY_BOXES = 100_000
 _MAX_NMS_BOXES = 4096
 _MAX_NMS_PAIR_WORK = 10_000_000
 _MAX_MODEL_CLASSES = 4096
@@ -42,13 +43,17 @@ def _require_representable_coordinates(value: np.ndarray, name: str) -> None:
         )
 
 
-def _real_numeric_array(value: object, error_message: str) -> np.ndarray:
+def _raw_real_numeric_array(value: object, error_message: str) -> np.ndarray:
     try:
         raw = np.asarray(value)
     except (TypeError, ValueError, OverflowError) as exc:
         raise ValueError(error_message) from exc
     if raw.dtype.kind not in "iuf":
         raise ValueError(error_message)
+    return raw
+
+
+def _float_numeric_array(raw: np.ndarray, error_message: str) -> np.ndarray:
     try:
         with np.errstate(over="ignore", invalid="ignore"):
             return np.asarray(raw, dtype=float)
@@ -75,18 +80,31 @@ def _round_ratio_ties_to_even(numerator: int, denominator: int) -> int:
     return quotient
 
 
-def _boxes(value: np.ndarray, name: str, *, require_positive_area: bool = True) -> np.ndarray:
-    boxes = _real_numeric_array(
+def _boxes(
+    value: np.ndarray,
+    name: str,
+    *,
+    require_positive_area: bool = True,
+    max_boxes: int = _MAX_BOX_ARRAY_BOXES,
+    limit_message: str | None = None,
+) -> np.ndarray:
+    error_message = f"{name} must be a real numeric array ending in four coordinates"
+    raw = _raw_real_numeric_array(
         value,
-        f"{name} must be a real numeric array ending in four coordinates",
+        error_message,
     )
-    if boxes.shape == (4,):
-        boxes = boxes.reshape(1, 4)
-    if boxes.ndim != 2 or boxes.shape[1:] != (4,):
-        raise ValueError(f"{name} must have shape (N, 4), got {boxes.shape}")
+    if raw.shape == (4,):
+        raw = raw.reshape(1, 4)
+    if raw.ndim != 2 or raw.shape[1:] != (4,):
+        raise ValueError(f"{name} must have shape (N, 4), got {raw.shape}")
+    if len(raw) > max_boxes:
+        raise ValueError(limit_message or f"{name} exceeds the {max_boxes}-box safety limit")
+    if not np.all(np.isfinite(raw)):
+        raise ValueError(f"{name} must contain only finite coordinates")
+    _require_representable_coordinates(raw, name)
+    boxes = _float_numeric_array(raw, error_message)
     if not np.all(np.isfinite(boxes)):
         raise ValueError(f"{name} must contain only finite coordinates")
-    _require_representable_coordinates(boxes, name)
     if require_positive_area and (
         np.any(boxes[..., 2] <= boxes[..., 0]) or np.any(boxes[..., 3] <= boxes[..., 1])
     ):
@@ -124,17 +142,24 @@ def letterbox_params(
 
 def xywh2xyxy(boxes: np.ndarray) -> np.ndarray:
     """Convert ``[cx, cy, w, h]`` boxes to ``[x1, y1, x2, y2]``."""
-    boxes = _real_numeric_array(
+    error_message = "boxes must be a real numeric array ending in four coordinates"
+    raw = _raw_real_numeric_array(
         boxes,
-        "boxes must be a real numeric array ending in four coordinates",
+        error_message,
     )
-    if boxes.shape == (4,):
-        boxes = boxes.reshape(1, 4)
-    if boxes.ndim < 2 or boxes.shape[-1] != 4:
-        raise ValueError(f"boxes must have shape (..., 4), got {boxes.shape}")
+    if raw.shape == (4,):
+        raw = raw.reshape(1, 4)
+    if raw.ndim < 2 or raw.shape[-1] != 4:
+        raise ValueError(f"boxes must have shape (..., 4), got {raw.shape}")
+    box_count = raw.size // 4
+    if box_count > _MAX_BOX_ARRAY_BOXES:
+        raise ValueError(f"boxes exceed the {_MAX_BOX_ARRAY_BOXES}-box safety limit")
+    if not np.all(np.isfinite(raw)):
+        raise ValueError("boxes must contain only finite values")
+    _require_representable_coordinates(raw, "boxes")
+    boxes = _float_numeric_array(raw, error_message)
     if not np.all(np.isfinite(boxes)):
         raise ValueError("boxes must contain only finite values")
-    _require_representable_coordinates(boxes, "boxes")
     if np.any(boxes[..., 2:] <= 0.0):
         raise ValueError("xywh widths and heights must be positive")
     out = np.empty_like(boxes)
@@ -158,10 +183,14 @@ def scale_boxes(
         raise ValueError("ratio must be finite and positive")
     if not isinstance(pad, tuple) or len(pad) != 2:
         raise ValueError("pad must be a finite (pad_w, pad_h) tuple")
-    pad_values = _real_numeric_array(pad, "pad must be a finite (pad_w, pad_h) tuple")
-    if pad_values.shape != (2,) or not np.all(np.isfinite(pad_values)):
+    pad_error = "pad must be a finite (pad_w, pad_h) tuple"
+    raw_pad = _raw_real_numeric_array(pad, pad_error)
+    if raw_pad.shape != (2,) or not np.all(np.isfinite(raw_pad)):
         raise ValueError("pad must be a finite (pad_w, pad_h) tuple")
-    _require_representable_coordinates(pad_values, "pad")
+    _require_representable_coordinates(raw_pad, "pad")
+    pad_values = _float_numeric_array(raw_pad, pad_error)
+    if not np.all(np.isfinite(pad_values)):
+        raise ValueError("pad must be a finite (pad_w, pad_h) tuple")
     pad_w, pad_h = pad_values
     boxes[..., [0, 2]] -= pad_w
     boxes[..., [1, 3]] -= pad_h
@@ -188,11 +217,21 @@ def nms(
     labels: np.ndarray | None = None,
 ) -> list[int]:
     """Greedy NMS, optionally class-aware, returning score-descending indices."""
-    boxes = _boxes(boxes_xyxy, "boxes_xyxy")
-    scores = _real_numeric_array(scores, "scores must be a real numeric one-dimensional array")
-    if scores.ndim != 1 or len(scores) != len(boxes):
+    work_limit_message = "NMS input exceeds the bounded quadratic-work limit"
+    boxes = _boxes(
+        boxes_xyxy,
+        "boxes_xyxy",
+        max_boxes=_MAX_NMS_BOXES,
+        limit_message=work_limit_message,
+    )
+    score_error = "scores must be a real numeric one-dimensional array"
+    raw_scores = _raw_real_numeric_array(scores, score_error)
+    if raw_scores.ndim != 1 or len(raw_scores) != len(boxes):
         raise ValueError("scores must have shape (N,) and match the box count")
-    if not np.all(np.isfinite(scores)) or np.any((scores < 0.0) | (scores > 1.0)):
+    if not np.all(np.isfinite(raw_scores)) or np.any((raw_scores < 0.0) | (raw_scores > 1.0)):
+        raise ValueError("scores must contain finite probabilities in [0, 1]")
+    scores = _float_numeric_array(raw_scores, score_error)
+    if not np.all(np.isfinite(scores)):
         raise ValueError("scores must contain finite probabilities in [0, 1]")
     validated_labels: np.ndarray | None = None
     if labels is not None:
@@ -211,7 +250,7 @@ def nms(
     if len(boxes) == 0:
         return []
     if len(boxes) > _MAX_NMS_BOXES or len(boxes) * (len(boxes) - 1) // 2 > _MAX_NMS_PAIR_WORK:
-        raise ValueError("NMS input exceeds the bounded quadratic-work limit")
+        raise ValueError(work_limit_message)
     x1, y1, x2, y2 = boxes[:, 0], boxes[:, 1], boxes[:, 2], boxes[:, 3]
     original_indices = np.arange(len(boxes))
     tie_keys: tuple[np.ndarray, ...] = (original_indices, y2, x2, y1, x1)
