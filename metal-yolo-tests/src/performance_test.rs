@@ -14,6 +14,7 @@
 //! - P99 latency (99th percentile - slowest frames / potential dropped frames)
 
 use std::env;
+use std::ffi::OsString;
 use std::fs::{self, OpenOptions};
 use std::io::{Cursor, Write};
 use std::path::{Path, PathBuf};
@@ -25,9 +26,9 @@ use candle_nn::{Module, VarBuilder};
 use clap::Parser;
 use manwe::model::{Multiples, YoloV8};
 use manwe::secure_io::{
-    open_bounded_regular_file, read_bounded_open_file, read_bounded_regular_file,
-    read_bounded_regular_file_with_identity, sha256_hex, BoundDirectory, FileIdentity,
-    MAX_ENCODED_IMAGE_BYTES, MAX_MODEL_BYTES,
+    bounded_open_file_identity, open_bounded_regular_file, read_bounded_open_file,
+    read_bounded_regular_file, read_bounded_regular_file_with_identity, sha256_hex, BoundDirectory,
+    FileIdentity, MAX_ENCODED_IMAGE_BYTES, MAX_MODEL_BYTES,
 };
 use manwe::{prepare_image, validate_coco_detection_output_schema, validate_coco_model_output};
 use serde_json::json;
@@ -146,6 +147,40 @@ fn create_private_directory(path: &Path) -> std::io::Result<()> {
     builder.create(path)
 }
 
+fn set_owner_only_permissions(file: &fs::File) -> std::io::Result<()> {
+    #[cfg(not(unix))]
+    {
+        let _ = file;
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "owner-only benchmark evidence permissions require Unix",
+        ))
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        file.set_permissions(fs::Permissions::from_mode(0o600))
+    }
+}
+
+fn require_owner_only_permissions(file: &fs::File, path: &Path) -> anyhow::Result<()> {
+    #[cfg(not(unix))]
+    {
+        let _ = (file, path);
+        anyhow::bail!("owner-only benchmark evidence permissions require Unix")
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        if file.metadata()?.permissions().mode() & 0o7777 != 0o600 {
+            anyhow::bail!("benchmark evidence is not owner-only: {}", path.display())
+        }
+        Ok(())
+    }
+}
+
 fn path_occupied(path: &Path) -> anyhow::Result<bool> {
     match fs::symlink_metadata(path) {
         Ok(_) => Ok(true),
@@ -161,6 +196,7 @@ fn verify_json_file(path: &Path, expected: &[u8]) -> anyhow::Result<FileIdentity
     let max_bytes = u64::try_from(MAX_RESULT_BYTES).context("result size limit overflowed")?;
     let (mut file, identity) = open_bounded_regular_file(path, max_bytes)?;
     let actual = read_bounded_open_file(&mut file, identity, path, max_bytes)?;
+    require_owner_only_permissions(&file, path)?;
     if actual != expected {
         anyhow::bail!("result JSON verification failed: {}", path.display())
     }
@@ -174,30 +210,49 @@ fn write_verified_json_once(path: &Path, value: &serde_json::Value) -> anyhow::R
     if bytes.len() > MAX_RESULT_BYTES {
         anyhow::bail!("result JSON exceeds the {MAX_RESULT_BYTES}-byte limit")
     }
-    let mut file = OpenOptions::new().write(true).create_new(true).open(path)?;
+    let mut options = OpenOptions::new();
+    options.read(true).write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        options.mode(0o600);
+    }
+    let mut file = options.open(path)?;
+    set_owner_only_permissions(&file)?;
     file.write_all(&bytes)?;
     file.sync_all()?;
-    drop(file);
-    verify_json_file(path, &bytes)?;
+    let max_bytes = u64::try_from(MAX_RESULT_BYTES).context("result size limit overflowed")?;
+    let identity = bounded_open_file_identity(&file, path, max_bytes)?;
+    let actual = read_bounded_open_file(&mut file, identity, path, max_bytes)?;
+    require_owner_only_permissions(&file, path)?;
+    if actual != bytes {
+        anyhow::bail!("result JSON verification failed: {}", path.display())
+    }
+    serde_json::from_slice::<serde_json::Value>(&actual)
+        .with_context(|| format!("staged result is not valid JSON: {}", path.display()))?;
     Ok(bytes)
 }
 
+#[derive(Debug)]
 struct EvidenceRun {
     run_dir: BoundDirectory,
     stage_dir: BoundDirectory,
+    stage_name: OsString,
     stage_result: PathBuf,
     result_path: PathBuf,
     final_link_created: bool,
     committed: bool,
+    cleanup_started: bool,
 }
 
 impl EvidenceRun {
     fn acquire(run_dir: &Path, run_id: &str) -> anyhow::Result<Self> {
         let run_dir = BoundDirectory::open(run_dir)?;
+        run_dir.require_owner_mutation_boundary()?;
         let result_path = run_dir.path().join(format!("results_rust_{run_id}.json"));
-        let stage_path = run_dir
-            .path()
-            .join(format!(".manwe-static-benchmark-{run_id}.in-progress"));
+        let stage_name = OsString::from(format!(".manwe-static-benchmark-{run_id}.in-progress"));
+        let stage_path = run_dir.path().join(&stage_name);
         run_dir.verify()?;
         match create_private_directory(&stage_path) {
             Ok(()) => {}
@@ -210,10 +265,8 @@ impl EvidenceRun {
         let stage_dir = match BoundDirectory::open(&stage_path) {
             Ok(directory) => directory,
             Err(error) => {
-                if run_dir.verify().is_ok() {
-                    let _ = fs::remove_dir_all(&stage_path);
-                    let _ = run_dir.sync();
-                }
+                let _ = run_dir.remove_directory_entry(&stage_name);
+                let _ = run_dir.sync();
                 return Err(error);
             }
         };
@@ -221,12 +274,14 @@ impl EvidenceRun {
             stage_result: stage_dir.path().join("result.json"),
             run_dir,
             stage_dir,
+            stage_name,
             result_path,
             final_link_created: false,
             committed: false,
+            cleanup_started: false,
         };
         run.run_dir.sync()?;
-        run.stage_dir.verify()?;
+        run.stage_dir.require_owner_mutation_boundary()?;
         if path_occupied(&run.result_path)? {
             anyhow::bail!("run id would overwrite existing benchmark evidence")
         }
@@ -252,33 +307,42 @@ impl EvidenceRun {
         }
         self.run_dir.sync()?;
         self.committed = true;
-        match self
-            .run_dir
-            .verify()
-            .and_then(|()| self.stage_dir.verify())
-            .and_then(|()| fs::remove_dir_all(self.stage_dir.path()).map_err(Into::into))
-        {
-            Ok(()) => {
-                if let Err(error) = self.run_dir.sync() {
-                    eprintln!("result was published but staging cleanup sync failed: {error}");
-                }
-            }
-            Err(error) => {
-                eprintln!("result was published but staging cleanup failed: {error}");
-            }
+        self.cleanup_started = true;
+        self.cleanup_staging(true).context(
+            "evidence publication is committed; staging cleanup is incomplete or its durability is unknown",
+        )
+    }
+
+    fn cleanup_staging(&self, require_result: bool) -> anyhow::Result<()> {
+        self.cleanup_staging_with_hook(require_result, || {})
+    }
+
+    fn cleanup_staging_with_hook(
+        &self,
+        require_result: bool,
+        after_directory_removal: impl FnOnce(),
+    ) -> anyhow::Result<()> {
+        self.run_dir.require_owner_mutation_boundary()?;
+        self.stage_dir.verify()?;
+        if require_result {
+            self.stage_dir
+                .remove_file_entry(std::ffi::OsStr::new("result.json"))?;
+        } else {
+            self.stage_dir
+                .remove_file_entry_if_exists(std::ffi::OsStr::new("result.json"))?;
         }
-        Ok(())
+        self.stage_dir.sync()?;
+        self.run_dir.remove_directory_entry(&self.stage_name)?;
+        after_directory_removal();
+        self.run_dir.sync()
     }
 }
 
 impl Drop for EvidenceRun {
     fn drop(&mut self) {
-        if (self.committed || !self.final_link_created)
-            && self.run_dir.verify().is_ok()
-            && self.stage_dir.verify().is_ok()
-        {
-            let _ = fs::remove_dir_all(self.stage_dir.path());
-            let _ = self.run_dir.sync();
+        if !self.cleanup_started && !self.committed && !self.final_link_created {
+            self.cleanup_started = true;
+            let _ = self.cleanup_staging(false);
         }
     }
 }
@@ -578,6 +642,109 @@ mod tests {
     }
 
     #[test]
+    fn committed_publication_reports_incomplete_cleanup_without_retrying_drop() {
+        let directory = evidence_test_directory("committed-cleanup-error");
+        let _ = fs::remove_dir_all(&directory);
+        fs::create_dir(&directory).unwrap();
+        let mut run = EvidenceRun::acquire(&directory, "cleanup_error").unwrap();
+        let stage_dir = run.stage_dir.path().to_path_buf();
+        let sentinel = stage_dir.join("unexpected");
+        fs::write(&sentinel, b"preserve").unwrap();
+
+        let error = run
+            .publish(&serde_json::json!({"committed": true}))
+            .unwrap_err();
+
+        assert!(error.to_string().contains("publication is committed"));
+        assert!(run.result_path().is_file());
+        assert_eq!(fs::read(&sentinel).unwrap(), b"preserve");
+        drop(run);
+        assert!(stage_dir.is_dir());
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn committed_cleanup_sync_failure_does_not_recreate_or_retry_the_marker() {
+        let directory = evidence_test_directory("post-removal-sync-error");
+        let moved = directory.with_extension("moved");
+        let _ = fs::remove_dir_all(&directory);
+        let _ = fs::remove_dir_all(&moved);
+        fs::create_dir(&directory).unwrap();
+        let mut run = EvidenceRun::acquire(&directory, "sync_error").unwrap();
+        let expected =
+            write_verified_json_once(&run.stage_result, &serde_json::json!({"committed": true}))
+                .unwrap();
+        fs::hard_link(&run.stage_result, &run.result_path).unwrap();
+        run.final_link_created = true;
+        verify_json_file(&run.stage_result, &expected).unwrap();
+        verify_json_file(&run.result_path, &expected).unwrap();
+        run.run_dir.sync().unwrap();
+        run.committed = true;
+        run.cleanup_started = true;
+        let stage_name = run.stage_name.clone();
+        let final_name = run.result_path.file_name().unwrap().to_owned();
+
+        let error = run
+            .cleanup_staging_with_hook(true, || {
+                fs::rename(&directory, &moved).unwrap();
+                fs::create_dir(&directory).unwrap();
+            })
+            .unwrap_err();
+
+        assert!(error.to_string().contains("directory identity changed"));
+        assert!(moved.join(final_name).is_file());
+        assert!(!moved.join(stage_name).exists());
+        drop(run);
+        assert!(!moved
+            .join(".manwe-static-benchmark-sync_error.in-progress")
+            .exists());
+        fs::remove_dir_all(directory).unwrap();
+        fs::remove_dir_all(moved).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn published_static_evidence_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = evidence_test_directory("private-mode");
+        let _ = fs::remove_dir_all(&directory);
+        fs::create_dir(&directory).unwrap();
+        let mut run = EvidenceRun::acquire(&directory, "private_mode").unwrap();
+        let result_path = run.result_path().to_path_buf();
+
+        run.publish(&serde_json::json!({"complete": true})).unwrap();
+
+        let mode = fs::metadata(&result_path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn staging_cleanup_rejects_a_replaced_directory_without_recursive_deletion() {
+        let directory = evidence_test_directory("stage-replacement");
+        let moved = directory.with_extension("stage-moved");
+        let _ = fs::remove_dir_all(&directory);
+        let _ = fs::remove_dir_all(&moved);
+        fs::create_dir(&directory).unwrap();
+        let run = EvidenceRun::acquire(&directory, "cleanup_replacement").unwrap();
+        let stage_path = run.stage_dir.path().to_path_buf();
+        fs::rename(&stage_path, &moved).unwrap();
+        fs::create_dir(&stage_path).unwrap();
+        let sentinel = stage_path.join("do-not-delete");
+        fs::write(&sentinel, b"replacement").unwrap();
+
+        let error = run.cleanup_staging(false).unwrap_err();
+
+        assert!(error.to_string().contains("directory identity changed"));
+        assert_eq!(fs::read(sentinel).unwrap(), b"replacement");
+        assert!(moved.is_dir());
+        drop(run);
+        fs::remove_dir_all(directory).unwrap();
+        fs::remove_dir_all(moved).unwrap();
+    }
+
+    #[test]
     fn evidence_run_does_not_replace_output_created_after_reservation() {
         let directory = evidence_test_directory("occupied");
         let _ = fs::remove_dir_all(&directory);
@@ -610,6 +777,42 @@ mod tests {
 
         assert!(!stage_dir.exists());
         assert!(!directory.join("results_rust_run_3.json").exists());
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn evidence_cleanup_preserves_unexpected_nested_content() {
+        let directory = evidence_test_directory("unexpected-stage-content");
+        let _ = fs::remove_dir_all(&directory);
+        fs::create_dir(&directory).unwrap();
+        let run = EvidenceRun::acquire(&directory, "unexpected_content").unwrap();
+        let stage_dir = run.stage_dir.path().to_path_buf();
+        let nested = stage_dir.join("unexpected");
+        fs::create_dir(&nested).unwrap();
+        let sentinel = nested.join("sentinel");
+        fs::write(&sentinel, b"preserve-me").unwrap();
+
+        drop(run);
+
+        assert_eq!(fs::read(sentinel).unwrap(), b"preserve-me");
+        assert!(stage_dir.is_dir());
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn evidence_run_rejects_a_group_writable_run_directory() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = evidence_test_directory("writable-run-directory");
+        let _ = fs::remove_dir_all(&directory);
+        fs::create_dir(&directory).unwrap();
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o770)).unwrap();
+
+        let error = EvidenceRun::acquire(&directory, "unsafe_boundary").unwrap_err();
+
+        assert!(error.to_string().contains("group- or world-writable"));
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
         fs::remove_dir_all(directory).unwrap();
     }
 

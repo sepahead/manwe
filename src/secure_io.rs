@@ -229,6 +229,119 @@ impl BoundDirectory {
         self.file.sync_all()?;
         self.verify()
     }
+
+    /// Require this directory to be an owner-controlled mutation boundary.
+    ///
+    /// Cleanup operations trust the effective OS account (and root), but reject a
+    /// directory that another account can mutate through mode bits or a mutating
+    /// macOS extended ACL.
+    pub fn require_owner_mutation_boundary(&self) -> Result<()> {
+        self.verify()?;
+        #[cfg(not(unix))]
+        {
+            anyhow::bail!("owner-controlled directory mutation requires Unix")
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+
+            let metadata = self.file.metadata()?;
+            // SAFETY: `geteuid` has no pointer arguments and only reads process credentials.
+            let effective_uid = unsafe { libc::geteuid() };
+            if metadata.uid() != effective_uid {
+                anyhow::bail!(
+                    "directory must be owned by the effective account: {}",
+                    self.path.display()
+                )
+            }
+            ensure_trusted_path_component(&self.path, &metadata, false)?;
+            ensure_no_access_granting_extended_acl(&self.path)?;
+            let mut ancestor = self.path.parent();
+            while let Some(directory) = ancestor {
+                let metadata = std::fs::symlink_metadata(directory).with_context(|| {
+                    format!(
+                        "failed to inspect mutation-boundary path component {}",
+                        directory.display()
+                    )
+                })?;
+                if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                    anyhow::bail!(
+                        "mutation-boundary path component is not a canonical directory: {}",
+                        directory.display()
+                    )
+                }
+                ensure_trusted_path_component(directory, &metadata, true)?;
+                ancestor = directory.parent();
+            }
+            self.verify()
+        }
+    }
+
+    /// Remove one non-directory entry relative to this bound directory.
+    pub fn remove_file_entry(&self, name: &std::ffi::OsStr) -> Result<()> {
+        self.remove_entry(name, 0, false).map(|_| ())
+    }
+
+    /// Remove one non-directory entry if present, returning whether it existed.
+    pub fn remove_file_entry_if_exists(&self, name: &std::ffi::OsStr) -> Result<bool> {
+        self.remove_entry(name, 0, true)
+    }
+
+    /// Remove one empty directory entry relative to this bound directory.
+    pub fn remove_directory_entry(&self, name: &std::ffi::OsStr) -> Result<()> {
+        #[cfg(not(unix))]
+        {
+            let _ = name;
+            anyhow::bail!("descriptor-relative entry removal requires Unix")
+        }
+        #[cfg(unix)]
+        {
+            self.remove_entry(name, libc::AT_REMOVEDIR, false)
+                .map(|_| ())
+        }
+    }
+
+    fn remove_entry(
+        &self,
+        name: &std::ffi::OsStr,
+        flags: libc::c_int,
+        missing_ok: bool,
+    ) -> Result<bool> {
+        #[cfg(not(unix))]
+        {
+            let _ = (name, flags, missing_ok);
+            anyhow::bail!("descriptor-relative entry removal requires Unix")
+        }
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd;
+            use std::os::unix::ffi::OsStrExt;
+
+            let bytes = name.as_bytes();
+            if bytes.is_empty() || bytes == b"." || bytes == b".." || bytes.contains(&b'/') {
+                anyhow::bail!("directory entry name must be one non-special basename")
+            }
+            let encoded = std::ffi::CString::new(bytes)
+                .context("directory entry name contains an interior NUL")?;
+            self.verify()?;
+            // SAFETY: `self.file` is a live directory descriptor and `encoded` is
+            // one live NUL-terminated basename. `flags` is either 0 or AT_REMOVEDIR.
+            if unsafe { libc::unlinkat(self.file.as_raw_fd(), encoded.as_ptr(), flags) } != 0 {
+                let error = std::io::Error::last_os_error();
+                if missing_ok && error.kind() == std::io::ErrorKind::NotFound {
+                    return Ok(false);
+                }
+                return Err(error).with_context(|| {
+                    format!(
+                        "failed to remove bound directory entry {}",
+                        self.path.join(name).display()
+                    )
+                });
+            }
+            self.verify()?;
+            Ok(true)
+        }
+    }
 }
 
 #[cfg(not(unix))]
@@ -293,6 +406,26 @@ pub fn open_bounded_regular_file(path: &Path, max_bytes: u64) -> Result<(File, F
         validate_metadata(path, &metadata, max_bytes)?;
         Ok((file, identity(&metadata)))
     }
+}
+
+/// Inspect the current identity of an already-opened bounded regular file.
+///
+/// Unlike a pathname reopen, this remains bound to the caller's exact descriptor.
+/// It is useful after metadata changes such as `fchmod`, which intentionally change
+/// ctime and therefore require a fresh identity before authenticated reads.
+pub fn bounded_open_file_identity(
+    file: &File,
+    path: &Path,
+    max_bytes: u64,
+) -> Result<FileIdentity> {
+    if max_bytes == 0 {
+        anyhow::bail!("file size limit must be positive")
+    }
+    let metadata = file
+        .metadata()
+        .with_context(|| format!("failed to inspect opened file {}", path.display()))?;
+    validate_metadata(path, &metadata, max_bytes)?;
+    Ok(identity(&metadata))
 }
 
 fn bounded_reader(file: &mut File, max_bytes: u64) -> Take<&mut File> {
@@ -433,10 +566,11 @@ pub fn ensure_file_identity(path: &Path, expected: FileIdentity, max_bytes: u64)
     Ok(())
 }
 
-/// A canonical executable path bound to the regular-file identity inspected at resolution time.
+/// A canonical executable path plus the authenticated descriptor opened at resolution time.
 #[derive(Clone, Debug)]
 pub struct ResolvedExecutable {
     path: std::path::PathBuf,
+    file: std::sync::Arc<File>,
     identity: FileIdentity,
     sha256: String,
 }
@@ -454,17 +588,455 @@ impl ResolvedExecutable {
         &self.sha256
     }
 
-    /// Recheck that the path still names the executable resolved earlier.
+    /// Return the authenticated executable descriptor retained at resolution.
+    #[must_use]
+    pub fn file(&self) -> &File {
+        &self.file
+    }
+
+    /// Require a structurally bounded native ELF or Mach-O executable container.
     ///
-    /// This narrows pathname replacement races before `Command::spawn`. Callers
-    /// should still place executables in directories not writable by an attacker.
+    /// This excludes interpreter scripts (including Linux `binfmt_misc` payloads
+    /// that do not identify as a valid ELF container) from evidence-grade child
+    /// execution. The trusted root/current-account boundary also covers kernel
+    /// binary-format registration.
+    pub fn require_native_executable(&self) -> Result<()> {
+        validate_native_executable(&self.file, self.identity.len(), &self.path)
+    }
+
+    /// Recheck the retained descriptor, path identity, ownership, modes, and ACLs.
+    ///
+    /// The explicit trust boundary is root plus the process's effective OS account;
+    /// an equally privileged process is outside this pathname-hardening model.
     pub fn verify(&self) -> Result<()> {
-        ensure_file_identity(&self.path, self.identity, MAX_EXECUTABLE_BYTES)
-            .context("resolved executable identity changed before spawn")
+        self.verify_with_hook(|| {})
+    }
+
+    fn verify_with_hook(&self, after_trust_walk: impl FnOnce()) -> Result<()> {
+        let retained = bounded_open_file_identity(&self.file, &self.path, MAX_EXECUTABLE_BYTES)?;
+        if retained != self.identity {
+            anyhow::bail!("resolved executable descriptor changed before spawn")
+        }
+        let (file, current) = open_bounded_regular_file(&self.path, MAX_EXECUTABLE_BYTES)
+            .context("resolved executable identity changed before spawn")?;
+        if current != self.identity {
+            anyhow::bail!("resolved executable identity changed before spawn")
+        }
+        ensure_trusted_executable_location(&self.path, &file.metadata()?)
+            .context("resolved executable location became untrusted before spawn")?;
+        after_trust_walk();
+        let (final_file, final_identity) =
+            open_bounded_regular_file(&self.path, MAX_EXECUTABLE_BYTES)
+                .context("resolved executable identity changed after the trust check")?;
+        if final_identity != self.identity {
+            anyhow::bail!("resolved executable identity changed after the trust check")
+        }
+        let final_retained =
+            bounded_open_file_identity(&self.file, &self.path, MAX_EXECUTABLE_BYTES)?;
+        if final_retained != self.identity {
+            anyhow::bail!("resolved executable descriptor changed after the trust check")
+        }
+        drop(final_file);
+        Ok(())
     }
 }
 
-/// Resolve an executable and retain its regular-file identity for pre-spawn checks.
+#[cfg(unix)]
+fn read_exact_at(file: &File, mut buffer: &mut [u8], mut offset: u64) -> Result<()> {
+    use std::os::unix::fs::FileExt;
+
+    while !buffer.is_empty() {
+        let read = file.read_at(buffer, offset)?;
+        if read == 0 {
+            anyhow::bail!("native executable header is truncated")
+        }
+        offset = offset
+            .checked_add(read as u64)
+            .context("native executable header offset overflowed")?;
+        buffer = &mut buffer[read..];
+    }
+    Ok(())
+}
+
+#[cfg(any(target_os = "linux", target_os = "android", test))]
+fn decode_u16(bytes: [u8; 2], little_endian: bool) -> u16 {
+    if little_endian {
+        u16::from_le_bytes(bytes)
+    } else {
+        u16::from_be_bytes(bytes)
+    }
+}
+
+fn decode_u32(bytes: [u8; 4], little_endian: bool) -> u32 {
+    if little_endian {
+        u32::from_le_bytes(bytes)
+    } else {
+        u32::from_be_bytes(bytes)
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn decode_u64(bytes: [u8; 8], little_endian: bool) -> u64 {
+    if little_endian {
+        u64::from_le_bytes(bytes)
+    } else {
+        u64::from_be_bytes(bytes)
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn validate_native_executable(file: &File, file_len: u64, path: &Path) -> Result<()> {
+    let mut header = [0_u8; 64];
+    read_exact_at(file, &mut header, 0)
+        .with_context(|| format!("failed to read ELF header from {}", path.display()))?;
+    validate_elf_header(&header, file_len, path)
+}
+
+#[cfg(any(target_os = "linux", target_os = "android", test))]
+fn validate_elf_header(header: &[u8; 64], file_len: u64, path: &Path) -> Result<()> {
+    if &header[..4] != b"\x7fELF" {
+        anyhow::bail!("child executable is not a native ELF container: {}", path.display())
+    }
+    let class = header[4];
+    let little_endian = match header[5] {
+        1 => true,
+        2 => false,
+        _ => anyhow::bail!("ELF executable has an invalid byte order: {}", path.display()),
+    };
+    if header[6] != 1 {
+        anyhow::bail!("ELF executable has an invalid identifier version: {}", path.display())
+    }
+    let executable_type = decode_u16([header[16], header[17]], little_endian);
+    let machine = decode_u16([header[18], header[19]], little_endian);
+    let version = decode_u32(header[20..24].try_into()?, little_endian);
+    let expected_header_size = match class {
+        1 => 52_u16,
+        2 => 64_u16,
+        _ => anyhow::bail!("ELF executable has an invalid class: {}", path.display()),
+    };
+    let header_size_offset = if class == 1 { 40 } else { 52 };
+    let header_size = decode_u16(
+        header[header_size_offset..header_size_offset + 2].try_into()?,
+        little_endian,
+    );
+    if !matches!(executable_type, 2 | 3)
+        || machine == 0
+        || version != 1
+        || header_size != expected_header_size
+        || file_len < u64::from(expected_header_size)
+    {
+        anyhow::bail!("ELF executable header is not loadable: {}", path.display())
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn validate_native_executable(file: &File, file_len: u64, path: &Path) -> Result<()> {
+    let mut magic = [0_u8; 4];
+    read_exact_at(file, &mut magic, 0)
+        .with_context(|| format!("failed to read Mach-O magic from {}", path.display()))?;
+    match magic {
+        [0xce, 0xfa, 0xed, 0xfe] => validate_thin_macho(file, 0, file_len, true, false, path),
+        [0xcf, 0xfa, 0xed, 0xfe] => validate_thin_macho(file, 0, file_len, true, true, path),
+        [0xfe, 0xed, 0xfa, 0xce] => validate_thin_macho(file, 0, file_len, false, false, path),
+        [0xfe, 0xed, 0xfa, 0xcf] => validate_thin_macho(file, 0, file_len, false, true, path),
+        [0xca, 0xfe, 0xba, 0xbe] => validate_fat_macho(file, file_len, false, false, path),
+        [0xbe, 0xba, 0xfe, 0xca] => validate_fat_macho(file, file_len, true, false, path),
+        [0xca, 0xfe, 0xba, 0xbf] => validate_fat_macho(file, file_len, false, true, path),
+        [0xbf, 0xba, 0xfe, 0xca] => validate_fat_macho(file, file_len, true, true, path),
+        _ => anyhow::bail!(
+            "child executable is not a native Mach-O container: {}",
+            path.display()
+        ),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn validate_thin_macho(
+    file: &File,
+    offset: u64,
+    slice_len: u64,
+    little_endian: bool,
+    is_64_bit: bool,
+    path: &Path,
+) -> Result<()> {
+    let header_len = if is_64_bit { 32_u64 } else { 28_u64 };
+    if slice_len < header_len {
+        anyhow::bail!("Mach-O executable header is truncated: {}", path.display())
+    }
+    let mut header = [0_u8; 32];
+    read_exact_at(file, &mut header[..header_len as usize], offset)?;
+    let file_type = decode_u32(header[12..16].try_into()?, little_endian);
+    let command_count = decode_u32(header[16..20].try_into()?, little_endian);
+    let command_bytes = decode_u32(header[20..24].try_into()?, little_endian);
+    let command_end = header_len
+        .checked_add(u64::from(command_bytes))
+        .context("Mach-O load-command length overflowed")?;
+    if file_type != 2 || command_count == 0 || command_bytes == 0 || command_end > slice_len {
+        anyhow::bail!("Mach-O executable header is not loadable: {}", path.display())
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn validate_fat_macho(
+    file: &File,
+    file_len: u64,
+    little_endian: bool,
+    is_64_bit: bool,
+    path: &Path,
+) -> Result<()> {
+    let mut count_bytes = [0_u8; 4];
+    read_exact_at(file, &mut count_bytes, 4)?;
+    let architecture_count = decode_u32(count_bytes, little_endian);
+    if architecture_count == 0 || architecture_count > 64 {
+        anyhow::bail!("fat Mach-O architecture count is invalid: {}", path.display())
+    }
+    let entry_len = if is_64_bit { 32_u64 } else { 20_u64 };
+    let table_len = u64::from(architecture_count)
+        .checked_mul(entry_len)
+        .and_then(|length| length.checked_add(8))
+        .context("fat Mach-O architecture table overflowed")?;
+    if table_len > file_len {
+        anyhow::bail!("fat Mach-O architecture table is truncated: {}", path.display())
+    }
+    let mut table = vec![0_u8; (table_len - 8) as usize];
+    read_exact_at(file, &mut table, 8)?;
+    for entry in table.chunks_exact(entry_len as usize) {
+        let (offset, size) = if is_64_bit {
+            (
+                decode_u64(entry[8..16].try_into()?, little_endian),
+                decode_u64(entry[16..24].try_into()?, little_endian),
+            )
+        } else {
+            (
+                u64::from(decode_u32(entry[8..12].try_into()?, little_endian)),
+                u64::from(decode_u32(entry[12..16].try_into()?, little_endian)),
+            )
+        };
+        let end = offset
+            .checked_add(size)
+            .context("fat Mach-O architecture range overflowed")?;
+        if offset < table_len || size < 28 || end > file_len {
+            anyhow::bail!("fat Mach-O architecture range is invalid: {}", path.display())
+        }
+        let mut magic = [0_u8; 4];
+        read_exact_at(file, &mut magic, offset)?;
+        match magic {
+            [0xce, 0xfa, 0xed, 0xfe] => {
+                validate_thin_macho(file, offset, size, true, false, path)?
+            }
+            [0xcf, 0xfa, 0xed, 0xfe] => {
+                validate_thin_macho(file, offset, size, true, true, path)?
+            }
+            [0xfe, 0xed, 0xfa, 0xce] => {
+                validate_thin_macho(file, offset, size, false, false, path)?
+            }
+            [0xfe, 0xed, 0xfa, 0xcf] => {
+                validate_thin_macho(file, offset, size, false, true, path)?
+            }
+            _ => anyhow::bail!("fat Mach-O contains a non-native slice: {}", path.display()),
+        }
+    }
+    Ok(())
+}
+
+#[cfg(all(
+    unix,
+    not(any(target_os = "linux", target_os = "android", target_os = "macos"))
+))]
+fn validate_native_executable(_file: &File, _file_len: u64, path: &Path) -> Result<()> {
+    anyhow::bail!(
+        "native executable validation is unavailable on this Unix target: {}",
+        path.display()
+    )
+}
+
+#[cfg(not(unix))]
+fn validate_native_executable(_file: &File, _file_len: u64, path: &Path) -> Result<()> {
+    anyhow::bail!("native executable validation requires Unix: {}", path.display())
+}
+
+#[cfg(unix)]
+fn ensure_trusted_executable_location(path: &Path, file_metadata: &Metadata) -> Result<()> {
+    ensure_trusted_path_component(path, file_metadata, false)?;
+    let mut ancestor = path.parent();
+    while let Some(directory) = ancestor {
+        let metadata = std::fs::symlink_metadata(directory).with_context(|| {
+            format!(
+                "failed to inspect executable path component {}",
+                directory.display()
+            )
+        })?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            anyhow::bail!(
+                "executable path component is not a canonical directory: {}",
+                directory.display()
+            )
+        }
+        ensure_trusted_path_component(directory, &metadata, true)?;
+        ancestor = directory.parent();
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn ensure_trusted_path_component(
+    component: &Path,
+    metadata: &Metadata,
+    allow_sticky_writable_directory: bool,
+) -> Result<()> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    // The integrity boundary is the effective OS account: root and this account
+    // are trusted, while other users and group/world-writable path components are
+    // not. An equally privileged process can already alter this process directly.
+    // SAFETY: `geteuid` has no pointer arguments and only reads process credentials.
+    let effective_uid = unsafe { libc::geteuid() };
+    let owner = metadata.uid();
+    let mode = metadata.permissions().mode();
+    if owner != 0 && owner != effective_uid {
+        anyhow::bail!(
+            "trusted path component is owned by an untrusted account: {}",
+            component.display()
+        )
+    }
+    let sticky_boundary = allow_sticky_writable_directory && mode & 0o1000 != 0;
+    if mode & 0o022 != 0 && !sticky_boundary {
+        anyhow::bail!(
+            "trusted path component is group- or world-writable: {}",
+            component.display()
+        )
+    }
+    ensure_no_mutating_extended_acl(component)
+}
+
+#[cfg(target_os = "macos")]
+fn ensure_no_mutating_extended_acl(path: &Path) -> Result<()> {
+    const MUTATING_PERMISSIONS: u64 = (1 << 2)
+        | (1 << 4)
+        | (1 << 5)
+        | (1 << 6)
+        | (1 << 8)
+        | (1 << 10)
+        | (1 << 12)
+        | (1 << 13);
+
+    ensure_no_extended_acl_permissions(path, MUTATING_PERMISSIONS, "mutating")
+}
+
+#[cfg(target_os = "macos")]
+fn ensure_no_access_granting_extended_acl(path: &Path) -> Result<()> {
+    ensure_no_extended_acl_permissions(path, u64::MAX, "access-granting")
+}
+
+#[cfg(target_os = "macos")]
+fn ensure_no_extended_acl_permissions(
+    path: &Path,
+    forbidden_permissions: u64,
+    description: &str,
+) -> Result<()> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    type Acl = *mut libc::c_void;
+    type AclEntry = *mut libc::c_void;
+    const ACL_TYPE_EXTENDED: libc::c_int = 0x0000_0100;
+    const ACL_FIRST_ENTRY: libc::c_int = 0;
+    const ACL_NEXT_ENTRY: libc::c_int = -1;
+    const ACL_EXTENDED_ALLOW: libc::c_int = 1;
+
+    unsafe extern "C" {
+        fn acl_get_file(path: *const libc::c_char, acl_type: libc::c_int) -> Acl;
+        fn acl_get_entry(acl: Acl, entry_id: libc::c_int, entry: *mut AclEntry) -> libc::c_int;
+        fn acl_get_tag_type(entry: AclEntry, tag: *mut libc::c_int) -> libc::c_int;
+        fn acl_get_permset_mask_np(entry: AclEntry, mask: *mut u64) -> libc::c_int;
+        fn acl_free(object: *mut libc::c_void) -> libc::c_int;
+    }
+
+    let encoded = CString::new(path.as_os_str().as_bytes())
+        .with_context(|| format!("path contains an interior NUL: {}", path.display()))?;
+    // SAFETY: `encoded` is a live NUL-terminated path and the returned ACL is
+    // released with `acl_free` before this function returns.
+    let acl = unsafe { acl_get_file(encoded.as_ptr(), ACL_TYPE_EXTENDED) };
+    if acl.is_null() {
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::ENOENT) {
+            return Ok(());
+        }
+        return Err(error)
+            .with_context(|| format!("failed to inspect ACL for {}", path.display()));
+    }
+
+    let inspection = (|| -> Result<()> {
+        let mut entry: AclEntry = std::ptr::null_mut();
+        let mut entry_id = ACL_FIRST_ENTRY;
+        loop {
+            // SAFETY: `acl` is live and `entry` points to writable storage for one
+            // borrowed ACL-entry handle.
+            let status = unsafe { acl_get_entry(acl, entry_id, &mut entry) };
+            if status < 0 {
+                let error = std::io::Error::last_os_error();
+                if error.raw_os_error() == Some(libc::EINVAL) {
+                    break;
+                }
+                return Err(error).with_context(|| {
+                    format!("failed to inspect ACL entries for {}", path.display())
+                });
+            }
+            let mut tag = 0;
+            // SAFETY: `entry` was returned by `acl_get_entry`; `tag` is writable.
+            if unsafe { acl_get_tag_type(entry, &mut tag) } != 0 {
+                return Err(std::io::Error::last_os_error())
+                    .with_context(|| format!("failed to inspect ACL tag for {}", path.display()));
+            }
+            if tag == ACL_EXTENDED_ALLOW {
+                let mut permissions = 0_u64;
+                // SAFETY: `entry` is live and `permissions` is writable storage for
+                // the entry's permission mask.
+                if unsafe { acl_get_permset_mask_np(entry, &mut permissions) } != 0 {
+                    return Err(std::io::Error::last_os_error()).with_context(|| {
+                        format!("failed to inspect ACL permissions for {}", path.display())
+                    });
+                }
+                if permissions & forbidden_permissions != 0 {
+                    anyhow::bail!(
+                        "path component has a {description} extended ACL: {}",
+                        path.display()
+                    )
+                }
+            }
+            entry_id = ACL_NEXT_ENTRY;
+        }
+        Ok(())
+    })();
+    // SAFETY: `acl` is the live allocation returned by `acl_get_file`.
+    let free_status = unsafe { acl_free(acl) };
+    if free_status != 0 {
+        return Err(std::io::Error::last_os_error())
+            .with_context(|| format!("failed to release ACL for {}", path.display()));
+    }
+    inspection
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn ensure_no_mutating_extended_acl(_path: &Path) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn ensure_no_access_granting_extended_acl(_path: &Path) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn ensure_trusted_executable_location(_path: &Path, _file_metadata: &Metadata) -> Result<()> {
+    anyhow::bail!("trusted executable path validation requires Unix")
+}
+
+/// Resolve an executable, authenticate it, retain its descriptor, and reject path
+/// components mutable by accounts outside the explicit root/current-account trust
+/// boundary.
 pub fn resolve_executable(path: &Path) -> Result<ResolvedExecutable> {
     let candidate = if path.is_absolute() || path.components().count() > 1 {
         path.to_path_buf()
@@ -489,6 +1061,7 @@ pub fn resolve_executable(path: &Path) -> Result<ResolvedExecutable> {
             anyhow::bail!("resolved path is not executable")
         }
     }
+    ensure_trusted_executable_location(&resolved, &metadata)?;
     let sha256 = sha256_bounded_open_file(
         &mut file,
         executable_identity,
@@ -497,6 +1070,7 @@ pub fn resolve_executable(path: &Path) -> Result<ResolvedExecutable> {
     )?;
     Ok(ResolvedExecutable {
         path: resolved,
+        file: std::sync::Arc::new(file),
         identity: executable_identity,
         sha256,
     })
@@ -566,6 +1140,94 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn owner_mutation_boundary_rejects_group_writable_directories() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = test_directory("group-writable-boundary");
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir(&directory).unwrap();
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o770)).unwrap();
+        let bound = BoundDirectory::open(&directory).unwrap();
+
+        let error = bound.require_owner_mutation_boundary().unwrap_err();
+
+        assert!(error.to_string().contains("group- or world-writable"));
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn owner_mutation_boundary_accepts_a_private_child_of_a_sticky_parent() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let base = test_directory("sticky-parent-boundary");
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir(&base).unwrap();
+        let sticky_parent = base.join("shared");
+        std::fs::create_dir(&sticky_parent).unwrap();
+        std::fs::set_permissions(&sticky_parent, std::fs::Permissions::from_mode(0o1777))
+            .unwrap();
+        let directory = sticky_parent.join("private");
+        std::fs::create_dir(&directory).unwrap();
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let bound = BoundDirectory::open(&directory).unwrap();
+
+        bound.require_owner_mutation_boundary().unwrap();
+
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn owner_mutation_boundary_rejects_an_access_granting_acl() {
+        let directory = test_directory("access-granting-boundary-acl");
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir(&directory).unwrap();
+        let status = std::process::Command::new("/bin/chmod")
+            .args(["+a", "everyone allow read", directory.to_str().unwrap()])
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let bound = BoundDirectory::open(&directory).unwrap();
+
+        let error = bound.require_owner_mutation_boundary().unwrap_err();
+
+        assert!(error.to_string().contains("access-granting extended ACL"));
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn descriptor_relative_removal_never_recurses_into_unknown_content() {
+        let directory = test_directory("descriptor-relative-removal");
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir(&directory).unwrap();
+        let known = directory.join("known");
+        std::fs::write(&known, b"known").unwrap();
+        let unknown = directory.join("unknown");
+        std::fs::create_dir(&unknown).unwrap();
+        let sentinel = unknown.join("sentinel");
+        std::fs::write(&sentinel, b"preserve").unwrap();
+        let bound = BoundDirectory::open(&directory).unwrap();
+
+        bound.remove_file_entry(std::ffi::OsStr::new("known"))
+            .unwrap();
+        let error = bound
+            .remove_directory_entry(std::ffi::OsStr::new("unknown"))
+            .unwrap_err();
+
+        assert!(!known.exists());
+        assert_eq!(std::fs::read(sentinel).unwrap(), b"preserve");
+        assert!(error.to_string().contains("failed to remove bound directory entry"));
+        assert!(bound
+            .remove_file_entry(std::ffi::OsStr::new("../escape"))
+            .is_err());
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn bound_directory_rejects_a_final_symlink() {
         use std::os::unix::fs::symlink;
 
@@ -603,6 +1265,29 @@ mod tests {
             first,
             "4a79516c84b8144eb7ba196298962abd826363a6481cb4a9dacba815610dacf7"
         );
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn opened_file_identity_refreshes_after_a_permission_change() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = test_directory("identity-after-mode-change");
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir(&directory).unwrap();
+        let path = directory.join("artifact.bin");
+        std::fs::write(&path, b"authenticated bytes").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666)).unwrap();
+        let (mut file, original) = open_bounded_regular_file(&path, 64).unwrap();
+
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))
+            .unwrap();
+        let refreshed = bounded_open_file_identity(&file, &path, 64).unwrap();
+        let digest = sha256_bounded_open_file(&mut file, refreshed, &path, 64).unwrap();
+
+        assert_ne!(original, refreshed);
+        assert_eq!(digest, sha256_hex(b"authenticated bytes"));
         std::fs::remove_dir_all(directory).unwrap();
     }
 
@@ -679,7 +1364,141 @@ mod tests {
         let executable = resolve_executable(&std::env::current_exe().unwrap()).unwrap();
 
         executable.verify().unwrap();
+        executable.require_native_executable().unwrap();
         assert!(executable.path().is_absolute());
         assert_eq!(executable.sha256().len(), 64);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn executable_verification_rechecks_identity_after_the_trust_walk() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = test_directory("post-trust-executable-swap");
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir(&directory).unwrap();
+        let executable_path = directory.join("tool");
+        std::fs::copy(std::env::current_exe().unwrap(), &executable_path).unwrap();
+        std::fs::set_permissions(&executable_path, std::fs::Permissions::from_mode(0o700))
+            .unwrap();
+        let executable = resolve_executable(&executable_path).unwrap();
+
+        let error = executable
+            .verify_with_hook(|| {
+                std::fs::remove_file(&executable_path).unwrap();
+                std::fs::copy("/bin/echo", &executable_path).unwrap();
+            })
+            .unwrap_err();
+
+        assert!(error.to_string().contains("after the trust check"));
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolved_executable_rejects_a_group_writable_path_component() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = test_directory("writable-executable-parent");
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir(&directory).unwrap();
+        let writable_parent = directory.join("writable");
+        std::fs::create_dir(&writable_parent).unwrap();
+        std::fs::set_permissions(&writable_parent, std::fs::Permissions::from_mode(0o770))
+            .unwrap();
+        let executable_path = writable_parent.join("tool");
+        std::fs::copy(std::env::current_exe().unwrap(), &executable_path).unwrap();
+        std::fs::set_permissions(&executable_path, std::fs::Permissions::from_mode(0o700))
+            .unwrap();
+
+        let error = resolve_executable(&executable_path).unwrap_err();
+
+        assert!(error.to_string().contains("group- or world-writable"));
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn resolved_executable_rejects_a_mutating_extended_acl() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = test_directory("mutating-executable-acl");
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir(&directory).unwrap();
+        let executable_path = directory.join("tool");
+        std::fs::copy(std::env::current_exe().unwrap(), &executable_path).unwrap();
+        std::fs::set_permissions(&executable_path, std::fs::Permissions::from_mode(0o700))
+            .unwrap();
+        let status = std::process::Command::new("/bin/chmod")
+            .args(["+a", "everyone allow write", executable_path.to_str().unwrap()])
+            .status()
+            .unwrap();
+        assert!(status.success());
+
+        let error = resolve_executable(&executable_path).unwrap_err();
+
+        assert!(error.to_string().contains("mutating extended ACL"));
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn evidence_grade_executable_boundary_rejects_interpreter_scripts() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = test_directory("interpreter-script");
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir(&directory).unwrap();
+        let script = directory.join("tool");
+        std::fs::write(&script, b"#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let executable = resolve_executable(&script).unwrap();
+
+        let error = executable.require_native_executable().unwrap_err();
+
+        assert!(error.to_string().contains("not a native"));
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn native_executable_validation_rejects_a_truncated_macho_header() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = test_directory("truncated-macho");
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir(&directory).unwrap();
+        let executable_path = directory.join("tool");
+        let mut bytes = vec![0_u8; 32];
+        bytes[..4].copy_from_slice(&[0xcf, 0xfa, 0xed, 0xfe]);
+        std::fs::write(&executable_path, bytes).unwrap();
+        std::fs::set_permissions(&executable_path, std::fs::Permissions::from_mode(0o700))
+            .unwrap();
+        let executable = resolve_executable(&executable_path).unwrap();
+
+        let error = executable.require_native_executable().unwrap_err();
+
+        assert!(error.to_string().contains("not loadable"));
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn elf_header_validation_accepts_a_bounded_native_header_and_rejects_et_none() {
+        let path = Path::new("synthetic-elf");
+        let mut header = [0_u8; 64];
+        header[..4].copy_from_slice(b"\x7fELF");
+        header[4] = 2;
+        header[5] = 1;
+        header[6] = 1;
+        header[16..18].copy_from_slice(&3_u16.to_le_bytes());
+        header[18..20].copy_from_slice(&62_u16.to_le_bytes());
+        header[20..24].copy_from_slice(&1_u32.to_le_bytes());
+        header[52..54].copy_from_slice(&64_u16.to_le_bytes());
+
+        validate_elf_header(&header, 64, path).unwrap();
+        header[16..18].copy_from_slice(&0_u16.to_le_bytes());
+
+        let error = validate_elf_header(&header, 64, path).unwrap_err();
+        assert!(error.to_string().contains("not loadable"));
     }
 }

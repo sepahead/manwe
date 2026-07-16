@@ -22,6 +22,7 @@ image = { version = "0.25.1", default-features = false, features = ["jpeg", "png
 # Matches the root crate's imageproc line. These binaries only draw rectangles, so
 # the `text` feature stays off here; the root crate enables it for detection labels.
 imageproc = { version = "0.27.0", default-features = false }
+libc = "0.2"
 # Digests come from `manwe::secure_io::sha256_hex`, the single audited renderer
 # shared with the root crate, so this crate no longer depends on `sha2` directly.
 manwe = { path = "..", version = "=0.2.0-alpha.1", features = ["metal"] }

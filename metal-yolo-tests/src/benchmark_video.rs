@@ -3,6 +3,7 @@ use candle::{DType, Device, IndexOp, Tensor};
 use candle_nn::{Module, VarBuilder};
 use clap::Parser;
 use image::{ImageBuffer, Rgb};
+use std::ffi::OsString;
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -16,9 +17,10 @@ use std::time::{Duration, Instant};
 
 use manwe::model::{Multiples, YoloV8};
 use manwe::secure_io::{
-    ensure_file_identity, open_bounded_regular_file, read_bounded_open_file,
-    read_bounded_regular_file, resolve_executable, sha256_bounded_open_file, sha256_hex,
-    BoundDirectory, FileIdentity, MAX_MODEL_BYTES, MAX_VIDEO_BYTES,
+    bounded_open_file_identity, ensure_file_identity, open_bounded_regular_file,
+    read_bounded_open_file, read_bounded_regular_file, resolve_executable,
+    sha256_bounded_open_file, sha256_hex, BoundDirectory, FileIdentity, ResolvedExecutable,
+    MAX_MODEL_BYTES, MAX_VIDEO_BYTES,
 };
 use manwe::{validate_coco_detection_output_schema, validate_coco_model_output};
 
@@ -34,6 +36,7 @@ const MAX_CANDIDATES: usize = 2_000;
 const DEFAULT_MAX_DURATION_SECONDS: u64 = 7_200;
 const MAX_BENCHMARK_DURATION_SECONDS: u64 = 30 * 24 * 60 * 60;
 const MAX_RESULT_BYTES: u64 = 64 * 1024 * 1024;
+const FILE_LIMIT_EXEC_MODE: &str = "--manwe-internal-file-limit-exec";
 const VIDEO_LETTERBOX_FILTER: &str = "scale=w='if(gte(iw,ih),640,max(1,floor(iw*640/ih)+gt(iw*640/ih-floor(iw*640/ih),0.5)+eq(iw*640/ih-floor(iw*640/ih),0.5)*mod(floor(iw*640/ih),2)))':h='if(gte(iw,ih),max(1,floor(ih*640/iw)+gt(ih*640/iw-floor(ih*640/iw),0.5)+eq(ih*640/iw-floor(ih*640/iw),0.5)*mod(floor(ih*640/iw),2)),640)':flags=bicubic:param0=0:param1=0.5,setsar=1,pad=640:640:(ow-iw)/2:(oh-ih)/2:color=0x727272";
 
 fn bounded_fps(value: &str) -> std::result::Result<f64, String> {
@@ -91,6 +94,171 @@ fn bounded_duration_seconds(value: &str) -> std::result::Result<u64, String> {
         Err(format!(
             "duration must be between 1 and {MAX_BENCHMARK_DURATION_SECONDS} seconds"
         ))
+    }
+}
+
+#[cfg(unix)]
+fn set_current_process_file_size_limit(max_bytes: u64) -> anyhow::Result<()> {
+    // `rlim_t` is target-dependent; keep the checked conversion for Unix targets
+    // where it is narrower than `u64`, even though it is an identity on macOS.
+    #[allow(clippy::useless_conversion)]
+    let requested_limit: libc::rlim_t = max_bytes
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("output file-size limit is not representable on this host"))?;
+    let mut existing = std::mem::MaybeUninit::<libc::rlimit>::uninit();
+    // SAFETY: `existing` points to writable storage for one `rlimit` value.
+    if unsafe { libc::getrlimit(libc::RLIMIT_FSIZE, existing.as_mut_ptr()) } != 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    // SAFETY: the successful `getrlimit` call initialized `existing`.
+    let mut limit = unsafe { existing.assume_init() };
+    // Never relax a stricter limit inherited from the caller.
+    limit.rlim_cur = limit.rlim_cur.min(requested_limit);
+    // SAFETY: `limit` is a fully initialized `rlimit` value valid for this call.
+    if unsafe { libc::setrlimit(libc::RLIMIT_FSIZE, &limit) } != 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn set_current_process_file_size_limit(_max_bytes: u64) -> anyhow::Result<()> {
+    anyhow::bail!("kernel-enforced output file-size limits require Unix")
+}
+
+struct FileLimitedCommand {
+    command: Command,
+    helper: ResolvedExecutable,
+}
+
+impl FileLimitedCommand {
+    fn command_mut(&mut self) -> &mut Command {
+        &mut self.command
+    }
+
+    fn spawn(mut self) -> anyhow::Result<Child> {
+        self.helper.verify()?;
+        Ok(self.command.spawn()?)
+    }
+}
+
+fn file_limited_command(
+    executable: &ResolvedExecutable,
+    max_bytes: u64,
+) -> anyhow::Result<FileLimitedCommand> {
+    executable.require_native_executable()?;
+    let helper = resolve_executable(&std::env::current_exe()?)?;
+    helper.require_native_executable()?;
+    let mut command = Command::new(helper.path());
+    command
+        .arg(FILE_LIMIT_EXEC_MODE)
+        .arg(max_bytes.to_string())
+        .arg(executable.sha256())
+        .arg(executable.path());
+    Ok(FileLimitedCommand { command, helper })
+}
+
+#[cfg(unix)]
+fn run_file_limited_exec(mut arguments: impl Iterator<Item = OsString>) -> anyhow::Result<()> {
+    let max_bytes = arguments
+        .next()
+        .and_then(|value| value.into_string().ok())
+        .context("internal file-limit mode requires a UTF-8 byte limit")?
+        .parse::<u64>()
+        .context("internal file-limit mode received an invalid byte limit")?;
+    if max_bytes == 0 {
+        anyhow::bail!("internal file-limit mode requires a positive byte limit")
+    }
+    let expected_sha256 = arguments
+        .next()
+        .and_then(|value| value.into_string().ok())
+        .context("internal file-limit mode requires a UTF-8 executable digest")?;
+    let expected_sha256 = sha256_digest(&expected_sha256).map_err(anyhow::Error::msg)?;
+    let executable_path = arguments
+        .next()
+        .map(PathBuf::from)
+        .context("internal file-limit mode requires an executable path")?;
+    let executable = resolve_executable(&executable_path)?;
+    executable.require_native_executable()?;
+    if executable.sha256() != expected_sha256 {
+        anyhow::bail!("file-limited executable digest changed before launch")
+    }
+    let remaining = arguments.collect::<Vec<_>>();
+    run_authenticated_executable(executable, remaining, max_bytes)
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn run_authenticated_executable(
+    executable: ResolvedExecutable,
+    arguments: Vec<OsString>,
+    max_bytes: u64,
+) -> anyhow::Result<()> {
+    use std::ffi::CString;
+    use std::os::fd::AsRawFd;
+    use std::os::unix::ffi::OsStrExt;
+
+    let encode = |value: &std::ffi::OsStr, label: &str| -> anyhow::Result<CString> {
+        CString::new(value.as_bytes()).with_context(|| format!("{label} contains an interior NUL"))
+    };
+    let mut argv = Vec::with_capacity(arguments.len().saturating_add(1));
+    argv.push(encode(executable.path().as_os_str(), "executable path")?);
+    for argument in &arguments {
+        argv.push(encode(argument, "executable argument")?);
+    }
+    let mut env = Vec::new();
+    for (key, value) in std::env::vars_os() {
+        let mut entry = key;
+        entry.push("=");
+        entry.push(value);
+        env.push(encode(&entry, "environment entry")?);
+    }
+    let mut argv_pointers = argv.iter().map(|value| value.as_ptr()).collect::<Vec<_>>();
+    argv_pointers.push(std::ptr::null());
+    let mut env_pointers = env.iter().map(|value| value.as_ptr()).collect::<Vec<_>>();
+    env_pointers.push(std::ptr::null());
+
+    executable.verify()?;
+    set_current_process_file_size_limit(max_bytes)?;
+    // SAFETY: the retained descriptor and all C strings/pointer arrays remain live
+    // for this call and both pointer arrays have trailing null sentinels.
+    unsafe {
+        libc::fexecve(
+            executable.file().as_raw_fd(),
+            argv_pointers.as_ptr(),
+            env_pointers.as_ptr(),
+        )
+    };
+    Err(std::io::Error::last_os_error()).context("failed to execute the authenticated child")
+}
+
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
+fn run_authenticated_executable(
+    executable: ResolvedExecutable,
+    arguments: Vec<OsString>,
+    max_bytes: u64,
+) -> anyhow::Result<()> {
+    use std::os::unix::process::CommandExt;
+
+    let mut command = Command::new(executable.path());
+    command.args(arguments);
+    set_current_process_file_size_limit(max_bytes)?;
+    executable.verify()?;
+    let error = command.exec();
+    Err(error).context("failed to execute the authenticated child")
+}
+
+#[cfg(not(unix))]
+fn run_file_limited_exec(_arguments: impl Iterator<Item = OsString>) -> anyhow::Result<()> {
+    anyhow::bail!("file-limited child execution requires Unix")
+}
+
+fn run_file_limited_exec_if_requested() -> Option<anyhow::Result<()>> {
+    let mut arguments = std::env::args_os();
+    let _program = arguments.next();
+    if arguments.next().as_deref() == Some(std::ffi::OsStr::new(FILE_LIMIT_EXEC_MODE)) {
+        Some(run_file_limited_exec(arguments))
+    } else {
+        None
     }
 }
 
@@ -407,9 +575,44 @@ fn create_private_directory(path: &Path) -> std::io::Result<()> {
     builder.create(path)
 }
 
+fn set_owner_only_permissions(file: &fs::File) -> std::io::Result<()> {
+    #[cfg(not(unix))]
+    {
+        let _ = file;
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "owner-only benchmark evidence permissions require Unix",
+        ))
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        file.set_permissions(fs::Permissions::from_mode(0o600))
+    }
+}
+
+fn require_owner_only_permissions(file: &fs::File, path: &Path) -> anyhow::Result<()> {
+    #[cfg(not(unix))]
+    {
+        let _ = (file, path);
+        anyhow::bail!("owner-only benchmark evidence permissions require Unix")
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        if file.metadata()?.permissions().mode() & 0o7777 != 0o600 {
+            anyhow::bail!("benchmark evidence is not owner-only: {}", path.display())
+        }
+        Ok(())
+    }
+}
+
 fn verify_json_file(path: &Path, expected: &[u8]) -> anyhow::Result<FileIdentity> {
     let (mut file, identity) = open_bounded_regular_file(path, MAX_RESULT_BYTES)?;
     let actual = read_bounded_open_file(&mut file, identity, path, MAX_RESULT_BYTES)?;
+    require_owner_only_permissions(&file, path)?;
     if actual != expected {
         anyhow::bail!("result JSON verification failed: {}", path.display())
     }
@@ -423,11 +626,26 @@ fn write_verified_json_once(path: &Path, value: &serde_json::Value) -> anyhow::R
     if bytes.is_empty() || bytes.len() as u64 > MAX_RESULT_BYTES {
         anyhow::bail!("result JSON must contain between 1 and {MAX_RESULT_BYTES} bytes")
     }
-    let mut file = OpenOptions::new().write(true).create_new(true).open(path)?;
+    let mut options = OpenOptions::new();
+    options.read(true).write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        options.mode(0o600);
+    }
+    let mut file = options.open(path)?;
+    set_owner_only_permissions(&file)?;
     file.write_all(&bytes)?;
     file.sync_all()?;
-    drop(file);
-    verify_json_file(path, &bytes)?;
+    let identity = bounded_open_file_identity(&file, path, MAX_RESULT_BYTES)?;
+    let actual = read_bounded_open_file(&mut file, identity, path, MAX_RESULT_BYTES)?;
+    require_owner_only_permissions(&file, path)?;
+    if actual != bytes {
+        anyhow::bail!("result JSON verification failed: {}", path.display())
+    }
+    serde_json::from_slice::<serde_json::Value>(&actual)
+        .with_context(|| format!("result is not valid JSON: {}", path.display()))?;
     Ok(bytes)
 }
 
@@ -437,8 +655,10 @@ fn verify_hard_link_identity(
     max_bytes: u64,
 ) -> anyhow::Result<()> {
     let (staged_file, staged_identity) = open_bounded_regular_file(staged, max_bytes)?;
+    require_owner_only_permissions(&staged_file, staged)?;
     drop(staged_file);
     let (published_file, published_identity) = open_bounded_regular_file(published, max_bytes)?;
+    require_owner_only_permissions(&published_file, published)?;
     drop(published_file);
     if staged_identity != published_identity {
         anyhow::bail!("published file identity does not match its staged source")
@@ -453,9 +673,26 @@ struct AuthenticatedFile {
 }
 
 fn digest_and_sync_regular_file(path: &Path, max_bytes: u64) -> anyhow::Result<AuthenticatedFile> {
-    let (mut file, identity) = open_bounded_regular_file(path, max_bytes)?;
+    digest_and_sync_regular_file_with_hook(path, max_bytes, || {})
+}
+
+fn digest_and_sync_regular_file_with_hook(
+    path: &Path,
+    max_bytes: u64,
+    after_permission_sync: impl FnOnce(),
+) -> anyhow::Result<AuthenticatedFile> {
+    let (mut file, _) = open_bounded_regular_file(path, max_bytes)?;
+    set_owner_only_permissions(&file)?;
+    file.sync_all()?;
+    after_permission_sync();
+    let identity = bounded_open_file_identity(&file, path, max_bytes)?;
     let sha256 = sha256_bounded_open_file(&mut file, identity, path, max_bytes)?;
     file.sync_all()?;
+    let final_identity = bounded_open_file_identity(&file, path, max_bytes)?;
+    require_owner_only_permissions(&file, path)?;
+    if final_identity != identity {
+        anyhow::bail!("staged artifact identity changed after authentication")
+    }
     Ok(AuthenticatedFile { identity, sha256 })
 }
 
@@ -465,6 +702,7 @@ fn verify_authenticated_file(
     max_bytes: u64,
 ) -> anyhow::Result<()> {
     let (mut file, identity) = open_bounded_regular_file(path, max_bytes)?;
+    require_owner_only_permissions(&file, path)?;
     if identity != expected.identity {
         anyhow::bail!("staged artifact identity changed after authentication")
     }
@@ -481,6 +719,7 @@ fn verify_expected_digest(
     max_bytes: u64,
 ) -> anyhow::Result<()> {
     let (mut file, identity) = open_bounded_regular_file(path, max_bytes)?;
+    require_owner_only_permissions(&file, path)?;
     let sha256 = sha256_bounded_open_file(&mut file, identity, path, max_bytes)?;
     if sha256 != expected_sha256 {
         anyhow::bail!("published artifact digest does not match its authenticated digest")
@@ -496,15 +735,18 @@ fn path_occupied(path: &Path) -> anyhow::Result<bool> {
     }
 }
 
+#[derive(Debug)]
 struct EvidenceRun {
     run_dir: BoundDirectory,
     stage_dir: BoundDirectory,
+    stage_name: OsString,
     stage_result: PathBuf,
     stage_video: Option<PathBuf>,
     result_path: PathBuf,
     output_path: Option<PathBuf>,
     final_link_created: bool,
     committed: bool,
+    cleanup_started: bool,
 }
 
 impl EvidenceRun {
@@ -515,6 +757,7 @@ impl EvidenceRun {
         save_video: bool,
     ) -> anyhow::Result<Self> {
         let run_dir = BoundDirectory::open(run_dir)?;
+        run_dir.require_owner_mutation_boundary()?;
         let result_path = run_dir
             .path()
             .join(format!("res_rust_{safe_name}_{run_id}.json"));
@@ -523,9 +766,9 @@ impl EvidenceRun {
                 .path()
                 .join(format!("video_rust_{safe_name}_{run_id}.mp4"))
         });
-        let stage_path = run_dir
-            .path()
-            .join(format!(".manwe-benchmark-{safe_name}-{run_id}.in-progress"));
+        let stage_name =
+            OsString::from(format!(".manwe-benchmark-{safe_name}-{run_id}.in-progress"));
+        let stage_path = run_dir.path().join(&stage_name);
         run_dir.verify()?;
         match create_private_directory(&stage_path) {
             Ok(()) => {}
@@ -538,10 +781,8 @@ impl EvidenceRun {
         let stage_dir = match BoundDirectory::open(&stage_path) {
             Ok(directory) => directory,
             Err(error) => {
-                if run_dir.verify().is_ok() {
-                    let _ = fs::remove_dir_all(&stage_path);
-                    let _ = run_dir.sync();
-                }
+                let _ = run_dir.remove_directory_entry(&stage_name);
+                let _ = run_dir.sync();
                 return Err(error);
             }
         };
@@ -550,13 +791,15 @@ impl EvidenceRun {
             stage_video: save_video.then(|| stage_dir.path().join("output.mp4")),
             run_dir,
             stage_dir,
+            stage_name,
             result_path,
             output_path,
             final_link_created: false,
             committed: false,
+            cleanup_started: false,
         };
         run.run_dir.sync()?;
-        run.stage_dir.verify()?;
+        run.stage_dir.require_owner_mutation_boundary()?;
         let output_occupied = match run.output_path.as_deref() {
             Some(path) => path_occupied(path)?,
             None => false,
@@ -615,38 +858,58 @@ impl EvidenceRun {
         }
         self.run_dir.sync()?;
         self.committed = true;
-        match self
-            .run_dir
-            .verify()
-            .and_then(|()| self.stage_dir.verify())
-            .and_then(|()| fs::remove_dir_all(self.stage_dir.path()).map_err(Into::into))
-        {
-            Ok(()) => {
-                if let Err(error) = self.run_dir.sync() {
-                    eprintln!("benchmark evidence was published but cleanup sync failed: {error}");
-                }
+        self.cleanup_started = true;
+        self.cleanup_staging(true).context(
+            "evidence publication is committed; staging cleanup is incomplete or its durability is unknown",
+        )
+    }
+
+    fn cleanup_staging(&self, committed: bool) -> anyhow::Result<()> {
+        self.cleanup_staging_with_hook(committed, || {})
+    }
+
+    fn cleanup_staging_with_hook(
+        &self,
+        committed: bool,
+        after_directory_removal: impl FnOnce(),
+    ) -> anyhow::Result<()> {
+        self.run_dir.require_owner_mutation_boundary()?;
+        self.stage_dir.verify()?;
+        if committed {
+            self.stage_dir
+                .remove_file_entry(std::ffi::OsStr::new("result.json"))?;
+            if self.stage_video.is_some() {
+                self.stage_dir
+                    .remove_file_entry(std::ffi::OsStr::new("output.mp4"))?;
             }
-            Err(error) => {
-                eprintln!("benchmark evidence was published but staging cleanup failed: {error}");
+        } else {
+            self.stage_dir
+                .remove_file_entry_if_exists(std::ffi::OsStr::new("result.json"))?;
+            if self.stage_video.is_some() {
+                self.stage_dir
+                    .remove_file_entry_if_exists(std::ffi::OsStr::new("output.mp4"))?;
             }
         }
-        Ok(())
+        self.stage_dir.sync()?;
+        self.run_dir.remove_directory_entry(&self.stage_name)?;
+        after_directory_removal();
+        self.run_dir.sync()
     }
 }
 
 impl Drop for EvidenceRun {
     fn drop(&mut self) {
-        if (self.committed || !self.final_link_created)
-            && self.run_dir.verify().is_ok()
-            && self.stage_dir.verify().is_ok()
-        {
-            let _ = fs::remove_dir_all(self.stage_dir.path());
-            let _ = self.run_dir.sync();
+        if !self.cleanup_started && !self.committed && !self.final_link_created {
+            self.cleanup_started = true;
+            let _ = self.cleanup_staging(false);
         }
     }
 }
 
 fn main() -> anyhow::Result<()> {
+    if let Some(result) = run_file_limited_exec_if_requested() {
+        return result;
+    }
     let args = Args::parse();
     let ffmpeg = resolve_executable(&args.ffmpeg)?;
     let run_dir = std::env::var("RUN_DIR").unwrap_or_else(|_| "video_results".to_string());
@@ -692,8 +955,8 @@ fn main() -> anyhow::Result<()> {
     // 2. Setup Input Pipe (FFmpeg -> Rust)
     // Decode into the same isotropic 640-square letterbox geometry as static inference.
     ffmpeg.verify()?;
-    let mut input_command = Command::new(ffmpeg.path());
-    input_command.args([
+    let mut input_command = file_limited_command(&ffmpeg, MAX_VIDEO_BYTES)?;
+    input_command.command_mut().args([
         "-nostdin",
         "-loglevel",
         "error",
@@ -709,9 +972,12 @@ fn main() -> anyhow::Result<()> {
         input_demuxer,
     ]);
     if input_demuxer == "mov" {
-        input_command.args(["-use_absolute_path", "0", "-enable_drefs", "0"]);
+        input_command
+            .command_mut()
+            .args(["-use_absolute_path", "0", "-enable_drefs", "0"]);
     }
     input_command
+        .command_mut()
         .args([
             "-i",
             "/dev/fd/0",
@@ -746,8 +1012,9 @@ fn main() -> anyhow::Result<()> {
             30.0
         };
         ffmpeg.verify()?;
-        let mut command = Command::new(ffmpeg.path());
+        let mut command = file_limited_command(&ffmpeg, MAX_VIDEO_BYTES)?;
         command
+            .command_mut()
             .args([
                 "-nostdin",
                 "-loglevel",
@@ -1272,7 +1539,209 @@ mod tests {
 
         let result = directory.join("res_rust_input_mp4_run_1.json");
         assert!(result.is_file());
+        assert!(!directory
+            .join(".manwe-benchmark-input_mp4-run_1.in-progress")
+            .exists());
         assert!(EvidenceRun::acquire(&directory, "input_mp4", "run_1", false).is_err());
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn committed_video_publication_reports_incomplete_cleanup_without_drop_retry() {
+        let directory = evidence_test_directory("committed-cleanup-error");
+        let _ = fs::remove_dir_all(&directory);
+        fs::create_dir(&directory).unwrap();
+        let mut run =
+            EvidenceRun::acquire(&directory, "input_mp4", "cleanup_error", false).unwrap();
+        let stage_dir = run.stage_dir.path().to_path_buf();
+        let sentinel = stage_dir.join("unexpected");
+        fs::write(&sentinel, b"preserve").unwrap();
+
+        let error = run
+            .publish(&serde_json::json!({"committed": true}), None)
+            .unwrap_err();
+
+        assert!(error.to_string().contains("publication is committed"));
+        assert!(run.result_path.is_file());
+        assert_eq!(fs::read(&sentinel).unwrap(), b"preserve");
+        drop(run);
+        assert!(stage_dir.is_dir());
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn published_video_evidence_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = evidence_test_directory("private-mode");
+        let _ = fs::remove_dir_all(&directory);
+        fs::create_dir(&directory).unwrap();
+        let mut run = EvidenceRun::acquire(&directory, "input_mp4", "private_mode", true).unwrap();
+        let staged_video = run.staged_video_path().unwrap().to_path_buf();
+        fs::write(&staged_video, b"video-evidence").unwrap();
+        fs::set_permissions(&staged_video, fs::Permissions::from_mode(0o666)).unwrap();
+        let authenticated = digest_and_sync_regular_file(&staged_video, MAX_VIDEO_BYTES).unwrap();
+        let video_path = run.output_path().unwrap().to_path_buf();
+        let result_path = run.result_path.clone();
+
+        run.publish(
+            &serde_json::json!({"output_video_sha256": authenticated.sha256.as_str()}),
+            Some(&authenticated),
+        )
+        .unwrap();
+
+        let video_mode = fs::metadata(video_path).unwrap().permissions().mode() & 0o777;
+        let result_mode = fs::metadata(result_path).unwrap().permissions().mode() & 0o777;
+        assert_eq!((video_mode, result_mode), (0o600, 0o600));
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn video_authentication_stays_bound_to_the_chmodded_descriptor() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = evidence_test_directory("same-fd-authentication");
+        let moved = directory.join("original.bin");
+        let _ = fs::remove_dir_all(&directory);
+        fs::create_dir(&directory).unwrap();
+        let path = directory.join("output.mp4");
+        fs::write(&path, b"authenticated-original").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o666)).unwrap();
+
+        let authenticated = digest_and_sync_regular_file_with_hook(&path, MAX_VIDEO_BYTES, || {
+            fs::rename(&path, &moved).unwrap();
+            fs::write(&path, b"replacement").unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o666)).unwrap();
+        })
+        .unwrap();
+
+        assert_eq!(authenticated.sha256, sha256_hex(b"authenticated-original"));
+        assert_eq!(
+            fs::metadata(&moved).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o666
+        );
+        assert!(verify_authenticated_file(&path, &authenticated, MAX_VIDEO_BYTES).is_err());
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn staging_cleanup_rejects_a_replaced_directory_without_recursive_deletion() {
+        let directory = evidence_test_directory("cleanup-replacement");
+        let moved = directory.with_extension("stage-moved");
+        let _ = fs::remove_dir_all(&directory);
+        let _ = fs::remove_dir_all(&moved);
+        fs::create_dir(&directory).unwrap();
+        let run =
+            EvidenceRun::acquire(&directory, "input_mp4", "cleanup_replacement", false).unwrap();
+        let stage_path = run.stage_dir.path().to_path_buf();
+        fs::rename(&stage_path, &moved).unwrap();
+        fs::create_dir(&stage_path).unwrap();
+        let sentinel = stage_path.join("do-not-delete");
+        fs::write(&sentinel, b"replacement").unwrap();
+
+        let error = run.cleanup_staging(false).unwrap_err();
+
+        assert!(error.to_string().contains("directory identity changed"));
+        assert_eq!(fs::read(sentinel).unwrap(), b"replacement");
+        drop(run);
+        fs::remove_dir_all(directory).unwrap();
+        fs::remove_dir_all(moved).unwrap();
+    }
+
+    #[test]
+    fn evidence_cleanup_preserves_unexpected_nested_content() {
+        let directory = evidence_test_directory("unexpected-stage-content");
+        let _ = fs::remove_dir_all(&directory);
+        fs::create_dir(&directory).unwrap();
+        let run = EvidenceRun::acquire(&directory, "input_mp4", "unexpected", true).unwrap();
+        let stage_dir = run.stage_dir.path().to_path_buf();
+        let nested = stage_dir.join("unexpected");
+        fs::create_dir(&nested).unwrap();
+        let sentinel = nested.join("sentinel");
+        fs::write(&sentinel, b"preserve-me").unwrap();
+
+        drop(run);
+
+        assert_eq!(fs::read(sentinel).unwrap(), b"preserve-me");
+        assert!(stage_dir.is_dir());
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn evidence_run_rejects_a_group_writable_run_directory() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = evidence_test_directory("writable-run-directory");
+        let _ = fs::remove_dir_all(&directory);
+        fs::create_dir(&directory).unwrap();
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o770)).unwrap();
+
+        let error = EvidenceRun::acquire(&directory, "input_mp4", "unsafe", false).unwrap_err();
+
+        assert!(error.to_string().contains("group- or world-writable"));
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn child_output_file_size_limit_stops_growth_at_the_kernel_boundary() {
+        let directory = evidence_test_directory("file-size-limit");
+        let _ = fs::remove_dir_all(&directory);
+        fs::create_dir(&directory).unwrap();
+        let output = directory.join("bounded-output.bin");
+        let limit = 4096_u64;
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .args(["--exact", "tests::child_output_file_size_limit_helper"])
+            .env_clear()
+            .env("MANWE_FILE_SIZE_LIMIT_TEST_OUTPUT", &output)
+            .env("MANWE_FILE_SIZE_LIMIT_TEST_BYTES", "65536")
+            .env("MANWE_FILE_SIZE_LIMIT_TEST_LIMIT", limit.to_string())
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let status = command.status().unwrap();
+        let observed_size = fs::metadata(&output).unwrap().len();
+
+        assert!(!status.success() && observed_size <= limit);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn child_output_file_size_limit_preserves_a_stricter_parent_limit() {
+        let directory = evidence_test_directory("inherited-file-size-limit");
+        let _ = fs::remove_dir_all(&directory);
+        fs::create_dir(&directory).unwrap();
+        let output = directory.join("bounded-output.bin");
+        let inherited_limit = 2048_u64;
+        let requested_limit = 4096_u64;
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .args(["--exact", "tests::child_output_file_size_limit_helper"])
+            .env_clear()
+            .env("MANWE_FILE_SIZE_LIMIT_TEST_OUTPUT", &output)
+            .env("MANWE_FILE_SIZE_LIMIT_TEST_BYTES", "65536")
+            .env("MANWE_FILE_SIZE_INITIAL_LIMIT", inherited_limit.to_string())
+            .env(
+                "MANWE_FILE_SIZE_LIMIT_TEST_LIMIT",
+                requested_limit.to_string(),
+            )
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let status = command.status().unwrap();
+        let observed_size = fs::metadata(&output).unwrap().len();
+
+        assert!(!status.success() && observed_size <= inherited_limit);
         fs::remove_dir_all(directory).unwrap();
     }
 
@@ -1447,5 +1916,28 @@ mod tests {
                 thread::sleep(Duration::from_secs(60));
             }
         }
+    }
+
+    #[test]
+    fn child_output_file_size_limit_helper() {
+        let Some(output) = std::env::var_os("MANWE_FILE_SIZE_LIMIT_TEST_OUTPUT") else {
+            return;
+        };
+        let Some(byte_count) = std::env::var_os("MANWE_FILE_SIZE_LIMIT_TEST_BYTES") else {
+            return;
+        };
+        let limit = std::env::var("MANWE_FILE_SIZE_LIMIT_TEST_LIMIT")
+            .unwrap()
+            .parse::<u64>()
+            .unwrap();
+        if let Some(initial_limit) = std::env::var_os("MANWE_FILE_SIZE_INITIAL_LIMIT") {
+            set_current_process_file_size_limit(
+                initial_limit.to_string_lossy().parse::<u64>().unwrap(),
+            )
+            .unwrap();
+        }
+        set_current_process_file_size_limit(limit).unwrap();
+        let byte_count = byte_count.to_string_lossy().parse::<usize>().unwrap();
+        fs::write(output, vec![0_u8; byte_count]).unwrap();
     }
 }
