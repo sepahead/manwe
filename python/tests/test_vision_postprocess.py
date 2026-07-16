@@ -160,6 +160,19 @@ def test_postprocess_threshold_boundaries_are_exact_and_ties_are_stable():
         xywh2xyxy(np.array([[1e15, 1e15, 1e-10, 1e-10]]))
 
 
+def test_nms_exact_boundary_is_scale_invariant():
+    # Intersection=32 and union=160, so IoU is exactly 1/5. The former
+    # normalized-area quotient rounded this one ULP above float(0.2), suppressing
+    # the second box despite the strict-above threshold contract.
+    boxes = np.array([[3.0, 0.0, 10.0, 8.0], [-1.0, -5.0, 7.0, 12.0]])
+    scores = np.array([0.9, 0.8])
+    for scale in (np.ldexp(1.0, -600), 1.0, np.ldexp(1.0, 500)):
+        scaled = boxes * scale
+        assert nms(scaled, scores, iou_threshold=0.2) == [0, 1]
+        assert nms(scaled, scores, iou_threshold=0.19) == [0]
+        assert nms(scaled, scores, iou_threshold=0.0) == [0]
+
+
 def test_resolve_ultralytics_device():
     assert resolve_ultralytics_device(Device("cuda", index=1)) == "1"
     assert resolve_ultralytics_device(Device("mps")) == "mps"

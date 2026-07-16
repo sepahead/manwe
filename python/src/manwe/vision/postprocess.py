@@ -16,6 +16,12 @@ _MAX_EXACT_IMAGE_DIMENSION = 2**53
 _MAX_NMS_BOXES = 4096
 _MAX_NMS_PAIR_WORK = 10_000_000
 _MAX_MODEL_CLASSES = 4096
+# The intersection-relative IoU predicate below performs two divisions and two
+# products per area ratio, then one addition, subtraction, and final threshold
+# product. Sixteen float64 epsilons conservatively cover the accumulated forward
+# error at the exact suppression boundary; ambiguous cases are retained because
+# NMS is specified to suppress only overlaps strictly above the threshold.
+_NMS_BOUNDARY_ERROR = 16.0 * np.finfo(np.float64).eps
 
 
 def _positive_size(value: object, name: str) -> int:
@@ -217,14 +223,31 @@ def nms(
         height_i = y2[i] - y1[i]
         width_rest = x2[rest] - x1[rest]
         height_rest = y2[rest] - y1[rest]
-        x_scale = np.maximum(width_i, width_rest)
-        y_scale = np.maximum(height_i, height_rest)
-        area_i = (width_i / x_scale) * (height_i / y_scale)
-        area_rest = (width_rest / x_scale) * (height_rest / y_scale)
-        inter = ((xx2 - xx1).clip(0) / x_scale) * ((yy2 - yy1).clip(0) / y_scale)
-        union = area_i + area_rest - inter
-        iou = np.divide(inter, union, out=np.zeros_like(inter), where=union > 0)
-        keep_mask = iou <= iou_threshold
+        inter_width = (xx2 - xx1).clip(0)
+        inter_height = (yy2 - yy1).clip(0)
+        overlaps = (inter_width > 0.0) & (inter_height > 0.0)
+        keep_mask = ~overlaps
+        if iou_threshold > 0.0 and np.any(overlaps):
+            # For a positive intersection I, IoU <= t exactly when
+            #
+            #   t * (area_i / I + area_rest / I - 1) >= 1.
+            #
+            # Factoring each area ratio by the intersection dimensions keeps
+            # every factor >= 1. This avoids both area underflow for tiny boxes
+            # and area overflow for huge or elongated boxes. An infinite ratio
+            # means the positive IoU rounded below float64 range and is therefore
+            # safely below every positive threshold.
+            overlap_width = inter_width[overlaps]
+            overlap_height = inter_height[overlaps]
+            with np.errstate(over="ignore", invalid="ignore"):
+                relative_union = (
+                    (width_i / overlap_width) * (height_i / overlap_height)
+                    + (width_rest[overlaps] / overlap_width)
+                    * (height_rest[overlaps] / overlap_height)
+                    - 1.0
+                )
+                scaled_threshold = iou_threshold * relative_union
+            keep_mask[overlaps] = scaled_threshold >= 1.0 - _NMS_BOUNDARY_ERROR
         if validated_labels is not None:
             keep_mask |= validated_labels[rest] != validated_labels[i]
         order = rest[keep_mask]
