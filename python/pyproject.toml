@@ -55,7 +55,7 @@ config = [
 vision = [
     "torch>=2.5,<3",
     "torchvision>=0.19",
-    "ultralytics==8.4.92",
+    "ultralytics==8.4.96",
     "sahi>=0.11",
     "pycocotools>=2.0.7",
     "pillow>=10.0",
@@ -74,7 +74,7 @@ rfdetr = [
 # installed separately from NVIDIA's index — see docs/research/SOTA-2026.md §5.)
 export = [
     "torch>=2.5,<3",
-    "ultralytics==8.4.92",
+    "ultralytics==8.4.96",
     "packaging>=23.2",
     "opencv-python>=4.9",
     "pillow>=10.0",
