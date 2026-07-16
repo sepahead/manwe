@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Any
 
 import numpy as np
 
@@ -20,6 +21,9 @@ from .postprocess import (
 
 _MAX_PIXEL_MAGNITUDE = 1e9
 _MAX_DETECTIONS = 100_000
+# Preserve the vetted Ultralytics inference default explicitly. This bounds
+# device-to-host copies before NumPy can observe or allocate for backend output.
+_MAX_BACKEND_DETECTIONS = 300
 _MAX_MODEL_CLASSES = 4096
 
 
@@ -184,6 +188,51 @@ def results_to_detections(
     return out
 
 
+def _backend_tensor_shape(value: object, name: str) -> tuple[int, ...]:
+    """Read a backend tensor's cheap shape metadata without materializing it."""
+    shape = getattr(value, "shape", None)
+    if shape is None:
+        raise ValueError(f"detector backend {name} must expose shape metadata")
+    try:
+        dimensions = tuple(shape)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(f"detector backend {name} has invalid shape metadata") from exc
+    normalized: list[int] = []
+    for dimension in dimensions:
+        if (
+            isinstance(dimension, (bool, np.bool_))
+            or not isinstance(dimension, (int, np.integer))
+            or int(dimension) < 0
+        ):
+            raise ValueError(f"detector backend {name} has invalid shape metadata")
+        normalized.append(int(dimension))
+    return tuple(normalized)
+
+
+def _bounded_backend_tensors(boxes: Any) -> tuple[Any, Any, Any]:
+    """Preflight every Ultralytics result tensor before the first CPU copy."""
+    try:
+        xyxy = boxes.xyxy
+        confidences = boxes.conf
+        class_ids = boxes.cls
+    except AttributeError as exc:
+        raise ValueError("detector backend boxes output is incomplete") from exc
+    xyxy_shape = _backend_tensor_shape(xyxy, "boxes.xyxy")
+    confidence_shape = _backend_tensor_shape(confidences, "boxes.conf")
+    class_shape = _backend_tensor_shape(class_ids, "boxes.cls")
+    if len(xyxy_shape) != 2 or xyxy_shape[1:] != (4,):
+        raise ValueError(f"detector backend boxes.xyxy must have shape (N, 4), got {xyxy_shape}")
+    count = xyxy_shape[0]
+    if count > _MAX_BACKEND_DETECTIONS:
+        raise ValueError(
+            "detector backend output exceeds the "
+            f"{_MAX_BACKEND_DETECTIONS}-detection device-copy safety limit"
+        )
+    if confidence_shape != (count,) or class_shape != (count,):
+        raise ValueError("detector backend boxes, confidences, and class_ids must align")
+    return xyxy, confidences, class_ids
+
+
 class Detector:
     """Thin Ultralytics inference wrapper returning crebain-mapped detections."""
 
@@ -228,9 +277,11 @@ class Detector:
             names = getattr(self.model, "names", None)
             if not isinstance(names, dict):
                 raise ValueError("checkpoint must expose an integer-keyed class-name mapping")
+            # Validate the independent class-count/key/name bounds before
+            # allocating contiguous-key comparison sets.
+            mapped_names = crebain_class_map(names)
             if set(names) != set(range(len(names))):
                 raise ValueError("checkpoint class-name mapping must be contiguous from zero")
-            mapped_names = crebain_class_map(names)
             if not mapped_names:
                 raise ValueError(
                     "checkpoint class table has no mapping into the candidate taxonomy"
@@ -268,17 +319,22 @@ class Detector:
             backend_image,
             conf=self.conf,
             iou=self.iou,
+            max_det=_MAX_BACKEND_DETECTIONS,
             device=resolve_ultralytics_device(self.device),
             verbose=False,
         )
         if not isinstance(results, (list, tuple)) or len(results) != 1:
             raise ValueError("detect expects exactly one input image and one result")
         res = results[0]
-        boxes = res.boxes
+        try:
+            boxes = res.boxes
+        except AttributeError as exc:
+            raise ValueError("detector backend result must expose boxes") from exc
+        xyxy, confidences, class_ids = _bounded_backend_tensors(boxes)
         return results_to_detections(
-            boxes.xyxy.cpu().numpy(),
-            boxes.conf.cpu().numpy(),
-            boxes.cls.cpu().numpy(),
+            xyxy.cpu().numpy(),
+            confidences.cpu().numpy(),
+            class_ids.cpu().numpy(),
             self.model.names,
         )
 

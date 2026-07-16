@@ -2370,6 +2370,7 @@ def test_inference_input_is_one_owned_bounded_local_image(tmp_path):
     class FakeTensor:
         def __init__(self, value):
             self.value = value
+            self.shape = value.shape
 
         def cpu(self):
             return self
@@ -2402,6 +2403,7 @@ def test_inference_input_is_one_owned_bounded_local_image(tmp_path):
     assert observed_kwargs[0] == {
         "conf": 0.25,
         "iou": 0.45,
+        "max_det": 300,
         "device": "cpu",
         "verbose": False,
     }

@@ -1,5 +1,7 @@
 """Vision postprocessing + crebain mapping (torch-free)."""
 
+from types import SimpleNamespace
+
 import numpy as np
 import pytest
 
@@ -315,6 +317,50 @@ def test_vision_fixed_shapes_reject_object_coercion_without_calling_float():
     with pytest.raises(ValueError, match="real numeric"):
         Detection(np.full(4, Coercive(), dtype=object), 0.5, "drone", 0)
     assert Coercive.calls == 0
+
+
+def test_detector_bounds_backend_output_before_any_device_to_host_copy():
+    from manwe.vision import predict as predict_module
+
+    copy_calls = 0
+    observed_kwargs = None
+
+    class BackendTensor:
+        def __init__(self, shape):
+            self.shape = shape
+
+        def cpu(self):
+            nonlocal copy_calls
+            copy_calls += 1
+            raise AssertionError("oversized backend output must not be copied to the host")
+
+    class BackendModel:
+        names = {0: "drone"}
+
+        def predict(self, _image, **kwargs):
+            nonlocal observed_kwargs
+            observed_kwargs = kwargs
+            count = predict_module._MAX_BACKEND_DETECTIONS + 1
+            boxes = SimpleNamespace(
+                xyxy=BackendTensor((count, 4)),
+                conf=BackendTensor((count,)),
+                cls=BackendTensor((count,)),
+            )
+            return [SimpleNamespace(boxes=boxes)]
+
+    detector = Detector.__new__(Detector)
+    detector._closed = False
+    detector.model = BackendModel()
+    detector.device = Device("cpu")
+    detector.conf = 0.25
+    detector.iou = 0.45
+
+    with pytest.raises(ValueError, match="device-copy safety limit"):
+        detector.detect(np.zeros((1, 1, 3), dtype=np.uint8))
+
+    assert copy_calls == 0
+    assert observed_kwargs is not None
+    assert observed_kwargs["max_det"] == predict_module._MAX_BACKEND_DETECTIONS
 
 
 def test_resolve_ultralytics_device():
