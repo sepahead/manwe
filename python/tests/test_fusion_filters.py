@@ -200,6 +200,9 @@ def test_wrap_angle_has_a_finite_explicit_boundary_contract():
         with pytest.raises(ValueError):
             wrap_angle(invalid)
 
+    with pytest.raises(ValueError, match="canonicalization limit"):
+        wrap_angle(1_000_001.0)
+
 
 def test_gaussian_state_copies_inputs_and_repairs_roundoff_only():
     x = np.arange(6.0)
@@ -800,3 +803,129 @@ def test_imm_revalidates_public_probability_arrays_at_runtime():
     imm.transition[0, 0] = np.nan
     with pytest.raises(ValueError, match="finite"):
         imm.predict(0.1)
+
+
+def test_filter_shape_and_work_admission_precedes_float_widening(monkeypatch):
+    from manwe.fusion import filters as filters_module
+
+    oversized_angles = np.broadcast_to(
+        np.array(1, dtype=np.int8),
+        (filters_module.MAX_WRAP_ANGLE_CELLS + 1,),
+    )
+    oversized_state = np.broadcast_to(
+        np.array(1, dtype=np.int8),
+        (2 * filters_module.MAX_FILTER_DIMENSION + 1,),
+    )
+    malformed_covariance = np.broadcast_to(np.array(1, dtype=np.int8), (1, 4_000_000))
+    malformed_particles = np.broadcast_to(np.array(1, dtype=np.int8), (1, 4_000_000))
+    malformed_transition = np.broadcast_to(np.array(1, dtype=np.int8), (1, 4_000_000))
+    forbidden = (
+        oversized_angles,
+        oversized_state,
+        malformed_covariance,
+        malformed_particles,
+        malformed_transition,
+    )
+    real_float_array = filters_module._float_array
+
+    def guarded_float_array(raw, name):
+        if any(
+            raw.shape == rejected.shape and np.shares_memory(raw, rejected)
+            for rejected in forbidden
+        ):
+            pytest.fail(f"{name} was widened before raw shape/work admission")
+        return real_float_array(raw, name)
+
+    monkeypatch.setattr(filters_module, "_float_array", guarded_float_array)
+
+    with pytest.raises(ValueError, match="value safety limit"):
+        wrap_angle(oversized_angles)
+    with pytest.raises(ValueError, match="at most 128"):
+        GaussianState(oversized_state, np.eye(1))
+    with pytest.raises(ValueError, match="must have shape"):
+        GaussianState(np.zeros(6), malformed_covariance)
+
+    particle = ParticleFilter(
+        np.zeros(6),
+        np.eye(6),
+        n_particles=4,
+        rng=np.random.default_rng(123),
+    )
+    particle.particles = malformed_particles
+    with pytest.raises(ValueError, match="particles must have shape"):
+        _ = particle.state
+
+    with pytest.raises(ValueError, match="transition must have shape"):
+        IMMEstimator(
+            [_LikelihoodModel(), _LikelihoodModel()],
+            transition=malformed_transition,
+        )
+
+
+def test_filter_numeric_admission_rejects_coercion_and_lossy_integers():
+    class Coercive:
+        calls = 0
+
+        def __float__(self):
+            type(self).calls += 1
+            return 1.0
+
+    with pytest.raises(ValueError, match="real numeric"):
+        GaussianState(np.full(6, Coercive(), dtype=object), np.eye(6))
+    assert Coercive.calls == 0
+
+    with pytest.raises(ValueError, match="exactly representable"):
+        GaussianState(np.array([2**53 + 1], dtype=np.uint64), np.eye(1))
+
+    with pytest.raises(FloatingPointError, match="invalid likelihood"):
+        IMMEstimator([_LikelihoodModel(likelihood=Coercive())])
+    with pytest.raises(FloatingPointError, match="invalid log likelihood"):
+        IMMEstimator([_LogLikelihoodModel(Coercive())])
+    assert Coercive.calls == 0
+
+
+def test_filter_rejects_finite_wide_values_that_overflow_float64():
+    wide = np.longdouble
+    if np.finfo(wide).max <= np.finfo(np.float64).max:
+        pytest.skip("long double has no wider finite range on this platform")
+    too_large = np.array([np.finfo(wide).max], dtype=wide)
+    with pytest.raises(ValueError, match="finite"):
+        GaussianState(too_large, np.eye(1))
+    with pytest.raises(ValueError, match="finite"):
+        cv_transition(wide(np.finfo(wide).max))
+
+
+def test_filter_rejects_wider_float_precision_loss_when_platform_exposes_it():
+    wide = np.longdouble
+    if np.finfo(wide).nmant <= np.finfo(np.float64).nmant:
+        pytest.skip("long double has no wider precision on this platform")
+    lossy = wide("0.1")
+    assert np.asarray(float(lossy), dtype=wide) != lossy
+    with pytest.raises(ValueError, match="precision"):
+        GaussianState(np.array([lossy], dtype=wide), np.eye(1))
+    with pytest.raises(ValueError, match="finite number"):
+        cv_transition(lossy)
+
+
+def test_filter_probability_sum_overflow_fails_as_validation_not_warning():
+    particle = ParticleFilter(
+        np.zeros(6),
+        np.eye(6),
+        n_particles=4,
+        rng=np.random.default_rng(124),
+    )
+    particle.weights = np.full(4, np.finfo(float).max)
+    with pytest.raises(ValueError, match="sum to 1"):
+        _ = particle.state
+
+    huge = np.finfo(float).max
+    with pytest.raises(ValueError, match="row must sum to 1"):
+        IMMEstimator(
+            [_LikelihoodModel(), _LikelihoodModel()],
+            transition=np.array([[huge, huge], [0.0, 1.0]]),
+        )
+    with pytest.raises(ValueError, match="mode_probs must sum to 1"):
+        IMMEstimator(
+            [_LikelihoodModel(), _LikelihoodModel()],
+            mode_probs=np.array([huge, huge]),
+        )

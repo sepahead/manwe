@@ -27,7 +27,11 @@ POS_DIM = 3
 STATE_DIM = 6
 MAX_FILTER_DIMENSION = 64
 MAX_FILTER_PARTICLES = 100_000
+MAX_WRAP_ANGLE_CELLS = 1_000_000
+MAX_WRAP_ANGLE_MAGNITUDE = 1_000_000.0
 MIN_POLAR_HORIZONTAL_RANGE = 1e-6
+_MAX_EXACT_FLOAT64_INTEGER = 2**53
+_FLOAT64_DTYPE = np.dtype(np.float64)
 
 
 # ---------------------------------------------------------------------------
@@ -89,22 +93,60 @@ def _symmetrize(P: np.ndarray) -> np.ndarray:
     return 0.5 * P + 0.5 * P.T
 
 
-def _as_real_array(value: object, name: str) -> np.ndarray:
+def _raw_real_array(value: object, name: str) -> np.ndarray:
     try:
         raw = np.asarray(value)
-    except (TypeError, ValueError) as exc:
+    except (TypeError, ValueError, OverflowError) as exc:
         raise ValueError(f"{name} must contain real numeric values") from exc
     if raw.dtype.kind not in "iuf":
         raise ValueError(f"{name} must contain real numeric values")
+    return raw
+
+
+def _float_array(raw: np.ndarray, name: str) -> np.ndarray:
+    if raw.dtype.kind == "u" and np.any(raw > _MAX_EXACT_FLOAT64_INTEGER):
+        raise ValueError(f"{name} integers must be exactly representable in float64")
+    if raw.dtype.kind == "i" and (
+        np.any(raw < -_MAX_EXACT_FLOAT64_INTEGER) or np.any(raw > _MAX_EXACT_FLOAT64_INTEGER)
+    ):
+        raise ValueError(f"{name} integers must be exactly representable in float64")
     try:
-        return np.asarray(raw, float)
+        with np.errstate(over="ignore", invalid="ignore"):
+            converted = np.asarray(raw, dtype=float)
     except (TypeError, ValueError, OverflowError) as exc:
         raise ValueError(f"{name} must contain real numeric values") from exc
+    if raw.dtype.kind == "f":
+        finite_before = np.isfinite(raw)
+        if np.any(finite_before & ~np.isfinite(converted)):
+            raise ValueError(f"{name} contains values outside the finite float64 range")
+        if raw.dtype.itemsize > _FLOAT64_DTYPE.itemsize:
+            restored = np.asarray(converted, dtype=raw.dtype)
+            if np.any(finite_before & (restored != raw)):
+                raise ValueError(f"{name} loses numeric precision when converted to float64")
+    return converted
+
+
+def _float_scalar(value: object, name: str) -> float:
+    """Admit one real scalar without invoking object-element coercion."""
+    raw = _raw_real_array(value, name)
+    if raw.ndim != 0:
+        raise ValueError(f"{name} must be a real numeric scalar")
+    return float(_float_array(raw, name))
 
 
 def wrap_angle(a: np.ndarray | float) -> np.ndarray | float:
     """Wrap finite angle(s) to ``[-pi, pi)``."""
-    array = _as_real_array(a, "angle")
+    raw = _raw_real_array(a, "angle")
+    if raw.size > MAX_WRAP_ANGLE_CELLS:
+        raise ValueError(f"angle exceeds the {MAX_WRAP_ANGLE_CELLS}-value safety limit")
+    if not np.isfinite(raw).all():
+        raise ValueError("angle must contain only finite values")
+    if np.any(np.abs(raw) > MAX_WRAP_ANGLE_MAGNITUDE):
+        raise ValueError(
+            f"angle magnitude exceeds the reliable canonicalization limit "
+            f"{MAX_WRAP_ANGLE_MAGNITUDE:g}"
+        )
+    array = _float_array(raw, "angle")
     if not np.isfinite(array).all():
         raise ValueError("angle must contain only finite values")
     wrapped = (array + np.pi) % (2 * np.pi) - np.pi
@@ -122,13 +164,15 @@ def _validate_dim(dim: object) -> int:
 
 
 def _validate_finite_scalar(value: object, name: str) -> float:
-    if (
-        isinstance(value, bool)
-        or not isinstance(value, (int, float, np.integer, np.floating))
-        or not np.isfinite(value)
-    ):
+    if isinstance(value, bool) or not isinstance(value, (int, float, np.integer, np.floating)):
         raise ValueError(f"{name} must be a finite number")
-    return float(value)
+    try:
+        converted = _float_scalar(value, name)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be a finite number") from exc
+    if not np.isfinite(converted):
+        raise ValueError(f"{name} must be a finite number")
+    return converted
 
 
 def _validate_nonnegative_scalar(value: object, name: str) -> float:
@@ -150,9 +194,12 @@ def _validate_dt(dt: float) -> float:
 
 
 def _as_vector(value: object, length: int, name: str) -> np.ndarray:
-    array = _as_real_array(value, name)
-    if array.shape != (length,):
-        raise ValueError(f"{name} must have shape ({length},), got {array.shape}")
+    raw = _raw_real_array(value, name)
+    if raw.shape != (length,):
+        raise ValueError(f"{name} must have shape ({length},), got {raw.shape}")
+    if not np.isfinite(raw).all():
+        raise ValueError(f"{name} must contain only finite values")
+    array = _float_array(raw, name)
     if not np.isfinite(array).all():
         raise ValueError(f"{name} must contain only finite values")
     return array.copy()
@@ -161,9 +208,12 @@ def _as_vector(value: object, length: int, name: str) -> np.ndarray:
 def _as_covariance(
     value: object, size: int, name: str, *, positive_definite: bool = False
 ) -> np.ndarray:
-    array = _as_real_array(value, name)
-    if array.shape != (size, size):
-        raise ValueError(f"{name} must have shape ({size}, {size}), got {array.shape}")
+    raw = _raw_real_array(value, name)
+    if raw.shape != (size, size):
+        raise ValueError(f"{name} must have shape ({size}, {size}), got {raw.shape}")
+    if not np.isfinite(raw).all():
+        raise ValueError(f"{name} must contain only finite values")
+    array = _float_array(raw, name)
     if not np.isfinite(array).all():
         raise ValueError(f"{name} must contain only finite values")
     if np.any(np.diag(array) < 0):
@@ -291,13 +341,13 @@ class GaussianState:
     P: np.ndarray
 
     def __post_init__(self) -> None:
-        x = _as_real_array(self.x, "x")
-        if x.ndim != 1 or len(x) == 0:
-            raise ValueError(f"x must be a non-empty 1-D vector, got shape {x.shape}")
-        if len(x) > 2 * MAX_FILTER_DIMENSION:
+        raw_x = _raw_real_array(self.x, "x")
+        if raw_x.ndim != 1 or len(raw_x) == 0:
+            raise ValueError(f"x must be a non-empty 1-D vector, got shape {raw_x.shape}")
+        if len(raw_x) > 2 * MAX_FILTER_DIMENSION:
             raise ValueError(f"x must contain at most {2 * MAX_FILTER_DIMENSION} state coordinates")
-        self.x = _as_vector(x, len(x), "x")
-        self.P = _as_covariance(self.P, len(x), "P")
+        self.x = _as_vector(raw_x, len(raw_x), "x")
+        self.P = _as_covariance(self.P, len(raw_x), "P")
 
     def copy(self) -> GaussianState:
         return GaussianState(self.x.copy(), self.P.copy())
@@ -726,18 +776,27 @@ class ParticleFilter:
 
     def _validate_population(self) -> tuple[np.ndarray, np.ndarray]:
         expected = (self.n_particles, 2 * self.dim)
-        particles = np.asarray(self.particles, float)
-        if particles.shape != expected:
-            raise ValueError(f"particles must have shape {expected}, got {particles.shape}")
+        raw_particles = _raw_real_array(self.particles, "particles")
+        raw_weights = _raw_real_array(self.weights, "weights")
+        if raw_particles.shape != expected:
+            raise ValueError(f"particles must have shape {expected}, got {raw_particles.shape}")
+        if raw_weights.shape != (self.n_particles,):
+            raise ValueError(
+                f"weights must have shape ({self.n_particles},), got {raw_weights.shape}"
+            )
+        if not np.isfinite(raw_particles).all():
+            raise ValueError("particles must contain only finite values")
+        if not np.isfinite(raw_weights).all() or np.any(raw_weights < 0):
+            raise ValueError("weights must be finite and nonnegative")
+        particles = _float_array(raw_particles, "particles")
+        weights = _float_array(raw_weights, "weights")
         if not np.isfinite(particles).all():
             raise ValueError("particles must contain only finite values")
-        weights = np.asarray(self.weights, float)
-        if weights.shape != (self.n_particles,):
-            raise ValueError(f"weights must have shape ({self.n_particles},), got {weights.shape}")
-        if not np.isfinite(weights).all() or np.any(weights < 0):
+        if not np.isfinite(weights).all():
             raise ValueError("weights must be finite and nonnegative")
-        total = float(weights.sum())
-        if not np.isclose(total, 1.0, rtol=1e-10, atol=1e-12):
+        with np.errstate(over="ignore", invalid="ignore"):
+            total = float(weights.sum())
+        if not np.isfinite(total) or not np.isclose(total, 1.0, rtol=1e-10, atol=1e-12):
             raise ValueError("weights must sum to 1")
         self.particles = particles
         self.weights = weights
@@ -939,11 +998,9 @@ class IMMEstimator:
     def _model_log_likelihood(model, index: int) -> float:
         if hasattr(model, "log_likelihood"):
             raw_value = model.log_likelihood
-            if isinstance(raw_value, (bool, np.bool_)):
-                raise FloatingPointError(f"models[{index}] produced an invalid log likelihood")
             try:
-                value = float(raw_value)
-            except (TypeError, ValueError, OverflowError) as exc:
+                value = _float_scalar(raw_value, f"models[{index}] log likelihood")
+            except ValueError as exc:
                 raise FloatingPointError(
                     f"models[{index}] produced an invalid log likelihood"
                 ) from exc
@@ -952,11 +1009,9 @@ class IMMEstimator:
             return value
 
         raw_value = model.likelihood
-        if isinstance(raw_value, (bool, np.bool_)):
-            raise FloatingPointError(f"models[{index}] produced an invalid likelihood")
         try:
-            likelihood = float(raw_value)
-        except (TypeError, ValueError, OverflowError) as exc:
+            likelihood = _float_scalar(raw_value, f"models[{index}] likelihood")
+        except ValueError as exc:
             raise FloatingPointError(f"models[{index}] produced an invalid likelihood") from exc
         if not np.isfinite(likelihood) or likelihood < 0:
             raise FloatingPointError(f"models[{index}] produced an invalid likelihood")
@@ -964,29 +1019,38 @@ class IMMEstimator:
 
     @staticmethod
     def _validate_transition(transition: np.ndarray, size: int) -> np.ndarray:
-        try:
-            matrix = np.asarray(transition, float)
-        except (TypeError, ValueError) as exc:
-            raise ValueError("transition must be a numeric probability matrix") from exc
-        if matrix.shape != (size, size):
-            raise ValueError(f"transition must have shape ({size}, {size}), got {matrix.shape}")
-        if not np.isfinite(matrix).all() or np.any(matrix < 0):
+        raw = _raw_real_array(transition, "transition")
+        if raw.shape != (size, size):
+            raise ValueError(f"transition must have shape ({size}, {size}), got {raw.shape}")
+        if not np.isfinite(raw).all() or np.any(raw < 0):
             raise ValueError("transition must contain finite nonnegative probabilities")
-        if not np.allclose(matrix.sum(axis=1), 1.0, rtol=1e-10, atol=1e-12):
+        matrix = _float_array(raw, "transition")
+        if not np.isfinite(matrix).all():
+            raise ValueError("transition must contain finite nonnegative probabilities")
+        with np.errstate(over="ignore", invalid="ignore"):
+            row_sums = matrix.sum(axis=1)
+        if not np.isfinite(row_sums).all() or not np.allclose(
+            row_sums,
+            1.0,
+            rtol=1e-10,
+            atol=1e-12,
+        ):
             raise ValueError("each transition row must sum to 1")
         return matrix.copy()
 
     @staticmethod
     def _validate_probabilities(values: np.ndarray, size: int, name: str) -> np.ndarray:
-        try:
-            probabilities = np.asarray(values, float)
-        except (TypeError, ValueError) as exc:
-            raise ValueError(f"{name} must be a numeric probability vector") from exc
-        if probabilities.shape != (size,):
-            raise ValueError(f"{name} must have shape ({size},), got {probabilities.shape}")
-        if not np.isfinite(probabilities).all() or np.any(probabilities < 0):
+        raw = _raw_real_array(values, name)
+        if raw.shape != (size,):
+            raise ValueError(f"{name} must have shape ({size},), got {raw.shape}")
+        if not np.isfinite(raw).all() or np.any(raw < 0):
             raise ValueError(f"{name} must contain finite nonnegative probabilities")
-        if not np.isclose(probabilities.sum(), 1.0, rtol=1e-10, atol=1e-12):
+        probabilities = _float_array(raw, name)
+        if not np.isfinite(probabilities).all():
+            raise ValueError(f"{name} must contain finite nonnegative probabilities")
+        with np.errstate(over="ignore", invalid="ignore"):
+            total = float(probabilities.sum())
+        if not np.isfinite(total) or not np.isclose(total, 1.0, rtol=1e-10, atol=1e-12):
             raise ValueError(f"{name} must sum to 1")
         return probabilities.copy()
 
@@ -1048,8 +1112,8 @@ class IMMEstimator:
         maneuver_sigma = quiet_sigma * 10.0
         quiet = ExtendedKalmanFilter(x0, P0, sigma_a=quiet_sigma, dim=dim)
         maneuver = ExtendedKalmanFilter(
-            x0,
-            np.asarray(P0, float).copy(),
+            quiet.state.x.copy(),
+            quiet.state.P.copy(),
             sigma_a=maneuver_sigma,
             dim=dim,
         )
