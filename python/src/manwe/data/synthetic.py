@@ -146,8 +146,7 @@ def _write_exclusive(path: pathlib.Path, payload: bytes) -> None:
 
 def _encode_png(rgb: np.ndarray) -> bytes:
     """Encode an ``(H, W, 3)`` uint8 array as one bounded PNG payload."""
-    rgb = np.asarray(rgb)
-    if rgb.dtype != np.uint8 or rgb.ndim != 3 or rgb.shape[2] != 3:
+    if type(rgb) is not np.ndarray or rgb.dtype != np.uint8 or rgb.ndim != 3 or rgb.shape[2] != 3:
         raise ValueError("rgb must be a uint8 array with shape (height, width, 3)")
     if rgb.shape[0] == 0 or rgb.shape[1] == 0:
         raise ValueError("rgb dimensions must be nonzero")

@@ -23,6 +23,8 @@ _NETWORK_INTEGRATIONS = (
 )
 _VETTED_ULTRALYTICS_VERSION = "8.4.92"
 _FORMAT_PATCH_LOCK = threading.RLock()
+_MAX_FORMAT_IMAGE_DIMENSION = 32_768
+_MAX_FORMAT_IMAGE_PIXELS = 32_000_000
 
 
 def _blocked_download(*_args, **_kwargs):
@@ -57,7 +59,28 @@ def _deterministic_format_image(formatter, image):
     import numpy as np
     import torch
 
-    if len(image.shape) < 3:
+    if type(image) is not np.ndarray or image.dtype != np.uint8:
+        raise ValueError("calibration image must be one uint8 numpy array")
+    if image.ndim == 2:
+        height, width = image.shape
+        channels = 1
+    elif image.ndim == 3:
+        height, width, channels = image.shape
+    else:
+        raise ValueError("calibration image must have shape (height, width) or (height, width, C)")
+    if height <= 0 or width <= 0 or channels not in {1, 3}:
+        raise ValueError(
+            "calibration image must have positive dimensions and one or three channels"
+        )
+    if height > _MAX_FORMAT_IMAGE_DIMENSION or width > _MAX_FORMAT_IMAGE_DIMENSION:
+        raise ValueError(
+            f"calibration image dimensions must not exceed {_MAX_FORMAT_IMAGE_DIMENSION}"
+        )
+    if height * width > _MAX_FORMAT_IMAGE_PIXELS:
+        raise ValueError(
+            f"calibration image exceeds the {_MAX_FORMAT_IMAGE_PIXELS}-pixel safety limit"
+        )
+    if image.ndim == 2:
         image = image[..., None]
     image = image.transpose(2, 0, 1)
     bgr_probability = formatter.bgr

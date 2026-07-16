@@ -33,7 +33,7 @@ def prepare_single_image(image: Any) -> Any:
     boundary. Backend adapters are responsible for any backend-specific channel
     ordering.
     """
-    if isinstance(image, np.ndarray):
+    if type(image) is np.ndarray:
         if image.dtype != np.uint8 or image.ndim != 3 or image.shape[2] != 3:
             raise ValueError("numpy image must be uint8 with shape (height, width, 3)")
         _validate_dimensions(int(image.shape[0]), int(image.shape[1]))

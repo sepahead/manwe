@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import copy
 import hashlib
 import json
 import os
@@ -16,6 +15,8 @@ from ..common.artifacts import sha256_artifact, sha256_artifact_at
 from ..common.config_io import open_directory_nofollow
 from ..common.contracts import (
     CREBAIN_CLASSES,
+    MAX_CONTRACT_CLASSES,
+    MAX_TENSOR_RANK,
     Backend,
     CrebainClass,
     ModelContract,
@@ -352,13 +353,13 @@ class VerifiedArtifactSignature:
 
     def __post_init__(self) -> None:
         if (
-            not isinstance(self.artifact_sha256, str)
+            type(self.artifact_sha256) is not str
             or len(self.artifact_sha256) != 64
             or any(char not in "0123456789abcdefABCDEF" for char in self.artifact_sha256)
         ):
             raise ValueError("signature artifact_sha256 must be a 64-character hex digest")
         object.__setattr__(self, "artifact_sha256", self.artifact_sha256.lower())
-        if not isinstance(self.precision, str) or self.precision not in {
+        if type(self.precision) is not str or self.precision not in {
             "float32",
             "float16",
             "int8",
@@ -368,10 +369,10 @@ class VerifiedArtifactSignature:
             raise TypeError("signature embedded_nms must be a boolean")
         if self.opset is not None and (type(self.opset) is not int or not 12 <= self.opset <= 20):
             raise ValueError("signature opset must be an integer in [12, 20] or None")
-        if not isinstance(self.source_classes, tuple) or not self.source_classes:
+        if type(self.source_classes) is not tuple or not self.source_classes:
             raise ValueError("signature source_classes must be a nonempty tuple")
         if len(self.source_classes) > 4096 or any(
-            not isinstance(value, str)
+            type(value) is not str
             or not value.strip()
             or value != value.strip()
             or not value.isprintable()
@@ -381,27 +382,21 @@ class VerifiedArtifactSignature:
             raise ValueError("signature source_classes must contain bounded printable names")
         if len(set(self.source_classes)) != len(self.source_classes):
             raise ValueError("signature source_classes must be unique")
-        if not isinstance(self.inputs, tuple) or not isinstance(self.outputs, tuple):
+        if type(self.inputs) is not tuple or type(self.outputs) is not tuple:
             raise TypeError("signature inputs and outputs must be tuples")
         if not self.inputs or not self.outputs:
             raise ValueError("signature inputs and outputs must be nonempty")
         if len(self.inputs) > 64 or len(self.outputs) > 64:
             raise ValueError("signature inputs and outputs must each contain at most 64 tensors")
-        if any(not isinstance(value, TensorSpec) for value in (*self.inputs, *self.outputs)):
+        if any(type(value) is not TensorSpec for value in (*self.inputs, *self.outputs)):
             raise TypeError("signature tensors must be TensorSpec values")
-        copied_inputs = tuple(copy.deepcopy(self.inputs))
-        copied_outputs = tuple(copy.deepcopy(self.outputs))
-        tensor_errors = _signature_tensor_errors(copied_inputs, copied_outputs)
-        if tensor_errors:
-            raise ValueError("invalid signature tensor metadata: " + "; ".join(tensor_errors))
+        copied_inputs, copied_outputs = _copy_validated_signature_tensors(
+            self.inputs,
+            self.outputs,
+        )
         for name in ("preprocess", "postprocess", "failure_behavior", "evidence"):
             value = getattr(self, name)
-            if (
-                not isinstance(value, str)
-                or not value.strip()
-                or "\0" in value
-                or len(value) > 4096
-            ):
+            if type(value) is not str or not value.strip() or "\0" in value or len(value) > 4096:
                 raise ValueError(f"signature {name} must be a nonempty string")
         object.__setattr__(self, "inputs", copied_inputs)
         object.__setattr__(self, "outputs", copied_outputs)
@@ -416,12 +411,74 @@ def _signature_tensor_errors(
     for collection_name, tensors in (("inputs", inputs), ("outputs", outputs)):
         for index, tensor in enumerate(tensors):
             errors.extend(tensor.validation_errors(f"signature.{collection_name}[{index}]"))
-            if isinstance(tensor.name, str):
+            if type(tensor.name) is str:
                 names.append(tensor.name)
     duplicate_names = sorted({name for name in names if names.count(name) > 1})
     if duplicate_names:
         errors.append(f"signature contains duplicate tensor names {duplicate_names}")
     return errors
+
+
+def _copy_validated_signature_tensors(
+    inputs: tuple[TensorSpec, ...],
+    outputs: tuple[TensorSpec, ...],
+) -> tuple[tuple[TensorSpec, ...], tuple[TensorSpec, ...]]:
+    """Validate shape cardinality before making bounded defensive copies."""
+    tensor_errors = _signature_tensor_errors(inputs, outputs)
+    if tensor_errors:
+        raise ValueError("invalid signature tensor metadata: " + "; ".join(tensor_errors))
+
+    def copy_tensor(tensor: TensorSpec) -> TensorSpec:
+        source_shape = tensor.shape
+        if type(source_shape) is not list:
+            raise RuntimeError("signature tensor shape changed while it was being copied")
+        shape: list[int | str] = []
+        for index, dimension in enumerate(source_shape):
+            if index >= MAX_TENSOR_RANK:
+                raise RuntimeError("signature tensor shape changed while it was being copied")
+            shape.append(dimension)
+        return TensorSpec(
+            name=tensor.name,
+            shape=shape,
+            dtype=tensor.dtype,
+            layout=tensor.layout,
+            notes=tensor.notes,
+        )
+
+    copied_inputs = tuple(copy_tensor(tensor) for tensor in inputs)
+    copied_outputs = tuple(copy_tensor(tensor) for tensor in outputs)
+    copied_errors = _signature_tensor_errors(copied_inputs, copied_outputs)
+    if copied_errors:
+        raise RuntimeError(
+            "signature tensor metadata changed while it was being copied: "
+            + "; ".join(copied_errors)
+        )
+    return copied_inputs, copied_outputs
+
+
+def _copy_bounded_class_map(
+    class_map: dict[int, CrebainClass | None],
+) -> dict[int, CrebainClass | None]:
+    """Copy one ordinary dictionary only after its public cardinality bound."""
+    if type(class_map) is not dict:
+        raise TypeError("class_map must be a dictionary or None")
+    if len(class_map) > MAX_CONTRACT_CLASSES:
+        raise ValueError(f"class_map must contain at most {MAX_CONTRACT_CLASSES} entries")
+    result: dict[int, CrebainClass | None] = {}
+    try:
+        for index, (key, value) in enumerate(dict.items(class_map)):
+            if index >= MAX_CONTRACT_CLASSES:
+                raise ValueError(f"class_map must contain at most {MAX_CONTRACT_CLASSES} entries")
+            if type(key) is not int or key < 0:
+                raise ValueError("class_map keys must be nonnegative built-in integers")
+            if value is not None and (type(value) is not str or value not in CREBAIN_CLASSES):
+                raise ValueError("class_map values must be canonical class strings or None")
+            result[key] = value
+    except RuntimeError as exc:
+        raise ValueError("class_map changed while it was being copied") from exc
+    if len(result) != len(class_map):
+        raise ValueError("class_map changed while it was being copied")
+    return result
 
 
 def _validate_raw_detect_signature(
@@ -509,8 +566,12 @@ def build_export_contract(
             raise ValueError(f"signature {field} does not match the export receipt")
     if signature.source_classes != receipt.source_classes:
         raise ValueError("signature source_classes do not match the export receipt")
-    signature_inputs = tuple(copy.deepcopy(signature.inputs))
-    signature_outputs = tuple(copy.deepcopy(signature.outputs))
+    if any(type(value) is not TensorSpec for value in (*signature.inputs, *signature.outputs)):
+        raise TypeError("signature tensors must be TensorSpec values")
+    signature_inputs, signature_outputs = _copy_validated_signature_tensors(
+        signature.inputs,
+        signature.outputs,
+    )
     _validate_raw_detect_signature(receipt, signature_inputs, signature_outputs)
 
     backend: Backend = EXPORT_FORMATS[receipt.format].crebain_backend  # type: ignore[assignment]
@@ -522,7 +583,7 @@ def build_export_contract(
             )
         cmap: dict[int, CrebainClass | None] = {i: value for i, value in enumerate(CREBAIN_CLASSES)}
     else:
-        cmap = class_map.copy()
+        cmap = _copy_bounded_class_map(class_map)
     export_options = json.dumps(
         {
             "format": receipt.format,

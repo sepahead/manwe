@@ -11,11 +11,15 @@ from __future__ import annotations
 import math
 from collections.abc import Collection
 from dataclasses import dataclass, field
+from typing import cast
 
 import numpy as np
 
+from ..common.numeric import finite_float64_scalar
 from ..eval.detection import Detections, GroundTruth, iou_matrix, mean_average_precision
 from ..fusion.association import GATE_INF, linear_assignment
+
+_MAX_FIDELITY_FRAMES = 10_000
 
 
 @dataclass
@@ -81,13 +85,11 @@ class FidelityReport:
 
 
 def _validate_tolerance(value: float, name: str) -> float:
-    if isinstance(value, bool):
-        raise ValueError(f"{name} must be a finite nonnegative number")
     try:
-        tolerance = float(value)
-    except (TypeError, ValueError) as exc:
-        raise ValueError(f"{name} must be a finite nonnegative number") from exc
-    if not math.isfinite(tolerance) or tolerance < 0.0:
+        tolerance = finite_float64_scalar(value, name)
+    except ValueError:
+        raise ValueError(f"{name} must be a finite nonnegative number") from None
+    if tolerance < 0.0:
         raise ValueError(f"{name} must be a finite nonnegative number")
     return tolerance
 
@@ -122,11 +124,35 @@ def _validate_required_classes(
 ) -> list[int]:
     if values is None:
         return []
-    if len(values) > num_classes:
+    if type(values) not in {list, tuple, set, frozenset, range}:
+        raise ValueError(f"{name} must be a built-in list, tuple, set, frozenset, or range")
+    initial_count = len(values)
+    if initial_count > num_classes:
         raise ValueError(f"{name} must contain at most {num_classes} class indices")
+    snapshot: list[object] = []
+    if type(values) is list:
+        list_values = cast(list[object], values)
+        for index in range(initial_count):
+            try:
+                snapshot.append(list_values[index])
+            except IndexError as exc:
+                raise ValueError(f"{name} changed while it was being validated") from exc
+    else:
+        try:
+            for index, collection_value in enumerate(values):
+                if index >= initial_count:
+                    raise ValueError(f"{name} changed while it was being validated")
+                snapshot.append(collection_value)
+        except RuntimeError as exc:
+            raise ValueError(f"{name} changed while it was being validated") from exc
+    if len(snapshot) != initial_count or len(values) != initial_count:
+        raise ValueError(f"{name} changed while it was being validated")
     result: set[int] = set()
-    for value in values:
-        if type(value) is not int or not 0 <= value < num_classes:
+    for item in snapshot:
+        if type(item) is not int:
+            raise ValueError(f"{name} must contain unique class indices in [0, {num_classes})")
+        value = cast(int, item)
+        if not 0 <= value < num_classes:
             raise ValueError(f"{name} must contain unique class indices in [0, {num_classes})")
         if value in result:
             raise ValueError(f"{name} must not contain duplicate class indices")
@@ -176,6 +202,29 @@ def _require_aligned_image_ids(
         or sequences["reference"] != sequences["ground_truth"]
     ):
         raise ValueError("fidelity image_id sequences are not aligned")
+
+
+def _snapshot_fidelity_frames(
+    frames: list[Detections] | list[GroundTruth],
+    expected_type: type[Detections] | type[GroundTruth],
+    name: str,
+    frame_count: int,
+) -> list[Detections] | list[GroundTruth]:
+    """Make one bounded frame-reference snapshot before any later materialization."""
+    snapshot: list[object] = []
+    for frame_index in range(frame_count):
+        try:
+            frame = frames[frame_index]
+        except IndexError as exc:
+            raise ValueError(f"{name} changed while it was being validated") from exc
+        if type(frame) is not expected_type:
+            raise ValueError(f"{name}[{frame_index}] must be a {expected_type.__name__} instance")
+        if frame.image_id is not None and type(frame.image_id) not in {str, int}:
+            raise ValueError(f"{name}[{frame_index}].image_id must be a built-in string or integer")
+        snapshot.append(frame)
+    if len(frames) != frame_count:
+        raise ValueError(f"{name} changed while it was being validated")
+    return cast(list[Detections] | list[GroundTruth], snapshot)
 
 
 def _within_limit(value: float, limit: float) -> bool:
@@ -260,6 +309,13 @@ def fidelity_report(
     """
     if type(num_classes) is not int or not 1 <= num_classes <= 4096:
         raise ValueError("num_classes must be an integer in [1, 4096]")
+    for name, frames in (
+        ("reference", reference),
+        ("exported", exported),
+        ("ground_truth", ground_truth),
+    ):
+        if type(frames) is not list:
+            raise ValueError(f"{name} must be an exact built-in list")
     counts = {
         "reference": len(reference),
         "exported": len(exported),
@@ -269,8 +325,25 @@ def fidelity_report(
         raise ValueError(f"fidelity evaluation requires nonempty frame lists, got {counts}")
     if len(set(counts.values())) != 1:
         raise ValueError(f"fidelity frame count mismatch: {counts}")
-    _require_aligned_image_ids(reference, exported, ground_truth)
+    frame_count = counts["ground_truth"]
+    if frame_count > _MAX_FIDELITY_FRAMES:
+        raise ValueError(
+            f"fidelity evaluation exceeds the {_MAX_FIDELITY_FRAMES}-frame safety limit"
+        )
+    reference = cast(
+        list[Detections],
+        _snapshot_fidelity_frames(reference, Detections, "reference", frame_count),
+    )
+    exported = cast(
+        list[Detections],
+        _snapshot_fidelity_frames(exported, Detections, "exported", frame_count),
+    )
+    ground_truth = cast(
+        list[GroundTruth],
+        _snapshot_fidelity_frames(ground_truth, GroundTruth, "ground_truth", frame_count),
+    )
 
+    iou_threshold = _validate_probability(iou_thr, "iou_thr")
     tolerance = _validate_probability(tolerance, "tolerance", include_zero=True)
     small_tol = (
         tolerance
@@ -289,14 +362,15 @@ def fidelity_report(
     required_small = _validate_required_classes(
         required_small_classes, num_classes, "required_small_classes"
     )
+    _require_aligned_image_ids(reference, exported, ground_truth)
 
-    ref_metrics = mean_average_precision(reference, ground_truth, num_classes, iou_thr)
-    exp_metrics = mean_average_precision(exported, ground_truth, num_classes, iou_thr)
+    ref_metrics = mean_average_precision(reference, ground_truth, num_classes, iou_threshold)
+    exp_metrics = mean_average_precision(exported, ground_truth, num_classes, iou_threshold)
     ref_small_metrics = mean_average_precision(
-        reference, ground_truth, num_classes, iou_thr, area="small"
+        reference, ground_truth, num_classes, iou_threshold, area="small"
     )
     exp_small_metrics = mean_average_precision(
-        exported, ground_truth, num_classes, iou_thr, area="small"
+        exported, ground_truth, num_classes, iou_threshold, area="small"
     )
     evaluated_classes = ref_metrics.evaluated_classes
     evaluated_small_classes = ref_small_metrics.evaluated_classes
@@ -331,8 +405,8 @@ def fidelity_report(
     small_class_gate_passed = all(
         _within_limit(values["drop"], small_tol) for values in small_class_metrics.values()
     )
-    ref_precision, ref_recall, ref_fppi = _operating_metrics(reference, ground_truth, iou_thr)
-    exp_precision, exp_recall, exp_fppi = _operating_metrics(exported, ground_truth, iou_thr)
+    ref_precision, ref_recall, ref_fppi = _operating_metrics(reference, ground_truth, iou_threshold)
+    exp_precision, exp_recall, exp_fppi = _operating_metrics(exported, ground_truth, iou_threshold)
     delta_precision = ref_precision - exp_precision
     delta_recall = ref_recall - exp_recall
     delta_fppi = exp_fppi - ref_fppi

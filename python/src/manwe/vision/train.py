@@ -7,7 +7,6 @@ inside :func:`train`, so this module (and its config) import with numpy alone.
 
 from __future__ import annotations
 
-import math
 from collections.abc import Mapping
 from contextlib import suppress
 from dataclasses import dataclass, field
@@ -19,6 +18,7 @@ from ..common.config_io import validate_local_path
 from ..common.dataset_manifest import validate_local_detection_manifest
 from ..common.device import Device, resolve_device
 from ..common.logging import get_logger
+from ..common.numeric import finite_float64_scalar
 from ..common.seed import seed_everything
 from .models import DEFAULT_DETECTOR, MODEL_ZOO, build_model
 
@@ -79,6 +79,37 @@ _ULTRALYTICS_BOOL_EXTRA = {
 }
 
 
+def _copy_bounded_extra(extra: Mapping[str, object]) -> dict[str, object]:
+    """Materialize at most 128 validated keys from one mapping."""
+    try:
+        initial_count = len(extra)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError("extra must be a stable mapping") from exc
+    if initial_count > 128:
+        raise ValueError("extra must contain at most 128 fields")
+
+    result: dict[str, object] = {}
+    try:
+        for index, key in enumerate(extra):
+            if index >= 128:
+                raise ValueError("extra must contain at most 128 fields")
+            if (
+                type(key) is not str
+                or not key
+                or not key.isprintable()
+                or len(key.encode("utf-8")) > 128
+            ):
+                raise ValueError("extra keys must be printable strings of 1..128 UTF-8 bytes")
+            if key in result:
+                raise ValueError("extra must be a stable mapping")
+            result[key] = extra[key]
+    except (KeyError, RuntimeError) as exc:
+        raise ValueError("extra must be a stable mapping") from exc
+    if len(result) != initial_count or len(extra) != initial_count:
+        raise ValueError("extra must be a stable mapping")
+    return result
+
+
 def _extra_bool(extra: Mapping[str, object], key: str) -> None:
     if key in extra and type(extra[key]) is not bool:
         raise ValueError(f"extra.{key} must be a boolean")
@@ -96,21 +127,27 @@ def _extra_integer(extra: Mapping[str, object], key: str, minimum: int, maximum:
 
 
 def _extra_float(
-    extra: Mapping[str, object], key: str, minimum: float, maximum: float, *, open_min: bool = False
+    extra: dict[str, object],
+    key: str,
+    minimum: float,
+    maximum: float,
+    *,
+    open_min: bool = False,
 ) -> None:
     if key not in extra:
         return
-    value = extra[key]
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        raise ValueError(f"extra.{key} must be a finite number")
-    number = float(value)
+    try:
+        number = finite_float64_scalar(extra[key], f"extra.{key}")
+    except ValueError:
+        raise ValueError(f"extra.{key} must be a finite number") from None
     valid_minimum = number > minimum if open_min else number >= minimum
-    if not math.isfinite(number) or not valid_minimum or number > maximum:
+    if not valid_minimum or number > maximum:
         bracket = "(" if open_min else "["
         raise ValueError(f"extra.{key} must be in {bracket}{minimum}, {maximum}]")
+    extra[key] = number
 
 
-def _validate_extra_values(extra: Mapping[str, object], family: str, epochs: int) -> None:
+def _validate_extra_values(extra: dict[str, object], family: str, epochs: int) -> None:
     if family == "rfdetr":
         _extra_integer(extra, "checkpoint_interval", 1, epochs)
         _extra_integer(extra, "gradient_accumulation_steps", 1, 4096)
@@ -143,7 +180,7 @@ def _validate_extra_values(extra: Mapping[str, object], family: str, epochs: int
     _extra_float(extra, "warmup_momentum", 0.0, 1.0)
     if "optimizer" in extra:
         optimizer = extra["optimizer"]
-        if not isinstance(optimizer, str) or optimizer.lower() not in {
+        if type(optimizer) is not str or optimizer.lower() not in {
             "sgd",
             "adam",
             "adamw",
@@ -201,9 +238,11 @@ class VisionTrainConfig:
     extra: Mapping[str, object] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
+        if type(self.model) is not str:
+            raise ValueError("model must be a built-in string")
         if self.model not in MODEL_ZOO:
             raise ValueError(f"unknown model {self.model!r}; choose from {list(MODEL_ZOO)}")
-        if not isinstance(self.data, str) or not self.data.strip():
+        if type(self.data) is not str or not self.data.strip():
             raise ValueError("data must be a nonempty dataset path")
         if (
             any(character in self.data for character in "\0\r\n")
@@ -223,24 +262,24 @@ class VisionTrainConfig:
             raise ValueError("patience must be an integer in [0, 100000]")
         for name in ("lr0", "lrf"):
             value = getattr(self, name)
-            if (
-                isinstance(value, bool)
-                or not isinstance(value, (int, float))
-                or not math.isfinite(value)
-                or value <= 0
-            ):
+            try:
+                number = finite_float64_scalar(value, name)
+            except ValueError:
+                raise ValueError(f"{name} must be finite and positive") from None
+            if number <= 0:
                 raise ValueError(f"{name} must be finite and positive")
+            object.__setattr__(self, name, number)
         if self.lrf > 1.0:
             raise ValueError("lrf must not exceed 1")
         for name in ("mosaic", "mixup", "copy_paste"):
             value = getattr(self, name)
-            if (
-                isinstance(value, bool)
-                or not isinstance(value, (int, float))
-                or not math.isfinite(value)
-                or not 0.0 <= value <= 1.0
-            ):
+            try:
+                number = finite_float64_scalar(value, name)
+            except ValueError:
+                raise ValueError(f"{name} must be finite and in [0, 1]") from None
+            if not 0.0 <= number <= 1.0:
                 raise ValueError(f"{name} must be finite and in [0, 1]")
+            object.__setattr__(self, name, number)
         if type(self.close_mosaic) is not int or not 0 <= self.close_mosaic <= 100_000:
             raise ValueError("close_mosaic must be an integer in [0, 100000]")
         if type(self.seed) is not int or not 0 <= self.seed <= 0xFFFFFFFF:
@@ -253,7 +292,7 @@ class VisionTrainConfig:
             )
         for name in ("device", "project", "name"):
             value = getattr(self, name)
-            if not isinstance(value, str) or not value.strip():
+            if type(value) is not str or not value.strip():
                 raise ValueError(f"{name} must be a nonempty string")
             if (
                 any(character in value for character in "\0\r\n")
@@ -264,32 +303,18 @@ class VisionTrainConfig:
             raise ValueError("name must be a single output-directory component")
         if not isinstance(self.extra, Mapping):
             raise ValueError("extra must be a mapping")
-        try:
-            extra = dict(self.extra)
-        except (TypeError, ValueError) as exc:
-            raise ValueError("extra must be a stable mapping") from exc
-        if len(extra) > 128:
-            raise ValueError("extra must contain at most 128 fields")
-        if any(
-            not isinstance(key, str)
-            or not key
-            or not key.isprintable()
-            or len(key.encode("utf-8")) > 128
-            for key in extra
-        ):
-            raise ValueError("extra keys must be printable strings of 1..128 UTF-8 bytes")
-        if not isinstance(self.export_formats, (tuple, list)):
+        extra = _copy_bounded_extra(self.extra)
+        if type(self.export_formats) not in {tuple, list}:
             raise ValueError("export_formats must be a sequence")
-        export_formats = tuple(self.export_formats)
-        if export_formats:
+        if len(self.export_formats) != 0:
             raise ValueError(
                 "post-training export is intentionally separate: run `manwe export` and "
                 "then build a contract and execute the fidelity gate"
             )
-        object.__setattr__(self, "extra", MappingProxyType(extra))
-        object.__setattr__(self, "export_formats", export_formats)
         family = MODEL_ZOO[self.model].family
         _validate_extra_values(extra, family, self.epochs)
+        object.__setattr__(self, "extra", MappingProxyType(extra))
+        object.__setattr__(self, "export_formats", ())
         if family == "rfdetr":
             nondefault_ultralytics_fields = [
                 name

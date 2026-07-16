@@ -190,37 +190,41 @@ class TensorSpec:
     def validation_errors(self, field_name: str) -> list[str]:
         """Return validation errors prefixed with ``field_name``."""
         errors: list[str] = []
-        if not isinstance(self.name, str) or not _TENSOR_NAME_RE.fullmatch(self.name):
+        if type(self.name) is not str or not _TENSOR_NAME_RE.fullmatch(self.name):
             errors.append(f"{field_name}.name must be a 1..128 character ASCII tensor identifier")
-        if not isinstance(self.dtype, str) or self.dtype not in TENSOR_DTYPES:
+        if type(self.dtype) is not str or self.dtype not in TENSOR_DTYPES:
             errors.append(f"{field_name}.dtype must be one of {tuple(sorted(TENSOR_DTYPES))}")
-        if not isinstance(self.shape, list) or not self.shape:
+        if type(self.shape) is not list or not self.shape:
             errors.append(f"{field_name}.shape must be a nonempty list")
         elif len(self.shape) > MAX_TENSOR_RANK:
             errors.append(f"{field_name}.shape must contain at most {MAX_TENSOR_RANK} dimensions")
         else:
-            for index, dim in enumerate(self.shape):
-                if isinstance(dim, bool) or not isinstance(dim, (int, str)):
+            shape_length = len(self.shape)
+            shape_snapshot = self.shape[:shape_length]
+            if len(shape_snapshot) != shape_length or len(self.shape) != shape_length:
+                errors.append(f"{field_name}.shape changed while it was being validated")
+            for index, dim in enumerate(shape_snapshot):
+                if type(dim) not in {int, str}:
                     errors.append(
                         f"{field_name}.shape[{index}] must be a positive integer "
                         "or canonical symbolic dimension"
                     )
-                elif isinstance(dim, int) and dim <= 0:
+                elif type(dim) is int and dim <= 0:
                     errors.append(f"{field_name}.shape[{index}] must be positive")
-                elif isinstance(dim, int) and dim > MAX_TENSOR_DIMENSION:
+                elif type(dim) is int and dim > MAX_TENSOR_DIMENSION:
                     errors.append(f"{field_name}.shape[{index}] exceeds {MAX_TENSOR_DIMENSION}")
-                elif isinstance(dim, str) and dim not in TENSOR_DIMENSION_SYMBOLS:
+                elif type(dim) is str and dim not in TENSOR_DIMENSION_SYMBOLS:
                     errors.append(
                         f"{field_name}.shape[{index}] must use one of the canonical "
                         f"symbols {tuple(sorted(TENSOR_DIMENSION_SYMBOLS))}"
                     )
-        if not isinstance(self.layout, str) or self.layout not in TENSOR_LAYOUTS:
+        if type(self.layout) is not str or self.layout not in TENSOR_LAYOUTS:
             errors.append(f"{field_name}.layout must be one of {tuple(sorted(TENSOR_LAYOUTS))}")
-        if not isinstance(self.notes, str):
+        if type(self.notes) is not str:
             errors.append(f"{field_name}.notes must be a string")
         for name in ("name", "dtype", "layout", "notes"):
             value = getattr(self, name)
-            if isinstance(value, str) and (len(value) > 4096 or "\0" in value):
+            if type(value) is str and (len(value) > 4096 or "\0" in value):
                 errors.append(f"{field_name}.{name} is too long or contains NUL")
         return errors
 

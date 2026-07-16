@@ -694,11 +694,7 @@ def _validate_calibration_image(
             if suffix in {".tif", ".tiff"}:
                 success, frames = cv2.imdecodemulti(encoded_array, cv2.IMREAD_UNCHANGED)
                 backend_image = (
-                    frames[0]
-                    if success and len(frames) == 1 and frames[0].ndim == 3
-                    else np.stack(frames, axis=2)
-                    if success and len(frames) > 0
-                    else None
+                    frames[0] if success and len(frames) == 1 and frames[0].ndim == 3 else None
                 )
             else:
                 backend_image = cv2.imdecode(encoded_array, cv2.IMREAD_COLOR)
