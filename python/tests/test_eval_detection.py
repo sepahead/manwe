@@ -69,3 +69,54 @@ def test_map_rejects_unbounded_class_by_box_work():
     truth = [GroundTruth(np.empty((0, 4)), np.empty(0, dtype=int), image_id="frame")]
     with pytest.raises(ValueError, match="class-by-box work"):
         mean_average_precision(predictions, truth, num_classes=4096)
+
+
+def test_metric_input_caps_and_shape_checks_precede_float_widening(monkeypatch):
+    from manwe.eval import detection as detection_module
+
+    oversized_boxes = np.broadcast_to(
+        np.array([0, 0, 1, 1], dtype=np.int8),
+        (detection_module._MAX_BOXES_PER_FRAME + 1, 4),
+    )
+    malformed_boxes = np.broadcast_to(np.array(1, dtype=np.int8), (1, 4_000_000))
+    mismatched_scores = np.broadcast_to(np.array(1, dtype=np.int8), (4_000_000,))
+    forbidden = (oversized_boxes, malformed_boxes, mismatched_scores)
+    real_float_array = detection_module._float_array
+
+    def guarded_float_array(raw, error_message):
+        if any(
+            raw.shape == rejected.shape and np.shares_memory(raw, rejected)
+            for rejected in forbidden
+        ):
+            pytest.fail("evaluation input was widened before raw admission")
+        return real_float_array(raw, error_message)
+
+    monkeypatch.setattr(detection_module, "_float_array", guarded_float_array)
+
+    with pytest.raises(ValueError, match="box safety limit"):
+        GroundTruth(oversized_boxes, np.zeros(len(oversized_boxes), dtype=np.int8))
+    with pytest.raises(ValueError, match=r"shape \(N, 4\)"):
+        GroundTruth(malformed_boxes, np.zeros(1, dtype=np.int8))
+    with pytest.raises(ValueError, match="length"):
+        Detections(
+            np.array([[0, 0, 1, 1]], dtype=np.int8),
+            mismatched_scores,
+            np.array([0], dtype=np.int8),
+        )
+
+
+def test_metric_inputs_reject_object_coercion_before_float_conversion():
+    class Coercive:
+        calls = 0
+
+        def __float__(self):
+            type(self).calls += 1
+            return 1.0
+
+    with pytest.raises(ValueError, match="real numeric"):
+        Detections(
+            np.array([Coercive(), Coercive(), Coercive(), Coercive()], dtype=object),
+            np.array([0.5]),
+            np.array([0]),
+        )
+    assert Coercive.calls == 0

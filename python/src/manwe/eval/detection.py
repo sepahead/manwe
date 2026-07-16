@@ -58,40 +58,60 @@ class DetectionMetricResult(dict[str, float]):
         self.evaluated_classes = evaluated_classes
 
 
-def _validated_boxes(boxes: np.ndarray, name: str) -> np.ndarray:
+def _raw_real_array(value: object, error_message: str) -> np.ndarray:
     try:
-        array = np.asarray(boxes, dtype=float)
-    except (TypeError, ValueError) as exc:
-        raise ValueError(f"{name} must be a numeric array with shape (N, 4)") from exc
-    if array.shape == (0,):
-        array = array.reshape(0, 4)
-    elif array.shape == (4,):
-        array = array.reshape(1, 4)
-    if array.ndim != 2 or array.shape[1:] != (4,):
-        raise ValueError(f"{name} must have shape (N, 4), got {array.shape}")
-    if len(array) > _MAX_BOXES_PER_FRAME:
+        raw = np.asarray(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(error_message) from exc
+    if raw.dtype.kind not in "iuf":
+        raise ValueError(error_message)
+    return raw
+
+
+def _float_array(raw: np.ndarray, error_message: str) -> np.ndarray:
+    try:
+        with np.errstate(over="ignore", invalid="ignore"):
+            return np.asarray(raw, dtype=float)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(error_message) from exc
+
+
+def _validated_boxes(boxes: np.ndarray, name: str) -> np.ndarray:
+    error_message = f"{name} must be a real numeric array with shape (N, 4)"
+    raw = _raw_real_array(boxes, error_message)
+    if raw.shape == (0,):
+        raw = raw.reshape(0, 4)
+    elif raw.shape == (4,):
+        raw = raw.reshape(1, 4)
+    if raw.ndim != 2 or raw.shape[1:] != (4,):
+        raise ValueError(f"{name} must have shape (N, 4), got {raw.shape}")
+    if len(raw) > _MAX_BOXES_PER_FRAME:
         raise ValueError(f"{name} exceeds the {_MAX_BOXES_PER_FRAME}-box safety limit")
-    if not np.all(np.isfinite(array)):
+    if not np.all(np.isfinite(raw)):
         raise ValueError(f"{name} must contain only finite coordinates")
-    if np.any(np.abs(array) > _MAX_COORDINATE_MAGNITUDE):
+    if np.any(np.abs(raw) > _MAX_COORDINATE_MAGNITUDE):
         raise ValueError(
             f"{name} coordinate magnitude exceeds the float64 geometry limit "
             f"{_MAX_COORDINATE_MAGNITUDE:g}"
         )
+    array = _float_array(raw, error_message)
+    if not np.all(np.isfinite(array)):
+        raise ValueError(f"{name} must contain only finite coordinates")
     if len(array) and (np.any(array[:, 2] <= array[:, 0]) or np.any(array[:, 3] <= array[:, 1])):
         raise ValueError(f"{name} must contain positive-area xyxy boxes")
     return array
 
 
 def _validated_scores(scores: np.ndarray, expected: int, name: str) -> np.ndarray:
-    try:
-        array = np.asarray(scores, dtype=float)
-    except (TypeError, ValueError) as exc:
-        raise ValueError(f"{name} must be a numeric one-dimensional array") from exc
-    if array.ndim != 1:
-        raise ValueError(f"{name} must have shape (N,), got {array.shape}")
-    if len(array) != expected:
-        raise ValueError(f"{name} length {len(array)} does not match box count {expected}")
+    error_message = f"{name} must be a real numeric one-dimensional array"
+    raw = _raw_real_array(scores, error_message)
+    if raw.ndim != 1:
+        raise ValueError(f"{name} must have shape (N,), got {raw.shape}")
+    if len(raw) != expected:
+        raise ValueError(f"{name} length {len(raw)} does not match box count {expected}")
+    if not np.all(np.isfinite(raw)):
+        raise ValueError(f"{name} must contain only finite scores")
+    array = _float_array(raw, error_message)
     if not np.all(np.isfinite(array)):
         raise ValueError(f"{name} must contain only finite scores")
     if np.any((array < 0.0) | (array > 1.0)):
@@ -101,12 +121,13 @@ def _validated_scores(scores: np.ndarray, expected: int, name: str) -> np.ndarra
 
 def _validated_ranking_scores(scores: np.ndarray, expected: int, name: str) -> np.ndarray:
     """Validate finite sortable AP scores without requiring probability units."""
-    try:
-        array = np.asarray(scores, dtype=float)
-    except (TypeError, ValueError) as exc:
-        raise ValueError(f"{name} must be a numeric one-dimensional array") from exc
-    if array.ndim != 1 or len(array) != expected:
-        raise ValueError(f"{name} must have shape ({expected},), got {array.shape}")
+    error_message = f"{name} must be a real numeric one-dimensional array"
+    raw = _raw_real_array(scores, error_message)
+    if raw.ndim != 1 or len(raw) != expected:
+        raise ValueError(f"{name} must have shape ({expected},), got {raw.shape}")
+    if not np.all(np.isfinite(raw)):
+        raise ValueError(f"{name} must contain only finite scores")
+    array = _float_array(raw, error_message)
     if not np.all(np.isfinite(array)):
         raise ValueError(f"{name} must contain only finite scores")
     return array
