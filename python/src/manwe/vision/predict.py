@@ -11,7 +11,7 @@ from ..common.contracts import CREBAIN_CLASSES
 from ..common.deps import require
 from ..common.ultralytics import harden_ultralytics_runtime, verify_ultralytics_policy
 from .input import prepare_single_image
-from .postprocess import crebain_class_map
+from .postprocess import _real_numeric_array, _real_numeric_scalar, crebain_class_map
 
 _MAX_PIXEL_MAGNITUDE = 1e9
 _MAX_DETECTIONS = 100_000
@@ -46,21 +46,21 @@ class Detection:
     class_index: int
 
     def __post_init__(self) -> None:
-        try:
-            bbox = np.asarray(self.bbox, dtype=float)
-        except (TypeError, ValueError) as exc:
-            raise ValueError("bbox must contain four numeric xyxy coordinates") from exc
+        bbox = _real_numeric_array(
+            self.bbox,
+            "bbox must contain four real numeric xyxy coordinates",
+        )
         if bbox.shape != (4,) or not np.all(np.isfinite(bbox)):
             raise ValueError("bbox must contain four finite xyxy coordinates")
         if np.any(np.abs(bbox) > _MAX_PIXEL_MAGNITUDE):
             raise ValueError(f"bbox coordinates must not exceed {_MAX_PIXEL_MAGNITUDE:g} pixels")
         if bbox[2] <= bbox[0] or bbox[3] <= bbox[1]:
             raise ValueError("bbox must have positive area")
-        if (
-            isinstance(self.confidence, bool)
-            or not np.isfinite(self.confidence)
-            or not 0.0 <= self.confidence <= 1.0
-        ):
+        confidence = _real_numeric_scalar(
+            self.confidence,
+            "confidence must be a finite probability in [0, 1]",
+        )
+        if not np.isfinite(confidence) or not 0.0 <= confidence <= 1.0:
             raise ValueError("confidence must be a finite probability in [0, 1]")
         if self.crebain_class not in CREBAIN_CLASSES:
             raise ValueError(f"unknown crebain class {self.crebain_class!r}")
@@ -70,7 +70,7 @@ class Detection:
             raise ValueError("class_index and crebain_class disagree")
         immutable_bbox = np.frombuffer(bbox.tobytes(order="C"), dtype=bbox.dtype)
         object.__setattr__(self, "bbox", immutable_bbox)
-        object.__setattr__(self, "confidence", float(self.confidence))
+        object.__setattr__(self, "confidence", confidence)
 
     def to_detection2d(
         self,
@@ -112,12 +112,12 @@ def results_to_detections(
     unit-tested without torch.
     """
     remap = crebain_class_map(model_names)
+    boxes = _real_numeric_array(boxes_xyxy, "detector boxes must be real numeric arrays")
+    scores = _real_numeric_array(confidences, "detector confidences must be real numeric arrays")
     try:
-        boxes = np.asarray(boxes_xyxy, dtype=float)
-        scores = np.asarray(confidences, dtype=float)
         raw_ids = np.asarray(class_ids)
-    except (TypeError, ValueError) as exc:
-        raise ValueError("detector outputs must be numeric arrays") from exc
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError("detector class_ids must be a numeric array") from exc
     if boxes.shape == (0,):
         boxes = boxes.reshape(0, 4)
     elif boxes.shape == (4,):
@@ -183,9 +183,11 @@ class Detector:
             raise TypeError("weights must be a nonempty local artifact path")
         if type(allow_pickle_checkpoint) is not bool:
             raise TypeError("allow_pickle_checkpoint must be a boolean")
-        if isinstance(conf, bool) or not np.isfinite(conf) or not 0.0 <= conf <= 1.0:
+        conf = _real_numeric_scalar(conf, "conf must be a finite probability in [0, 1]")
+        if not np.isfinite(conf) or not 0.0 <= conf <= 1.0:
             raise ValueError("conf must be a finite probability in [0, 1]")
-        if isinstance(iou, bool) or not np.isfinite(iou) or not 0.0 < iou <= 1.0:
+        iou = _real_numeric_scalar(iou, "iou must be finite and in (0, 1]")
+        if not np.isfinite(iou) or not 0.0 < iou <= 1.0:
             raise ValueError("iou must be finite and in (0, 1]")
         from ..common.device import resolve_device
 

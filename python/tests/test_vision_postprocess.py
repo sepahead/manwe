@@ -6,6 +6,7 @@ import pytest
 from manwe.common.device import Device
 from manwe.vision import (
     Detection,
+    Detector,
     crebain_class_map,
     letterbox_params,
     nms,
@@ -169,6 +170,39 @@ def test_postprocess_rejects_coercive_and_unrepresentable_numeric_inputs():
 
     with pytest.raises(ValueError, match="real numeric array"):
         xywh2xyxy([["1", "1", "1", "1"]])
+
+
+def test_detection_boundaries_reject_coercive_numeric_inputs_before_backend_use():
+    huge = 10**1000
+    for bbox in (
+        ["0", "0", "1", "1"],
+        [False, False, True, True],
+        np.ones(4, dtype=complex),
+        [0, 0, huge, 1],
+    ):
+        with pytest.raises(ValueError, match="real numeric"):
+            Detection(bbox, 0.5, "drone", 0)
+    for confidence in ("0.5", True, 0.5 + 0.0j, huge):
+        with pytest.raises(ValueError, match="confidence"):
+            Detection([0, 0, 1, 1], confidence, "drone", 0)
+
+    for boxes in (
+        [["0", "0", "1", "1"]],
+        [[False, False, True, True]],
+        np.ones((1, 4), dtype=complex),
+        [[0, 0, huge, 1]],
+    ):
+        with pytest.raises(ValueError, match="detector boxes"):
+            results_to_detections(boxes, [0.5], [0], {0: "drone"})
+    for confidences in (["0.5"], [True], np.array([0.5 + 0.0j]), [huge]):
+        with pytest.raises(ValueError, match="detector confidences"):
+            results_to_detections([[0, 0, 1, 1]], confidences, [0], {0: "drone"})
+
+    # Threshold validation precedes path resolution and optional backend import.
+    for field, value in (("conf", "0.5"), ("conf", huge), ("iou", True), ("iou", huge)):
+        kwargs = {field: value}
+        with pytest.raises(ValueError, match=field):
+            Detector("missing.pt", expected_sha256="0" * 64, **kwargs)
 
 
 def test_postprocess_threshold_boundaries_are_exact_and_ties_are_stable():
