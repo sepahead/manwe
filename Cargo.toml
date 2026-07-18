@@ -39,7 +39,7 @@ candle-transformers = { version = "0.11.0", default-features = false }
 # theoretical: clap 4.6.0 raised its own MSRV in a *minor* release, so a caret
 # range admits a future 4.x that moves the floor again. 4.6.1 parses this CLI
 # identically to 4.5.57; its only change is a derive-time rebuild fix.
-clap = { version = "=4.6.1", features = ["derive", "env"] }
+clap = { version = "=4.6.2", features = ["derive", "env"] }
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 tracing = "0.1"
 tracing-chrome = "0.7"
