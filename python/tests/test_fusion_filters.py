@@ -877,10 +877,11 @@ def test_filter_numeric_admission_rejects_coercion_and_lossy_integers():
     with pytest.raises(ValueError, match="exactly representable"):
         GaussianState(np.array([2**53 + 1], dtype=np.uint64), np.eye(1))
 
-    with pytest.raises(FloatingPointError, match="invalid likelihood"):
+    with pytest.raises(TypeError, match="unsafe type"):
         IMMEstimator([_LikelihoodModel(likelihood=Coercive())])
-    with pytest.raises(FloatingPointError, match="invalid log likelihood"):
+    with pytest.raises(TypeError, match="unsafe type"):
         IMMEstimator([_LogLikelihoodModel(Coercive())])
+    assert Coercive.calls == 0
     assert Coercive.calls == 0
 
 

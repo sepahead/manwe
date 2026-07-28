@@ -314,6 +314,100 @@ def test_probability_overflow_and_near_max_covariance_fail_without_warnings():
     assert np.all(np.linalg.eigvalsh(stabilized) > 0)
 
 
+def test_covariance_congruence_preserves_exact_float64_extremes_under_seterr():
+    maximum = np.finfo(float).max
+    minimum = np.nextafter(0.0, 1.0)
+    signed_dyadic_scales = np.ldexp(
+        np.array([1.0, -1.0, 1.0, -1.0, 1.0, -1.0]),
+        np.array([-500, -400, -100, 0, 100, 500]),
+    )
+    measurement_covariances = (
+        np.full((3, 3), maximum),
+        np.full((3, 3), minimum),
+        np.diag([maximum, minimum, 1.0]),
+        np.array(
+            [
+                [maximum, minimum, 0.0],
+                [minimum, minimum, 0.0],
+                [0.0, 0.0, 1.0],
+            ]
+        ),
+    )
+    state_covariances = (
+        np.full((6, 6), maximum),
+        np.full((6, 6), minimum),
+        np.diag([maximum, minimum, 1.0, 2.0, 3.0, 4.0]),
+        np.outer(signed_dyadic_scales, signed_dyadic_scales),
+    )
+
+    with np.errstate(all="raise"):
+        for covariance in measurement_covariances:
+            admitted = tracker_module._as_covariance(covariance)
+            assert np.array_equal(admitted, covariance)
+        for covariance in state_covariances:
+            admitted = tracker_module._as_state_covariance(covariance)
+            assert np.array_equal(admitted, covariance)
+
+
+def test_unrelated_max_variance_cannot_hide_local_covariance_defects():
+    maximum = np.finfo(float).max
+    asymmetric = np.diag([maximum, 1.0, 1.0])
+    asymmetric[1, 2] = 1.0
+    with pytest.raises(ValueError, match="symmetric"):
+        tracker_module._as_covariance(asymmetric)
+
+    indefinite = np.diag([maximum, 1.0, 1.0])
+    indefinite[1:, 1:] = np.array([[1.0, 2.0], [2.0, 1.0]])
+    with pytest.raises(ValueError, match="positive semidefinite"):
+        tracker_module._as_covariance(indefinite)
+
+    asymmetric_state = np.eye(6)
+    asymmetric_state[0, 0] = maximum
+    asymmetric_state[1, 2] = 1.0
+    with pytest.raises(ValueError, match="symmetric"):
+        tracker_module._as_state_covariance(asymmetric_state)
+
+    indefinite_state = np.eye(6)
+    indefinite_state[0, 0] = maximum
+    indefinite_state[1:3, 1:3] = np.array([[1.0, 2.0], [2.0, 1.0]])
+    with pytest.raises(ValueError, match="positive semidefinite"):
+        tracker_module._as_state_covariance(indefinite_state)
+
+
+def test_covariance_zero_variance_rows_and_extreme_asymmetry_fail_cleanly():
+    minimum = np.nextafter(0.0, 1.0)
+    zero_variance_cross_term = np.array(
+        [
+            [0.0, minimum, 0.0],
+            [minimum, 1.0, 0.0],
+            [0.0, 0.0, 1.0],
+        ]
+    )
+    with pytest.raises(ValueError, match="zero variances"):
+        tracker_module._as_covariance(zero_variance_cross_term)
+
+    maximum = np.finfo(float).max
+    opposite_extremes = np.eye(3)
+    opposite_extremes[0, 1] = maximum
+    opposite_extremes[1, 0] = -maximum
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", RuntimeWarning)
+        with pytest.raises(ValueError, match="positive semidefinite|symmetric"):
+            tracker_module._as_covariance(opposite_extremes)
+
+
+def test_measurement_covariance_repairs_only_exactly_indefinite_roundoff():
+    covariance = np.eye(3)
+    covariance[0, 1] = covariance[1, 0] = 1.0 + 5e-11
+    original = covariance.copy()
+
+    repaired = tracker_module._as_covariance(covariance)
+
+    assert np.array_equal(covariance, original)
+    assert np.array_equal(np.diag(repaired), np.diag(original))
+    assert tracker_module._is_exactly_positive_semidefinite(repaired)
+
+
 def test_oversized_scenario_times_fail_before_float64_widening(monkeypatch):
     calls: list[str] = []
     original: Callable = scenarios_module._float64_array
@@ -508,6 +602,15 @@ def test_state_covariance_rejects_even_tiny_negative_eigenvalues():
         tracker_module._as_state_covariance(covariance)
 
 
+def test_state_covariance_rejects_zero_variance_cross_terms():
+    covariance = np.eye(6)
+    covariance[0, 0] = 0.0
+    covariance[0, 1] = covariance[1, 0] = np.nextafter(0.0, 1.0)
+
+    with pytest.raises(ValueError, match="zero variances"):
+        tracker_module._as_state_covariance(covariance)
+
+
 def test_slotted_runtime_config_is_revalidated_and_reflective_corruption_rejected():
     tracker = MultiSensorTracker()
     tracker.step([], 0.0)
@@ -630,3 +733,24 @@ def test_score_rejects_invalid_callback_output_and_restores_tracker(monkeypatch)
     assert tracker.tracks == []
     assert tracker._next_id == 1
     assert tracker._last_t is None
+
+
+def test_tracker_rejects_generator_with_callback_capable_bit_generator():
+    class CallbackPCG64(np.random.PCG64):
+        calls = 0
+
+        @property
+        def state(self):
+            type(self).calls += 1
+            raise AssertionError("custom bit-generator state callback must not run")
+
+        @state.setter
+        def state(self, _value):
+            type(self).calls += 1
+            raise AssertionError("custom bit-generator state callback must not run")
+
+    CallbackPCG64.calls = 0
+    rng = np.random.Generator(CallbackPCG64())
+    with pytest.raises(TypeError, match="built-in BitGenerator"):
+        MultiSensorTracker(rng=rng)
+    assert CallbackPCG64.calls == 0

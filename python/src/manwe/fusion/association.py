@@ -14,6 +14,8 @@ from itertools import combinations, permutations
 
 import numpy as np
 
+from ..common.numeric import validate_exact_float64_integers, widen_to_float64
+
 # Chi-square 0.99 quantiles by degrees of freedom (gating thresholds).
 CHI2_99 = {1: 6.635, 2: 9.210, 3: 11.345, 4: 13.277, 6: 16.812}
 
@@ -28,7 +30,6 @@ MAX_ASSOCIATION_ARRAY_CELLS = 4_000_000
 # Batched eigendecomposition costs O(N D^3), independently of assignment work.
 MAX_COVARIANCE_VALIDATION_WORK = 100_000_000
 MAX_ASSOCIATION_DIMENSION = 64
-_MAX_EXACT_FLOAT64_INTEGER = 1 << 53
 _REAL_NUMERIC_KINDS = frozenset("biuf")
 _FLOAT64_DTYPE = np.dtype(np.float64)
 
@@ -46,30 +47,12 @@ def _raw_real_array(value: object, name: str) -> np.ndarray:
 
 def _validate_exact_float64_integers(array: np.ndarray, name: str) -> None:
     """Ensure integer-to-float64 conversion is injective over accepted values."""
-    if array.size == 0 or array.dtype.kind not in "iu":
-        return
-    minimum = int(np.min(array))
-    maximum = int(np.max(array))
-    if minimum < -_MAX_EXACT_FLOAT64_INTEGER or maximum > _MAX_EXACT_FLOAT64_INTEGER:
-        raise ValueError(
-            f"{name} contains integers outside the consecutive exact float64 range "
-            f"[-{_MAX_EXACT_FLOAT64_INTEGER}, {_MAX_EXACT_FLOAT64_INTEGER}]"
-        )
+    validate_exact_float64_integers(array, name)
 
 
 def _float64_array(array: np.ndarray, name: str) -> np.ndarray:
     """Convert an already-bounded array without silent finite-value narrowing."""
-    with np.errstate(over="ignore", invalid="ignore"):
-        converted = np.asarray(array, dtype=np.float64)
-    if array.dtype.kind == "f":
-        finite_before = np.isfinite(array)
-        if np.any(finite_before & ~np.isfinite(converted)):
-            raise ValueError(f"{name} contains values outside the finite float64 range")
-        if array.dtype.itemsize > _FLOAT64_DTYPE.itemsize:
-            restored = np.asarray(converted, dtype=array.dtype)
-            if np.any(finite_before & (restored != array)):
-                raise ValueError(f"{name} loses numeric precision when converted to float64")
-    return converted
+    return widen_to_float64(array, name)
 
 
 def _float64_scalar(value: object, name: str) -> float:

@@ -74,4 +74,45 @@ def finite_float64_scalar(value: object, name: str) -> float:
     return result
 
 
-__all__ = ["finite_float64_scalar"]
+def validate_exact_float64_integers(array: np.ndarray, name: str) -> None:
+    """Reject integer domains whose distinct values can collapse in float64."""
+    if array.size == 0 or array.dtype.kind not in "iu":
+        return
+    minimum = int(np.min(array))
+    maximum = int(np.max(array))
+    if minimum < -_MAX_EXACT_FLOAT64_INTEGER or maximum > _MAX_EXACT_FLOAT64_INTEGER:
+        raise ValueError(
+            f"{name} contains integers outside the consecutive exact float64 range "
+            f"[-{_MAX_EXACT_FLOAT64_INTEGER}, {_MAX_EXACT_FLOAT64_INTEGER}]"
+        )
+
+
+def widen_to_float64(
+    array: np.ndarray, name: str, *, validate_exact_integers: bool = False
+) -> np.ndarray:
+    """Widen an already shape-bounded array without silent finite-value narrowing.
+
+    When ``validate_exact_integers`` is set, integer inputs are first rejected if
+    any value falls outside float64's consecutive-integer range, so distinct
+    integers cannot collapse onto a shared float.
+    """
+    if validate_exact_integers:
+        validate_exact_float64_integers(array, name)
+    with np.errstate(over="ignore", invalid="ignore"):
+        converted = np.asarray(array, dtype=np.float64)
+    if array.dtype.kind == "f":
+        finite_before = np.isfinite(array)
+        if np.any(finite_before & ~np.isfinite(converted)):
+            raise ValueError(f"{name} contains values outside the finite float64 range")
+        if array.dtype.itemsize > _FLOAT64_DTYPE.itemsize:
+            restored = np.asarray(converted, dtype=array.dtype)
+            if np.any(finite_before & (restored != array)):
+                raise ValueError(f"{name} loses numeric precision when converted to float64")
+    return converted
+
+
+__all__ = [
+    "finite_float64_scalar",
+    "validate_exact_float64_integers",
+    "widen_to_float64",
+]

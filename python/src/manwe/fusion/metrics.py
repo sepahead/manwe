@@ -15,6 +15,7 @@ from typing import Literal
 
 import numpy as np
 
+from ..common.numeric import validate_exact_float64_integers, widen_to_float64
 from .association import linear_assignment
 
 _MAX_COORDINATE_MAGNITUDE = np.sqrt(np.finfo(np.float64).max) / 4.0
@@ -25,7 +26,6 @@ _MAX_POINT_CELLS = 262_144
 _MAX_PAIR_CELLS = 4_000_000
 _MAX_PAIR_COMPONENTS = 12_000_000
 _MAX_ASSIGNMENT_WORK = 50_000_000
-_MAX_EXACT_FLOAT64_INTEGER = 1 << 53
 _REAL_NUMERIC_KINDS = frozenset("biuf")
 _FLOAT64_DTYPE = np.dtype(np.float64)
 
@@ -69,15 +69,7 @@ def _point_set_shape(array: np.ndarray, name: str) -> tuple[int, int]:
 
 
 def _validate_exact_float64_integers(array: np.ndarray, name: str) -> None:
-    if array.size == 0 or array.dtype.kind not in "iu":
-        return
-    minimum = int(np.min(array))
-    maximum = int(np.max(array))
-    if minimum < -_MAX_EXACT_FLOAT64_INTEGER or maximum > _MAX_EXACT_FLOAT64_INTEGER:
-        raise ValueError(
-            f"{name} contains integers outside the consecutive exact float64 range "
-            f"[-{_MAX_EXACT_FLOAT64_INTEGER}, {_MAX_EXACT_FLOAT64_INTEGER}]"
-        )
+    validate_exact_float64_integers(array, name)
 
 
 def _validate_point_values(array: np.ndarray, name: str) -> None:
@@ -92,17 +84,7 @@ def _validate_point_values(array: np.ndarray, name: str) -> None:
 
 
 def _float64_array(array: np.ndarray, name: str) -> np.ndarray:
-    with np.errstate(over="ignore", invalid="ignore"):
-        converted = np.asarray(array, dtype=np.float64)
-    if array.dtype.kind == "f":
-        finite_before = np.isfinite(array)
-        if np.any(finite_before & ~np.isfinite(converted)):
-            raise ValueError(f"{name} contains values outside the finite float64 range")
-        if array.dtype.itemsize > _FLOAT64_DTYPE.itemsize:
-            restored = np.asarray(converted, dtype=array.dtype)
-            if np.any(finite_before & (restored != array)):
-                raise ValueError(f"{name} loses numeric precision when converted to float64")
-    return converted
+    return widen_to_float64(array, name)
 
 
 def _converted_point_set(

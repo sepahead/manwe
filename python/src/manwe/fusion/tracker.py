@@ -15,12 +15,14 @@ import math
 from collections import deque
 from collections.abc import Iterable
 from dataclasses import dataclass, field, fields
+from fractions import Fraction
 from itertools import combinations, islice
 from types import FunctionType
 from typing import cast
 
 import numpy as np
 
+from ..common.numeric import validate_exact_float64_integers, widen_to_float64
 from .association import CHI2_99, GATE_INF, linear_assignment
 from .filters import (
     FILTERS,
@@ -111,11 +113,10 @@ MAX_ASSIGNMENT_WORK = 100_000_000
 MAX_PARTICLE_POPULATION = 2_000_000
 MAX_CLASS_LABEL_BYTES = 256
 MAX_SENSOR_ID_BYTES = 128
-_MAX_EXACT_FLOAT64_INTEGER = 1 << 53
 _MAX_IMM_MODES = 32
 _MAX_RAW_SEQUENCE_CELLS = 30_000_000
+_COVARIANCE_EIGEN_TOLERANCE = 1e-10
 _REAL_NUMERIC_KINDS = frozenset("iuf")
-_FLOAT64_DTYPE = np.dtype(np.float64)
 _VALID_TRACK_STATES = frozenset({"tentative", "confirmed", "coasting", "lost"})
 _NUMPY_INTEGER_SCALAR_TYPES = frozenset(
     np.dtype(dtype).type
@@ -143,10 +144,29 @@ _SUPPORTED_INTEGER_SCALAR_TYPES = frozenset({int} | _NUMPY_INTEGER_SCALAR_TYPES)
 _SUPPORTED_REAL_SCALAR_TYPES = frozenset(
     {float} | _SUPPORTED_INTEGER_SCALAR_TYPES | _NUMPY_FLOAT_SCALAR_TYPES
 )
+_SUPPORTED_BIT_GENERATOR_TYPES = frozenset(
+    {
+        np.random.MT19937,
+        np.random.PCG64,
+        np.random.PCG64DXSM,
+        np.random.Philox,
+        np.random.SFC64,
+    }
+)
 
 
 def _is_supported_real_scalar(value: object) -> bool:
     return type(value) in _SUPPORTED_REAL_SCALAR_TYPES
+
+
+def _validate_builtin_generator(value: object, name: str) -> np.random.Generator:
+    """Admit a NumPy RNG whose state access cannot dispatch user code."""
+    if type(value) is not np.random.Generator:
+        raise TypeError(f"{name} must be a numpy.random.Generator")
+    generator = cast(np.random.Generator, value)
+    if type(generator.bit_generator) not in _SUPPORTED_BIT_GENERATOR_TYPES:
+        raise TypeError(f"{name} must use a built-in numpy BitGenerator")
+    return generator
 
 
 def _sequence_matches_shape(
@@ -262,31 +282,12 @@ def _raw_real_array(
 
 def _validate_exact_float64_integers(array: np.ndarray, name: str) -> None:
     """Reject integer domains whose distinct values can collapse in float64."""
-    if array.size == 0 or array.dtype.kind not in "iu":
-        return
-    minimum = int(np.min(array))
-    maximum = int(np.max(array))
-    if minimum < -_MAX_EXACT_FLOAT64_INTEGER or maximum > _MAX_EXACT_FLOAT64_INTEGER:
-        raise ValueError(
-            f"{name} contains integers outside the consecutive exact float64 range "
-            f"[-{_MAX_EXACT_FLOAT64_INTEGER}, {_MAX_EXACT_FLOAT64_INTEGER}]"
-        )
+    validate_exact_float64_integers(array, name)
 
 
 def _float64_array(array: np.ndarray, name: str) -> np.ndarray:
     """Widen an already shape-bounded array without silent finite narrowing."""
-    _validate_exact_float64_integers(array, name)
-    with np.errstate(over="ignore", invalid="ignore"):
-        converted = np.asarray(array, dtype=np.float64)
-    if array.dtype.kind == "f":
-        finite_before = np.isfinite(array)
-        if np.any(finite_before & ~np.isfinite(converted)):
-            raise ValueError(f"{name} contains values outside the finite float64 range")
-        if array.dtype.itemsize > _FLOAT64_DTYPE.itemsize:
-            restored = np.asarray(converted, dtype=array.dtype)
-            if np.any(finite_before & (restored != array)):
-                raise ValueError(f"{name} loses numeric precision when converted to float64")
-    return converted
+    return widen_to_float64(array, name, validate_exact_integers=True)
 
 
 def _finite_float64_scalar(value: object, name: str) -> float:
@@ -314,6 +315,127 @@ def _as_finite_vector(value: object, name: str) -> np.ndarray:
     return array.copy()
 
 
+def _symmetrize_finite(matrix: np.ndarray) -> np.ndarray:
+    """Average unequal pairs without overflowing or erasing equal subnormals."""
+    transpose = matrix.T
+    with np.errstate(under="ignore"):
+        averaged = 0.5 * matrix + 0.5 * transpose
+    return np.where(matrix == transpose, matrix, averaged)
+
+
+def _is_exactly_positive_semidefinite(matrix: np.ndarray) -> bool:
+    """Certify PSD for the exact dyadic rationals represented by float64.
+
+    For a positive diagonal pivot ``a``, symmetric block elimination is the
+    exact congruence
+
+    ``[[a, b.T], [b, C]] ~ diag(a, C - b b.T / a)``.
+
+    PSD is therefore equivalent to PSD of the exact Schur complement. If no
+    positive diagonal remains, the zero-variance theorem requires the complete
+    remainder to be zero. This is an O(n³) exact LDL-style certificate on the
+    tracker's at-most-6×6 ambiguous near-singular path.
+    """
+    size = len(matrix)
+    remaining = [
+        [Fraction.from_float(float(matrix[row, column])) for column in range(size)]
+        for row in range(size)
+    ]
+    while remaining:
+        diagonal = [remaining[index][index] for index in range(len(remaining))]
+        if any(value < 0 for value in diagonal):
+            return False
+        pivot_index = next((index for index, value in enumerate(diagonal) if value > 0), None)
+        if pivot_index is None:
+            return all(value == 0 for row in remaining for value in row)
+        if pivot_index != 0:
+            remaining[0], remaining[pivot_index] = remaining[pivot_index], remaining[0]
+            for row in remaining:
+                row[0], row[pivot_index] = row[pivot_index], row[0]
+        pivot = remaining[0][0]
+        trailing_size = len(remaining) - 1
+        schur = [
+            [
+                remaining[row + 1][column + 1]
+                - remaining[row + 1][0] * remaining[0][column + 1] / pivot
+                for column in range(trailing_size)
+            ]
+            for row in range(trailing_size)
+        ]
+        if any(
+            schur[row][column] != schur[column][row]
+            for row in range(trailing_size)
+            for column in range(row)
+        ):
+            # Exact symmetry should be invariant under the Schur update. Treat a
+            # violation as failed certification rather than continuing on an
+            # assumption the arithmetic did not establish.
+            return False
+        remaining = schur
+    return True
+
+
+def _correlation_block(
+    covariance: np.ndarray,
+    name: str,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return positive-variance indices and their unit-diagonal correlation block."""
+    diagonal = np.diag(covariance)
+    standard_deviations = np.sqrt(diagonal)
+    positive = standard_deviations > 0
+    zero = ~positive
+    if np.any(zero) and (np.any(covariance[zero, :] != 0.0) or np.any(covariance[:, zero] != 0.0)):
+        raise ValueError(
+            f"{name} must be positive semidefinite; zero variances require zero covariance"
+        )
+    indices = np.flatnonzero(positive)
+    if indices.size == 0:
+        return indices, np.zeros((0, 0))
+
+    deviations = standard_deviations[positive]
+    smaller = np.minimum.outer(deviations, deviations)
+    larger = np.maximum.outer(deviations, deviations)
+    with np.errstate(divide="ignore", over="ignore", under="ignore", invalid="ignore"):
+        block = (covariance[np.ix_(indices, indices)] / smaller) / larger
+    if not np.isfinite(block).all():
+        raise ValueError(f"{name} must be positive semidefinite")
+
+    # Correct the last ulp of sqrt/division error by one more bounded diagonal
+    # congruence. These diagonal entries are all approximately one, so unlike
+    # raw covariance scales their products cannot overflow or underflow.
+    block_diagonal = np.diag(block).copy()
+    if np.any(block_diagonal <= 0) or not np.isfinite(block_diagonal).all():
+        raise ValueError(f"{name} must be positive semidefinite")
+    with np.errstate(divide="ignore", over="ignore", under="ignore", invalid="ignore"):
+        normalizers = np.sqrt(np.multiply.outer(block_diagonal, block_diagonal))
+        block = block / normalizers
+    np.fill_diagonal(block, 1.0)
+    if not np.isfinite(block).all():
+        raise ValueError(f"{name} must be positive semidefinite")
+    if np.any(np.abs(block) > 1.0 + _COVARIANCE_EIGEN_TOLERANCE):
+        raise ValueError(f"{name} must be positive semidefinite")
+    with np.errstate(over="ignore", under="ignore", invalid="ignore"):
+        symmetric = np.allclose(
+            block,
+            block.T,
+            rtol=_COVARIANCE_EIGEN_TOLERANCE,
+            atol=_COVARIANCE_EIGEN_TOLERANCE,
+        )
+    if not symmetric:
+        raise ValueError(f"{name} must be symmetric")
+    return indices, _symmetrize_finite(block)
+
+
+def _correlation_eigenvalues(block: np.ndarray, name: str) -> np.ndarray:
+    try:
+        values = np.linalg.eigvalsh(block)
+    except np.linalg.LinAlgError as exc:
+        raise ValueError(f"{name} could not be decomposed") from exc
+    if not np.isfinite(values).all():
+        raise ValueError(f"{name} decomposition must remain finite")
+    return values
+
+
 def _as_covariance(value: object, name: str = "covariance") -> np.ndarray:
     raw = _raw_real_array(
         value,
@@ -333,28 +455,39 @@ def _as_covariance(value: object, name: str = "covariance") -> np.ndarray:
         array = np.diag(array)
     if np.any(np.diag(array) < 0):
         raise ValueError(f"{name} diagonal variances must be nonnegative")
-    normalizer = max(1.0, float(np.max(np.abs(array))))
-    with np.errstate(over="ignore", under="ignore", invalid="ignore"):
-        normalized = array / normalizer
-        symmetric = np.allclose(normalized, normalized.T, rtol=1e-10, atol=1e-10)
-    if not symmetric:
-        raise ValueError(f"{name} must be symmetric")
-    array = 0.5 * array + 0.5 * array.T
-    try:
-        values, vectors = np.linalg.eigh(0.5 * normalized + 0.5 * normalized.T)
-    except np.linalg.LinAlgError as exc:
-        raise ValueError(f"{name} could not be decomposed") from exc
-    if not np.isfinite(values).all() or not np.isfinite(vectors).all():
-        raise ValueError(f"{name} decomposition must remain finite")
-    if float(values[0]) < -1e-10:
+    indices, correlation = _correlation_block(array, name)
+    array = _symmetrize_finite(array)
+    if indices.size == 0:
+        return array.copy()
+    values = _correlation_eigenvalues(correlation, name)
+    minimum = float(values[0])
+    if minimum < -_COVARIANCE_EIGEN_TOLERANCE:
         raise ValueError(f"{name} must be positive semidefinite")
-    if values[0] < 0:
-        with np.errstate(over="ignore", under="ignore", invalid="ignore"):
-            repaired = vectors @ np.diag(np.maximum(values, 0.0)) @ vectors.T
-            array = (0.5 * repaired + 0.5 * repaired.T) * normalizer
-        if not np.isfinite(array).all():
-            raise ValueError(f"{name} repair must remain finite")
-    return array.copy()
+    if minimum > _COVARIANCE_EIGEN_TOLERANCE or _is_exactly_positive_semidefinite(array):
+        return array.copy()
+
+    # The exact float matrix is slightly indefinite even though its correlation
+    # eigenvalue lies within the roundoff band. Shrinking all correlations by a
+    # common factor is C' = f C + (1-f)I: it preserves every variance and moves
+    # every eigenvalue toward one without forming products of raw scales.
+    base_delta = max(
+        _COVARIANCE_EIGEN_TOLERANCE,
+        -minimum + _COVARIANCE_EIGEN_TOLERANCE,
+    )
+    original_block = array[np.ix_(indices, indices)].copy()
+    original_diagonal = np.diag(original_block).copy()
+    for multiplier in (1.0, 2.0, 4.0, 8.0):
+        shrink = 1.0 / (1.0 + multiplier * base_delta)
+        repaired_block = original_block.copy()
+        with np.errstate(under="ignore"):
+            repaired_block *= shrink
+        np.fill_diagonal(repaired_block, original_diagonal)
+        repaired = array.copy()
+        repaired[np.ix_(indices, indices)] = repaired_block
+        repaired = _symmetrize_finite(repaired)
+        if _is_exactly_positive_semidefinite(repaired):
+            return repaired.copy()
+    raise ValueError(f"{name} repair must remain positive semidefinite")
 
 
 def _as_state_vector(value: object, name: str = "state.x") -> np.ndarray:
@@ -383,18 +516,15 @@ def _as_state_covariance(value: object, name: str = "state.P") -> np.ndarray:
         raise ValueError(f"{name} must contain only finite values")
     if np.any(np.diag(array) < 0):
         raise ValueError(f"{name} diagonal variances must be nonnegative")
-    normalizer = max(1.0, float(np.max(np.abs(array))))
-    with np.errstate(over="ignore", under="ignore", invalid="ignore"):
-        normalized = array / normalizer
-        symmetric = np.allclose(normalized, normalized.T, rtol=1e-10, atol=1e-10)
-    if not symmetric:
-        raise ValueError(f"{name} must be symmetric")
-    array = 0.5 * array + 0.5 * array.T
-    try:
-        values = np.linalg.eigvalsh(0.5 * normalized + 0.5 * normalized.T)
-    except np.linalg.LinAlgError as exc:
-        raise ValueError(f"{name} could not be decomposed") from exc
-    if not np.isfinite(values).all() or values[0] < 0:
+    indices, correlation = _correlation_block(array, name)
+    array = _symmetrize_finite(array)
+    if indices.size == 0:
+        return array.copy()
+    values = _correlation_eigenvalues(correlation, name)
+    minimum = float(values[0])
+    if minimum < -_COVARIANCE_EIGEN_TOLERANCE:
+        raise ValueError(f"{name} must be finite and positive semidefinite")
+    if minimum <= _COVARIANCE_EIGEN_TOLERANCE and not _is_exactly_positive_semidefinite(array):
         raise ValueError(f"{name} must be finite and positive semidefinite")
     return array.copy()
 
@@ -1092,8 +1222,13 @@ class MultiSensorTracker:
     def __init__(self, config: TrackerConfig | None = None, rng: np.random.Generator | None = None):
         if config is not None and type(config) is not TrackerConfig:
             raise TypeError("config must be a TrackerConfig or None")
-        if rng is not None and type(rng) is not np.random.Generator:
-            raise TypeError("rng must be a numpy.random.Generator or None")
+        if rng is not None:
+            try:
+                _validate_builtin_generator(rng, "rng")
+            except TypeError as exc:
+                raise TypeError(
+                    "rng must be a numpy.random.Generator backed by a built-in BitGenerator or None"
+                ) from exc
         self.cfg = config if config is not None else TrackerConfig()
         self.rng = rng if rng is not None else np.random.default_rng(0)
         self.tracks: list[Track] = []
@@ -1103,8 +1238,7 @@ class MultiSensorTracker:
     def _validate_runtime_state(self) -> None:
         """Validate mutable tracker state before it is copied or consumed."""
         _validate_tracker_config_runtime(self.cfg)
-        if type(self.rng) is not np.random.Generator:
-            raise TypeError("tracker RNG must remain a numpy.random.Generator")
+        _validate_builtin_generator(self.rng, "tracker RNG")
         if type(self.tracks) is not list:
             raise TypeError("tracker tracks must remain a list")
         if len(self.tracks) > self.cfg.max_tracks:
@@ -1178,12 +1312,21 @@ class MultiSensorTracker:
                 if sigma_a != self.cfg.sigma_a:
                     raise ValueError(f"tracks[{index}] filter sigma_a was corrupted")
             particle_filter = cast(ParticleFilter, track.filt)
-            if type(track.filt) is ParticleFilter and (
-                type(particle_filter.n_particles) is not int
-                or particle_filter.n_particles != self.cfg.n_particles
-                or type(particle_filter.rng) is not np.random.Generator
-            ):
-                raise ValueError(f"tracks[{index}] particle filter configuration was corrupted")
+            if type(track.filt) is ParticleFilter:
+                if (
+                    type(particle_filter.n_particles) is not int
+                    or particle_filter.n_particles != self.cfg.n_particles
+                ):
+                    raise ValueError(f"tracks[{index}] particle filter configuration was corrupted")
+                try:
+                    _validate_builtin_generator(
+                        particle_filter.rng,
+                        f"tracks[{index}] particle filter RNG",
+                    )
+                except TypeError as exc:
+                    raise ValueError(
+                        f"tracks[{index}] particle filter configuration was corrupted"
+                    ) from exc
             if type(track.filt) is IMMEstimator:
                 if (
                     type(track.filt.models) is not list
