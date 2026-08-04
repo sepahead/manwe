@@ -58,7 +58,7 @@ _ULTRALYTICS_SAFE_EXTRA = {
 _RFDETR_SAFE_EXTRA = {
     "checkpoint_interval",
     "ema_decay",
-    "gradient_accumulation_steps",
+    "grad_accum_steps",
     "lr_component_decay",
     "lr_drop",
     "lr_encoder",
@@ -149,8 +149,13 @@ def _extra_float(
 
 def _validate_extra_values(extra: dict[str, object], family: str, epochs: int) -> None:
     if family == "rfdetr":
+        if "gradient_accumulation_steps" in extra:
+            raise ValueError(
+                "extra.gradient_accumulation_steps is a legacy Manwe misspelling that "
+                "RF-DETR 1.8.3 ignores; use extra.grad_accum_steps"
+            )
         _extra_integer(extra, "checkpoint_interval", 1, epochs)
-        _extra_integer(extra, "gradient_accumulation_steps", 1, 4096)
+        _extra_integer(extra, "grad_accum_steps", 1, 4096)
         _extra_integer(extra, "lr_drop", 0, 100_000)
         _extra_integer(extra, "num_workers", 0, 256)
         _extra_bool(extra, "use_ema")

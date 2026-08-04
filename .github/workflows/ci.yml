@@ -355,7 +355,7 @@ jobs:
         run: uv run --locked --no-sync -- .venv/bin/python -m pytest
 
   python-vision-policy:
-    name: Locked vision runtime safety policy
+    name: Locked vision and RF-DETR runtime safety policy
     runs-on: ubuntu-24.04
     timeout-minutes: 25
     env:
@@ -377,9 +377,9 @@ jobs:
           version: "0.11.28"
           enable-cache: true
           cache-dependency-glob: python/uv.lock
-      - name: Install the exact locked vision adapter
+      - name: Install the exact locked vision adapters
         working-directory: python
-        run: uv sync --locked --extra vision --extra dev --no-install-project
+        run: uv sync --locked --extra vision --extra rfdetr --extra dev --no-install-project
       - name: Verify no-install, offline, safe-load, and analytics policy
         working-directory: python
         run: |
@@ -391,6 +391,89 @@ jobs:
 
           verify_ultralytics_policy()
           print(f"verified ultralytics {ultralytics.__version__}")
+          PY
+      - name: Verify exact installed RF-DETR contract without network
+        working-directory: python
+        run: |
+          uv run --locked --no-sync -- .venv/bin/python - <<'PY'
+          import socket
+          import warnings
+          from contextlib import suppress
+          from importlib import metadata
+          from unittest.mock import patch
+
+          warnings.filterwarnings(
+              "ignore",
+              message=r"The platform model downloads requires the 'plus' extras.*",
+              category=ImportWarning,
+              module=r"rfdetr\.assets\.model_weights",
+          )
+          warnings.filterwarnings(
+              "ignore",
+              message=r"target=True is deprecated since `v0\.8`;.*",
+              category=FutureWarning,
+              module=r"rfdetr\.models\.weights",
+          )
+          warnings.filterwarnings(
+              "ignore",
+              message=r"`torch\.jit\.script` is deprecated\..*",
+              category=DeprecationWarning,
+              module=r"torch\.jit\._script",
+          )
+          from rfdetr import RFDETRNano
+          from rfdetr.config import PretrainWeightsCompatibilityWarning, TrainConfig
+
+          version = metadata.version("rfdetr")
+          if version != "1.8.3":
+              raise SystemExit(f"unexpected RF-DETR version: {version}")
+
+          fields = TrainConfig.model_fields
+          if "gradient_accumulation_steps" in fields:
+              raise SystemExit("legacy RF-DETR accumulation misspelling is present")
+          if TrainConfig.model_config.get("extra") != "ignore":
+              raise SystemExit("unexpected TrainConfig unknown-field policy")
+          for name, expected_default in {"grad_accum_steps": 4, "lr_drop": 100}.items():
+              field = fields.get(name)
+              if field is None or field.annotation is not int or field.default != expected_default:
+                  raise SystemExit(f"unexpected TrainConfig field contract for {name}: {field}")
+          train_config = TrainConfig(dataset_dir=".", grad_accum_steps=7, lr_drop=19)
+          if (train_config.grad_accum_steps, train_config.lr_drop) != (7, 19):
+              raise SystemExit("TrainConfig did not preserve accumulation or lr_drop")
+          if hasattr(train_config, "gradient_accumulation_steps"):
+              raise SystemExit("constructed TrainConfig exposes the legacy misspelling")
+
+          owners = []
+          for distribution in (
+              "opencv-python",
+              "opencv-python-headless",
+              "opencv-contrib-python",
+              "opencv-contrib-python-headless",
+          ):
+              with suppress(metadata.PackageNotFoundError):
+                  owners.append((distribution, metadata.version(distribution)))
+          if len(owners) != 1:
+              raise SystemExit(f"expected exactly one installed cv2 owner, found {owners or 'none'}")
+
+          def deny_network(*args, **kwargs):
+              raise AssertionError(f"RF-DETR attempted network access: {args!r} {kwargs!r}")
+
+          with (
+              warnings.catch_warnings(),
+              patch.object(socket.socket, "connect", deny_network),
+              patch("socket.create_connection", deny_network),
+              patch("requests.sessions.Session.request", deny_network),
+              patch("urllib.request.urlopen", deny_network),
+          ):
+              warnings.filterwarnings(
+                  "ignore",
+                  message=r"RFDETRNanoConfig was instantiated with pretrain_weights=None\..*",
+                  category=PretrainWeightsCompatibilityWarning,
+              )
+              model = RFDETRNano(pretrain_weights=None)
+          if model.model_config.pretrain_weights is not None:
+              raise SystemExit("RFDETRNano enabled pretrained weights unexpectedly")
+
+          print(f"verified rfdetr {version}; cv2 owner: {owners[0][0]} {owners[0][1]}")
           PY
       - name: Verify calibration preprocessing against the pinned loader
         working-directory: python

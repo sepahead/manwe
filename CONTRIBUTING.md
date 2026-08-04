@@ -42,9 +42,14 @@ uv run --locked --no-sync -- .venv/bin/ruff format --check src tests
 uv run --locked --no-sync -- .venv/bin/python -m mypy src/manwe
 ```
 
-The locked `rfdetr` extra covers construction/inference only. Do not install the
-upstream training extra into the combined environment while it pulls competing
-OpenCV distributions; curate and verify one package owner first.
+The locked `rfdetr` extra pins the installed construction/inference contract to
+RF-DETR 1.8.3. Do not install the upstream training extra into the combined
+environment while it pulls competing OpenCV distributions; curate and verify one
+package owner first. The Manwe training adapter accepts RF-DETR's
+`grad_accum_steps`; it rejects the legacy `gradient_accumulation_steps` misspelling
+because upstream silently ignores unknown training fields. CI checks the installed
+API and adapter mapping; it does not execute or qualify a training run or training
+environment.
 
 Add a test for every new numeric routine — the filters, triangulation, DOA, and
 metrics are all covered by fast, seeded tests in `python/tests/`. New pillar code

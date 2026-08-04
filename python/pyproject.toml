@@ -65,9 +65,10 @@ vision = [
 # RF-DETR model construction/inference is isolated because its upstream `train`
 # extra currently installs both GUI and headless OpenCV distributions, which own
 # the same `cv2` files. Manwe does not publish that ambiguous training environment.
-# RF-DETR 1.8.3 is the vetted correctness baseline; stay within the 1.8 API line.
+# RF-DETR 1.8.3 is the exact installed contract. Its TrainConfig silently ignores
+# unknown keys, so any version change requires a new installed-runtime review.
 rfdetr = [
-    "rfdetr>=1.8.3,<1.9",
+    "rfdetr==1.8.3",
 ]
 # Raw model export to three backend formats. Ultralytics drives the ONNX/CoreML/
 # TensorRT export API, so it belongs here too. (TensorRT itself is NVIDIA-only and

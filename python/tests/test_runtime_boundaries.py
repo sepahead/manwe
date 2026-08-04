@@ -2689,6 +2689,101 @@ def test_training_config_rejects_nonfinite_and_ambiguous_values(tmp_path, monkey
     assert called == {"seed": False, "model": False}
 
 
+@pytest.mark.parametrize("value", [True, 0, 4097, 10**100])
+def test_rfdetr_grad_accum_steps_rejects_invalid_values(tmp_path, value):
+    with pytest.raises(
+        ValueError,
+        match=r"extra\.grad_accum_steps must be an integer in \[1, 4096\]",
+    ):
+        VisionTrainConfig(
+            data=str(tmp_path),
+            model="rfdetr-medium",
+            extra={"grad_accum_steps": value},
+        )
+
+
+@pytest.mark.parametrize("value", [1, 4096])
+def test_rfdetr_grad_accum_steps_accepts_closed_bounds(tmp_path, value):
+    config = VisionTrainConfig(
+        data=str(tmp_path),
+        model="rfdetr-medium",
+        extra={"grad_accum_steps": value},
+    )
+    assert config.extra["grad_accum_steps"] == value
+
+
+def test_rfdetr_gradient_accumulation_misspelling_is_rejected(tmp_path):
+    with pytest.raises(
+        ValueError,
+        match=(
+            r"extra\.gradient_accumulation_steps is a legacy Manwe misspelling.*"
+            r"use extra\.grad_accum_steps"
+        ),
+    ):
+        VisionTrainConfig(
+            data=str(tmp_path),
+            model="rfdetr-medium",
+            extra={"gradient_accumulation_steps": 8},
+        )
+
+
+def test_rfdetr_training_forwards_exact_upstream_accumulation_field(tmp_path, monkeypatch):
+    dataset = tmp_path / "coco"
+    dataset.mkdir()
+    train_module = importlib.import_module("manwe.vision.train")
+    forwarded = []
+    build_calls = []
+    result = object()
+
+    class FakeModel:
+        def train(self, **kwargs):
+            forwarded.append(kwargs)
+            return result
+
+    def build_model(name, *, pretrained):
+        build_calls.append((name, pretrained))
+        return FakeModel()
+
+    monkeypatch.setattr(train_module, "_reject_ambiguous_opencv_install", lambda: None)
+    monkeypatch.setattr(train_module, "resolve_device", lambda _device: Device("cpu"))
+    monkeypatch.setattr(train_module, "seed_everything", lambda _seed: None)
+    monkeypatch.setattr(train_module, "build_model", build_model)
+
+    actual = train(
+        VisionTrainConfig(
+            data=str(dataset),
+            model="rfdetr-medium",
+            epochs=3,
+            imgsz=672,
+            batch=2,
+            device="cpu",
+            lr0=0.0002,
+            patience=4,
+            project="output",
+            name="contract",
+            extra={"grad_accum_steps": 8, "lr_drop": 2},
+        )
+    )
+
+    assert actual is result
+    assert build_calls == [("rfdetr-medium", False)]
+    assert forwarded == [
+        {
+            "dataset_dir": str(dataset.absolute()),
+            "epochs": 3,
+            "batch_size": 2,
+            "device": "cpu",
+            "lr": 0.0002,
+            "output_dir": "output/contract",
+            "resolution": 672,
+            "early_stopping": True,
+            "early_stopping_patience": 4,
+            "grad_accum_steps": 8,
+            "lr_drop": 2,
+        }
+    ]
+
+
 def test_rfdetr_training_rejects_multiple_opencv_owners_before_side_effects(tmp_path, monkeypatch):
     dataset = tmp_path / "coco"
     dataset.mkdir()

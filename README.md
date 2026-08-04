@@ -57,7 +57,7 @@ airspace situational awareness.
 
 | Pillar | What it does | Runnable today |
 |--------|--------------|----------------|
-| **vision** | Detector registry, from-scratch architecture training, sliced inference, postprocess and class mapping | Ultralytics training is runnable with `[vision]`; `[rfdetr]` covers construction/inference only, and local-checkpoint fine-tuning is not implemented |
+| **vision** | Detector registry, from-scratch architecture training, sliced inference, postprocess and class mapping | Ultralytics training is runnable with `[vision]`; `[rfdetr]` pins RF-DETR 1.8.3 for construction/inference and a contract-checked training argument mapping, but local-checkpoint fine-tuning is not implemented |
 | **audio** | Microphone-array direction-of-arrival (GCC-PHAT / SRP-PHAT), log-mel/SPL features, acoustic→fusion bridge | ✅ pure numpy |
 | **multicam** | Pinhole calibration, N-view DLT / midpoint triangulation, cross-camera correlation | ✅ pure numpy |
 | **fusion** | KF / EKF / UKF / PF / IMM, Mahalanobis gating, M-of-N track lifecycle, OSPA/GOSPA, synthetic scenarios | ✅ pure numpy |
@@ -83,9 +83,17 @@ uv sync --locked
 
 # Heavy pillars (use Python 3.11–3.12; torch wheels lag new releases):
 uv sync --locked --extra vision --extra export  # pinned local-only training/export adapters
-uv sync --locked --extra rfdetr                 # RF-DETR architecture construction
+uv sync --locked --extra rfdetr                 # exact RF-DETR 1.8.3 construction
 uv sync --locked --extra all                    # combined supported optional stack
 ```
+
+The `[rfdetr]` extra does not include RF-DETR's upstream `train` extra because that
+extra installs competing OpenCV distributions. To execute the Manwe training
+adapter, use a separately curated environment with exactly one OpenCV distribution.
+Set accumulation with `extra.grad_accum_steps`; Manwe rejects the legacy
+`extra.gradient_accumulation_steps` name because RF-DETR 1.8.3 silently ignores it.
+CI checks the installed API and Manwe's argument mapping. It does not execute or
+qualify an RF-DETR training run or the separately curated training environment.
 
 The `manwe` CLI:
 

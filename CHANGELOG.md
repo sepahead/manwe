@@ -100,6 +100,12 @@ This is the first planned tagged alpha after the untagged Rust/Candle prototypes
   single audited `secure_io::sha256_hex`, pinned by known-answer vectors; the
   benchmark crate no longer depends on `sha2` directly.
 - Upgraded the vetted Ultralytics runtime from 8.4.91 to 8.4.92.
+- Pinned the optional RF-DETR runtime to 1.8.3 and corrected the training adapter
+  to validate and forward upstream `grad_accum_steps`. The legacy
+  `gradient_accumulation_steps` misspelling is now rejected instead of being
+  silently ignored upstream. CI now checks the installed `TrainConfig`,
+  network-denied model construction, and exactly-one-OpenCV ownership; it does not
+  execute or qualify a training run.
 - Pinned CI to actions/checkout v7.0.0 and actions/setup-python v6.3.0 by commit
   SHA. checkout v7 blocks fork-PR checkout under `pull_request_target` and
   `workflow_run`; neither trigger is used here, so no opt-in is taken.

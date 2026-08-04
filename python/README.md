@@ -32,7 +32,7 @@ also owns the `manwe` import and command, so do not co-install it; use the isola
 ```bash
 uv sync --locked --extra dev                    # core, CLI, tests, lint, and typing
 uv sync --locked --extra vision --extra export # vetted local-only training/export adapters
-uv sync --locked --extra rfdetr                # vetted RF-DETR 1.8 architecture construction
+uv sync --locked --extra rfdetr                # exact RF-DETR 1.8.3 construction contract
 uv sync --locked --extra all --extra dev       # supported optional stack + tooling
 
 uv run --locked --no-sync -- .venv/bin/manwe doctor      # hardware + installed extras
@@ -103,7 +103,9 @@ RF-DETR's upstream `train` extra currently installs both `opencv-python` and
 `opencv-python-headless`, which overwrite the same `cv2` package. Manwe therefore
 does not include that ambiguous extra in its lock; RF-DETR training requires a
 separately curated environment with exactly one OpenCV distribution. The adapter
-targets RF-DETR 1.8.3 or newer within the 1.8 release line.
+is pinned to the installed RF-DETR 1.8.3 contract. Do not infer support for a newer
+1.8 patch without a new installed-runtime review. CI checks the API and Manwe's
+argument mapping; it does not execute or qualify a training run or environment.
 
 Full documentation lives in the repository root: see `../README.md`,
 `../docs/ARCHITECTURE.md`, `../docs/INTEGRATION_CREBAIN.md`, and
