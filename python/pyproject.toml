@@ -93,7 +93,7 @@ dev = [
     # INT8 calibration contract tests decode adversarial still-image fixtures.
     "opencv-python>=4.9",
     "pillow>=10.0",
-    "ruff>=0.5",
+    "ruff>=0.16.1",
     "mypy>=1.10",
 ]
 audit = [
