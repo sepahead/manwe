@@ -27,18 +27,20 @@ jobs:
       UV_PYTHON: ${{ matrix.python-version }}
     steps:
       - name: Check out repository
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - name: Set up Python
-        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: ${{ matrix.python-version }}
       - name: Set up uv
-        uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990 # v8.3.2
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
         with:
           version: "0.11.28"
           enable-cache: true
+          # Preserve the v8 cache-pruning behavior after the v9 default changed.
+          prune-cache: true
           cache-dependency-glob: python/uv.lock
       - name: Install locked core, test, and audit dependencies
         working-directory: python
@@ -65,19 +67,21 @@ jobs:
       UV_PYTHON: "3.12"
     steps:
       - name: Check out repository
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
           persist-credentials: false
       - name: Set up Python
-        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.12"
       - name: Set up uv
-        uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990 # v8.3.2
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
         with:
           version: "0.11.28"
           enable-cache: true
+          # Preserve the v8 cache-pruning behavior after the v9 default changed.
+          prune-cache: true
           cache-dependency-glob: python/uv.lock
       - name: Install locked quality dependencies
         working-directory: python
@@ -334,18 +338,20 @@ jobs:
       PYTHONWARNINGS: error
     steps:
       - name: Check out repository
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - name: Set up Python
-        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.12"
       - name: Set up uv
-        uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990 # v8.3.2
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
         with:
           version: "0.11.28"
           enable-cache: true
+          # Preserve the v8 cache-pruning behavior after the v9 default changed.
+          prune-cache: true
           cache-dependency-glob: python/uv.lock
       - name: Install the locked core development environment
         working-directory: python
@@ -364,33 +370,58 @@ jobs:
       PYTHONPATH: src
     steps:
       - name: Check out repository
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - name: Set up Python
-        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.12"
       - name: Set up uv
-        uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990 # v8.3.2
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
         with:
           version: "0.11.28"
           enable-cache: true
+          # Preserve the v8 cache-pruning behavior after the v9 default changed.
+          prune-cache: true
           cache-dependency-glob: python/uv.lock
       - name: Install the exact locked vision adapters
         working-directory: python
         run: uv sync --locked --extra vision --extra rfdetr --extra dev --no-install-project
-      - name: Verify no-install, offline, safe-load, and analytics policy
+      - name: Verify no-install, offline, safe-load, analytics, and SAHI policy
         working-directory: python
         run: |
           uv run --locked --no-sync -- .venv/bin/python - <<'PY'
+          from importlib import metadata
+
           from manwe.common.ultralytics import harden_ultralytics_runtime, verify_ultralytics_policy
 
           harden_ultralytics_runtime()
           import ultralytics
 
           verify_ultralytics_policy()
-          print(f"verified ultralytics {ultralytics.__version__}")
+
+          from sahi.models.ultralytics import UltralyticsDetectionModel
+          from sahi.predict import get_sliced_prediction
+
+          if metadata.version("sahi") != "0.12.5":
+              raise SystemExit(f"unexpected SAHI version: {metadata.version('sahi')}")
+
+          class ContractModel:
+              names = {0: "object"}
+
+          adapter = UltralyticsDetectionModel(
+              model=ContractModel(), confidence_threshold=0.25, device="cpu"
+          )
+          if adapter.category_mapping != {"0": "object"}:
+              raise SystemExit(f"unexpected SAHI category mapping: {adapter.category_mapping}")
+          if not callable(get_sliced_prediction):
+              raise SystemExit("SAHI sliced-prediction entry point is not callable")
+
+          print(
+              f"verified ultralytics {ultralytics.__version__} and "
+              f"sahi {metadata.version('sahi')}"
+          )
           PY
       - name: Verify exact installed RF-DETR contract without network
         working-directory: python
@@ -532,7 +563,7 @@ jobs:
         toolchain: ["1.95.0", "stable"]
     steps:
       - name: Check out repository
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - name: Set up Rust
@@ -576,7 +607,7 @@ jobs:
             toolchain: stable
     steps:
       - name: Check out repository
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - name: Set up Rust
@@ -636,7 +667,7 @@ jobs:
     timeout-minutes: 30
     steps:
       - name: Check out repository
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - name: Set up Rust

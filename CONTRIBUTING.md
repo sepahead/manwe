@@ -73,6 +73,21 @@ cargo test --manifest-path metal-yolo-tests/Cargo.toml --locked
 cargo clippy --manifest-path metal-yolo-tests/Cargo.toml --locked --all-targets -- -D warnings
 ```
 
+## Dependency maintenance
+
+Routine Dependabot version PRs are disabled to avoid one-PR-per-package churn.
+This repository setting does not control account-level notifications or disable
+Dependabot security updates.
+
+- Review routine dependency versions as one coherent batch at least once each
+  calendar month and before each release-candidate handoff.
+- Keep Dependabot security updates enabled and triage each security update
+  promptly. Do not add an ignore rule that also suppresses security updates.
+- Preserve each deliberate exact pin unless an installed-compatibility review
+  authorizes a contract change. Regenerate each lock with the resolver version
+  pinned in CI. Run all applicable Python, Rust, platform, package, audit, and
+  installed-adapter gates before the batch is accepted.
+
 ## Pull requests
 
 1. Open an issue first to discuss non-trivial changes.
