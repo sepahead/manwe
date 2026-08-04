@@ -681,12 +681,12 @@ def test_imm_rejects_hostile_namespace_descriptors_slots_and_array_views():
     assert HostileNamespace.dict_calls == 0
 
     class SlottedModel:
-        __slots__ = ("secret", "__dict__")
+        __slots__ = ("slot_value", "__dict__")
         dim = 3
         likelihood = 1.0
 
         def __init__(self):
-            self.secret = 1
+            self.slot_value = 1
             self.state = GaussianState(np.zeros(6), np.eye(6))
 
         def predict(self, _dt):
