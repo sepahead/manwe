@@ -396,11 +396,14 @@ jobs:
         working-directory: python
         run: |
           uv run --locked --no-sync -- .venv/bin/python - <<'PY'
+          import gc
           import socket
           import warnings
           from contextlib import suppress
           from importlib import metadata
           from unittest.mock import patch
+
+          from manwe.vision.models import MODEL_ZOO, build_model
 
           warnings.filterwarnings(
               "ignore",
@@ -420,27 +423,23 @@ jobs:
               category=DeprecationWarning,
               module=r"torch\.jit\._script",
           )
-          from rfdetr import RFDETRNano
-          from rfdetr.config import PretrainWeightsCompatibilityWarning, TrainConfig
 
           version = metadata.version("rfdetr")
           if version != "1.8.3":
               raise SystemExit(f"unexpected RF-DETR version: {version}")
 
-          fields = TrainConfig.model_fields
-          if "gradient_accumulation_steps" in fields:
-              raise SystemExit("legacy RF-DETR accumulation misspelling is present")
-          if TrainConfig.model_config.get("extra") != "ignore":
-              raise SystemExit("unexpected TrainConfig unknown-field policy")
-          for name, expected_default in {"grad_accum_steps": 4, "lr_drop": 100}.items():
-              field = fields.get(name)
-              if field is None or field.annotation is not int or field.default != expected_default:
-                  raise SystemExit(f"unexpected TrainConfig field contract for {name}: {field}")
-          train_config = TrainConfig(dataset_dir=".", grad_accum_steps=7, lr_drop=19)
-          if (train_config.grad_accum_steps, train_config.lr_drop) != (7, 19):
-              raise SystemExit("TrainConfig did not preserve accumulation or lr_drop")
-          if hasattr(train_config, "gradient_accumulation_steps"):
-              raise SystemExit("constructed TrainConfig exposes the legacy misspelling")
+          expected_models = {
+              "rfdetr-nano": ("RFDETRNano", "RFDETRNanoConfig"),
+              "rfdetr-small": ("RFDETRSmall", "RFDETRSmallConfig"),
+              "rfdetr-medium": ("RFDETRMedium", "RFDETRMediumConfig"),
+              "rfdetr-large": ("RFDETRLarge", "RFDETRLargeConfig"),
+          }
+          registered = {name for name, spec in MODEL_ZOO.items() if spec.family == "rfdetr"}
+          if registered != set(expected_models):
+              raise SystemExit(
+                  f"RF-DETR registry mismatch: expected {sorted(expected_models)}, "
+                  f"found {sorted(registered)}"
+              )
 
           owners = []
           for distribution in (
@@ -460,20 +459,54 @@ jobs:
           with (
               warnings.catch_warnings(),
               patch.object(socket.socket, "connect", deny_network),
+              patch.object(socket.socket, "connect_ex", deny_network),
               patch("socket.create_connection", deny_network),
+              patch("socket.getaddrinfo", deny_network),
               patch("requests.sessions.Session.request", deny_network),
               patch("urllib.request.urlopen", deny_network),
           ):
               warnings.filterwarnings(
                   "ignore",
-                  message=r"RFDETRNanoConfig was instantiated with pretrain_weights=None\..*",
-                  category=PretrainWeightsCompatibilityWarning,
+                  message=r"RFDETR(?:Nano|Small|Medium|Large)Config was instantiated "
+                  r"with pretrain_weights=None\..*",
+                  category=UserWarning,
               )
-              model = RFDETRNano(pretrain_weights=None)
-          if model.model_config.pretrain_weights is not None:
-              raise SystemExit("RFDETRNano enabled pretrained weights unexpectedly")
+              for name, expected_classes in expected_models.items():
+                  model = build_model(name, pretrained=False)
+                  actual_classes = (type(model).__name__, type(model.model_config).__name__)
+                  if actual_classes != expected_classes:
+                      raise SystemExit(
+                          f"unexpected {name} classes: {actual_classes} != {expected_classes}"
+                      )
+                  if model.model_config.pretrain_weights is not None:
+                      raise SystemExit(f"{name} enabled pretrained weights unexpectedly")
+                  del model
+                  gc.collect()
 
-          print(f"verified rfdetr {version}; cv2 owner: {owners[0][0]} {owners[0][1]}")
+              from rfdetr.config import TrainConfig
+
+              fields = TrainConfig.model_fields
+              if "gradient_accumulation_steps" in fields:
+                  raise SystemExit("legacy RF-DETR accumulation misspelling is present")
+              if TrainConfig.model_config.get("extra") != "ignore":
+                  raise SystemExit("unexpected TrainConfig unknown-field policy")
+              for name, expected_default in {"grad_accum_steps": 4, "lr_drop": 100}.items():
+                  field = fields.get(name)
+                  if field is None or field.annotation is not int or field.default != expected_default:
+                      raise SystemExit(f"unexpected TrainConfig field contract for {name}: {field}")
+              train_config = TrainConfig(dataset_dir=".", grad_accum_steps=7, lr_drop=19)
+              if (train_config.grad_accum_steps, train_config.lr_drop) != (7, 19):
+                  raise SystemExit("TrainConfig did not preserve accumulation or lr_drop")
+              legacy_config = TrainConfig(dataset_dir=".", gradient_accumulation_steps=7)
+              if legacy_config.grad_accum_steps != 4:
+                  raise SystemExit("legacy accumulation misspelling was not ignored")
+              if hasattr(legacy_config, "gradient_accumulation_steps"):
+                  raise SystemExit("constructed TrainConfig exposes the legacy misspelling")
+
+          print(
+              f"verified rfdetr {version} via {', '.join(expected_models)}; "
+              f"cv2 owner: {owners[0][0]} {owners[0][1]}"
+          )
           PY
       - name: Verify calibration preprocessing against the pinned loader
         working-directory: python

@@ -191,7 +191,7 @@ def build_model(
 
 
 def _rfdetr_class(weight: str) -> str:
-    # rfdetr exposes RFDETRNano / RFDETRSmall / RFDETRMedium / RFDETRBase / RFDETRXLarge
+    # Manwe exposes RFDETRNano / RFDETRSmall / RFDETRMedium / RFDETRLarge.
     mapping = {
         "rfdetr_nano": "RFDETRNano",
         "rfdetr_small": "RFDETRSmall",

@@ -2636,6 +2636,46 @@ def test_checkpoint_stride_metadata_has_bounded_nonrecursive_traversal():
         _checkpoint_max_stride(BrokenStride())
 
 
+def test_rfdetr_registry_maps_every_constructor_without_pretrained_weights(monkeypatch):
+    models = importlib.import_module("manwe.vision.models")
+    expected = {
+        "rfdetr-nano": "RFDETRNano",
+        "rfdetr-small": "RFDETRSmall",
+        "rfdetr-medium": "RFDETRMedium",
+        "rfdetr-large": "RFDETRLarge",
+    }
+    registered = {name for name, spec in models.MODEL_ZOO.items() if spec.family == "rfdetr"}
+    assert registered == set(expected)
+
+    constructed = []
+
+    def constructor(class_name):
+        def build(**kwargs):
+            constructed.append((class_name, kwargs))
+            return SimpleNamespace(class_name=class_name)
+
+        return build
+
+    fake_rfdetr = SimpleNamespace(
+        **{class_name: constructor(class_name) for class_name in expected.values()}
+    )
+    required = []
+
+    def require(module, extra):
+        required.append((module, extra))
+        return fake_rfdetr
+
+    monkeypatch.setattr(models, "require", require)
+
+    actual = {name: models.build_model(name).class_name for name in expected}
+
+    assert actual == expected
+    assert required == [("rfdetr", "rfdetr")] * len(expected)
+    assert constructed == [
+        (class_name, {"pretrain_weights": None}) for class_name in expected.values()
+    ]
+
+
 def test_training_config_rejects_nonfinite_and_ambiguous_values(tmp_path, monkeypatch):
     data = tmp_path / "data.yaml"
     data.write_text("names: {}\n", encoding="utf-8")
