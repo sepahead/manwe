@@ -1226,7 +1226,7 @@ requires-dist = [
     { name = "pyyaml", marker = "extra == 'vision'", specifier = ">=6.0" },
     { name = "rfdetr", marker = "extra == 'rfdetr'", specifier = "==1.8.3" },
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.5" },
-    { name = "sahi", marker = "extra == 'vision'", specifier = ">=0.11" },
+    { name = "sahi", marker = "extra == 'vision'", specifier = ">=0.12.2" },
     { name = "torch", marker = "extra == 'export'", specifier = ">=2.5,<3" },
     { name = "torch", marker = "extra == 'vision'", specifier = ">=2.5,<3" },
     { name = "torchvision", marker = "extra == 'vision'", specifier = ">=0.19" },
@@ -2999,7 +2999,7 @@ wheels = [
 
 [[package]]
 name = "sahi"
-version = "0.12.1"
+version = "0.12.2"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "click" },
@@ -3013,9 +3013,9 @@ dependencies = [
     { name = "shapely" },
     { name = "tqdm" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/7f/80/c6e4d2bf77521298163e2a579355491ba9d4ee4c31a741a649ab37c4ffa7/sahi-0.12.1.tar.gz", hash = "sha256:4b0fc9d7959e3a4a3b7219931936ce71da4a3cbf17dea76ed31e78c94d41d269", size = 34188986, upload-time = "2026-06-08T00:22:21.99Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/62/13/1ab768d5596642a717fac8ddb2fa50317404d6c5d04def9b88b12ae702d6/sahi-0.12.2.tar.gz", hash = "sha256:94e6df4e75fff1dd6978ccd37e9d31d55eb86d8ffbbfa1a494e233f5174c26e9", size = 34207616, upload-time = "2026-07-20T19:10:58.747Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/f3/eb/268b0f248e85955526a4c919b6e13c022a7be3a3a36afb81f0fc88f74e0c/sahi-0.12.1-py3-none-any.whl", hash = "sha256:3ca1b1e3ff53f2d68de2db3693e95899bffa6b9a779680ea32c9a6b481bda766", size = 144488, upload-time = "2026-06-08T00:22:19.301Z" },
+    { url = "https://files.pythonhosted.org/packages/7d/f4/beac1101b686d8db848be05972a3adb4c91535b8b14283cf56c908d908e0/sahi-0.12.2-py3-none-any.whl", hash = "sha256:3a4c9d4ab7dc6858c08c0899e18db8fba26153056faa1789901b09bec00f8374", size = 148622, upload-time = "2026-07-20T19:10:56.23Z" },
 ]
 
 [[package]]
