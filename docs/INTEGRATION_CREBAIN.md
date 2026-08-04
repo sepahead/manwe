@@ -5,6 +5,15 @@ commit containing this document. Several local consumer checkouts had uncommitte
 changes, so their observations are useful for finding gaps but are not release
 evidence. Re-audit whenever any producer, adapter, or consumer contract changes.
 
+> **Current NCP lifecycle boundary (2026-08-04).** This document is a historical
+> compatibility snapshot bound to the commits reviewed on 2026-07-11. NCP
+> `v0.8.0` (wire `0.8`) is now the latest immutable release. NCP repository HEAD
+> is the unreleased, release-blocked `1.0.0-rc.1` candidate (wire `1.0`; compact
+> proto contract hash `163acc57d8a62b66`). Neither newer wire has been re-audited
+> here. Nothing below establishes a native migration, compatibility,
+> qualification, or NCP role receipt. Preserve the exact wire-0.6 and wire-0.7
+> facts below as dated audit anchors.
+
 Only committed consumer content is an anchor. Uncommitted working-tree changes
 were deliberately excluded because a dirty-path count neither identifies their
 bytes nor makes the review reproducible.
