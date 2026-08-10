@@ -232,11 +232,15 @@ jobs:
       - name: Ruff
         working-directory: python
         run: |
-          uv run --locked --no-sync -- .venv/bin/ruff check src tests
-          uv run --locked --no-sync -- .venv/bin/ruff format --check src tests
+          uv run --locked --no-sync -- .venv/bin/ruff check \
+            src tests ../scripts/verify_python_sdist.py
+          uv run --locked --no-sync -- .venv/bin/ruff format --check \
+            src tests ../scripts/verify_python_sdist.py
       - name: Mypy
         working-directory: python
-        run: uv run --locked --no-sync -- .venv/bin/python -m mypy src
+        run: >-
+          uv run --locked --no-sync -- .venv/bin/python -m mypy
+          src ../scripts/verify_python_sdist.py
       - name: Build source and wheel distributions
         working-directory: python
         run: |
@@ -252,6 +256,10 @@ jobs:
             --require-hashes --only-binary :all: \
             -r "$RUNNER_TEMP/manwe-build-constraints.txt"
           rm -rf "$RUNNER_TEMP/manwe-build-prefetch"
+          # Prove workstation-only directories cannot leak into the sdist even
+          # when they are present below this repository-subdirectory project.
+          mkdir -p .venv-sdist-probe
+          touch .venv-sdist-probe/SHOULD_NOT_SHIP
           rm -rf dist
           uv build --no-sources --offline --require-hashes \
             --build-constraints "$RUNNER_TEMP/manwe-build-constraints.txt" --sdist
@@ -262,6 +270,8 @@ jobs:
             printf 'expected exactly one sdist, found %s\n' "${#sdists[@]}" >&2
             exit 1
           fi
+          python ../scripts/verify_python_sdist.py \
+            --adversarial-self-test "${sdists[0]}"
           uv build --no-sources --offline --require-hashes \
             --build-constraints "$RUNNER_TEMP/manwe-build-constraints.txt" \
             --wheel "${sdists[0]}"
@@ -677,14 +687,14 @@ jobs:
       - name: Install pinned cargo-audit
         run: cargo install cargo-audit --version 0.22.2 --locked
       - name: Install pinned cargo-deny
-        run: cargo install cargo-deny --version 0.19.9 --locked
+        run: cargo install cargo-deny --version 0.20.2 --locked
       - name: Audit root lock
-        run: cargo audit --file Cargo.lock
+        run: cargo audit --file Cargo.lock --deny unsound
       - name: Audit benchmark lock
-        run: cargo audit --file metal-yolo-tests/Cargo.lock
+        run: cargo audit --file metal-yolo-tests/Cargo.lock --deny unsound
       - name: Enforce root advisory, license, ban, and source policy
-        run: cargo deny --locked check
+        run: cargo deny --locked --config deny.toml check
       - name: Enforce benchmark advisory, license, ban, and source policy
         run: >-
           cargo deny --manifest-path metal-yolo-tests/Cargo.toml --locked
-          check --config deny.toml --allow license-not-encountered
+          --config deny.toml check --allow license-not-encountered

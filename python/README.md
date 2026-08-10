@@ -72,9 +72,12 @@ The receipt digest binds the TensorRT version/route, loader policy, `imgsz`,
 validated inventory, exact tree, and normalized source manifest. The caller-visible
 manifest file and its declared source tree are pinned and rechecked through
 descriptor-relative POSIX I/O before publication. Dataset roots and splits must be
-absolute or descendant-relative (`..`, symlinks, and special path components are
-rejected). This
-is a technical hygiene contract, not
+absolute or descendant-relative, with nonempty `train` and `val` selections. Every
+selected split tree is descriptor-inventoried under aggregate entry and byte
+limits: traversal rejects `..`, nested symlinks, and special entries, while
+regular-file identities must be unique both within and across splits. Opposite-
+order aggregate inventories reject changes during admission. This is a technical
+hygiene contract, not
 proof that the images represent the deployment domain or that every engine layer
 executes in INT8; `precision="int8"` records the requested mixed-precision route.
 Retain separate dataset provenance, engine-inspector, and fidelity evidence.
@@ -82,10 +85,11 @@ TensorRT 11 preflights locally installed `nvidia-modelopt>=0.44`, binds its exac
 version into the digest, and rejects image sizes whose conservative 10×
 tensor-materialization estimate exceeds 8 GiB. That version and route are not
 yet explicit receipt fields, so retain the build environment record.
-The descriptor boundary is not an operating-system filesystem snapshot:
-privileged mount changes, SHA-256 collisions, and malicious same-UID mutation of
-the process-owned private loader tree during backend reads require an isolated
-build worker or stronger OS containment.
+The descriptor boundary is not an operating-system filesystem snapshot: mutation
+after a source path's final admission check, privileged mount changes, SHA-256
+collisions, and malicious same-UID mutation of the process-owned private loader
+tree during backend reads require an isolated build worker or stronger OS
+containment.
 Contract JSON/Markdown sidecars use an adjacent private
 `.manwe-contract-*.in-progress` stage and no-replace hard links. If publication
 fails after either final link appears, Manwe deliberately preserves the final paths;

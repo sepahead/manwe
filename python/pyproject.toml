@@ -122,6 +122,12 @@ Repository = "https://github.com/sepahead/manwe"
 [tool.hatch.build.targets.wheel]
 packages = ["src/manwe"]
 
+[tool.hatch.build.targets.sdist]
+# A source release is an explicit, reviewable input set. In particular, do not
+# let ignored version-specific virtual environments or other workstation state
+# leak into an archive when the package is built from this repository subdir.
+only-include = ["src", "tests", "uv.lock"]
+
 # ----------------------------------------------------------------------------
 [tool.pytest.ini_options]
 minversion = "8.0"

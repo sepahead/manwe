@@ -436,6 +436,33 @@ def _correlation_eigenvalues(block: np.ndarray, name: str) -> np.ndarray:
     return values
 
 
+def _repair_covariance_roundoff(
+    array: np.ndarray,
+    indices: np.ndarray,
+    minimum_eigenvalue: float,
+    name: str,
+) -> np.ndarray:
+    """Repair only roundoff-sized indefiniteness and certify the float matrix exactly."""
+    base_delta = max(
+        _COVARIANCE_EIGEN_TOLERANCE,
+        -minimum_eigenvalue + _COVARIANCE_EIGEN_TOLERANCE,
+    )
+    original_block = array[np.ix_(indices, indices)].copy()
+    original_diagonal = np.diag(original_block).copy()
+    for multiplier in (1.0, 2.0, 4.0, 8.0):
+        shrink = 1.0 / (1.0 + multiplier * base_delta)
+        repaired_block = original_block.copy()
+        with np.errstate(under="ignore"):
+            repaired_block *= shrink
+        np.fill_diagonal(repaired_block, original_diagonal)
+        repaired = array.copy()
+        repaired[np.ix_(indices, indices)] = repaired_block
+        repaired = _symmetrize_finite(repaired)
+        if _is_exactly_positive_semidefinite(repaired):
+            return repaired.copy()
+    raise ValueError(f"{name} repair must remain positive semidefinite")
+
+
 def _as_covariance(value: object, name: str = "covariance") -> np.ndarray:
     raw = _raw_real_array(
         value,
@@ -470,24 +497,7 @@ def _as_covariance(value: object, name: str = "covariance") -> np.ndarray:
     # eigenvalue lies within the roundoff band. Shrinking all correlations by a
     # common factor is C' = f C + (1-f)I: it preserves every variance and moves
     # every eigenvalue toward one without forming products of raw scales.
-    base_delta = max(
-        _COVARIANCE_EIGEN_TOLERANCE,
-        -minimum + _COVARIANCE_EIGEN_TOLERANCE,
-    )
-    original_block = array[np.ix_(indices, indices)].copy()
-    original_diagonal = np.diag(original_block).copy()
-    for multiplier in (1.0, 2.0, 4.0, 8.0):
-        shrink = 1.0 / (1.0 + multiplier * base_delta)
-        repaired_block = original_block.copy()
-        with np.errstate(under="ignore"):
-            repaired_block *= shrink
-        np.fill_diagonal(repaired_block, original_diagonal)
-        repaired = array.copy()
-        repaired[np.ix_(indices, indices)] = repaired_block
-        repaired = _symmetrize_finite(repaired)
-        if _is_exactly_positive_semidefinite(repaired):
-            return repaired.copy()
-    raise ValueError(f"{name} repair must remain positive semidefinite")
+    return _repair_covariance_roundoff(array, indices, minimum, name)
 
 
 def _as_state_vector(value: object, name: str = "state.x") -> np.ndarray:
@@ -503,7 +513,12 @@ def _as_state_vector(value: object, name: str = "state.x") -> np.ndarray:
     return array.copy()
 
 
-def _as_state_covariance(value: object, name: str = "state.P") -> np.ndarray:
+def _validated_state_covariance(
+    value: object,
+    name: str,
+    *,
+    repair_derived_roundoff: bool,
+) -> np.ndarray:
     size = 2 * POS_DIM
     expected = (size, size)
     raw = _raw_real_array(value, name, allowed_shapes=(expected,))
@@ -524,9 +539,38 @@ def _as_state_covariance(value: object, name: str = "state.P") -> np.ndarray:
     minimum = float(values[0])
     if minimum < -_COVARIANCE_EIGEN_TOLERANCE:
         raise ValueError(f"{name} must be finite and positive semidefinite")
-    if minimum <= _COVARIANCE_EIGEN_TOLERANCE and not _is_exactly_positive_semidefinite(array):
-        raise ValueError(f"{name} must be finite and positive semidefinite")
-    return array.copy()
+    if minimum > _COVARIANCE_EIGEN_TOLERANCE or _is_exactly_positive_semidefinite(array):
+        return array.copy()
+    if repair_derived_roundoff:
+        return _repair_covariance_roundoff(array, indices, minimum, name)
+    raise ValueError(f"{name} must be finite and positive semidefinite")
+
+
+def _as_state_covariance(value: object, name: str = "state.P") -> np.ndarray:
+    """Strictly admit covariance already stored as filter state."""
+    return _validated_state_covariance(value, name, repair_derived_roundoff=False)
+
+
+def _as_derived_state_covariance(
+    value: object,
+    name: str = "derived state covariance",
+) -> np.ndarray:
+    """Admit a trusted weighted-moment covariance after bounded roundoff repair."""
+    return _validated_state_covariance(value, name, repair_derived_roundoff=True)
+
+
+def _exact_determinant_3x3(matrix: np.ndarray) -> Fraction:
+    values = [Fraction.from_float(float(value)) for value in matrix.flat]
+    a, b, c, d, e, f, g, h, i = values
+    return a * (e * i - f * h) - b * (d * i - f * g) + c * (d * h - e * g)
+
+
+def _position_covariance_volume_exceeds(covariance: np.ndarray, limit: float) -> bool:
+    """Compare a validated 3-D covariance determinant without floating sign noise."""
+    determinant = _exact_determinant_3x3(covariance)
+    if determinant < 0:
+        raise FloatingPointError("position covariance has an invalid determinant")
+    return determinant > Fraction.from_float(limit)
 
 
 def _as_probability_array(value: object, size: int, name: str) -> np.ndarray:
@@ -573,7 +617,7 @@ def _validated_filter_state(filt: object) -> tuple[np.ndarray, np.ndarray]:
             x = np.einsum("n,nd->d", weights, particles)
             deviations = particles - x
             covariance = np.einsum("n,ni,nj->ij", weights, deviations, deviations)
-        return _as_state_vector(x), _as_state_covariance(covariance)
+        return _as_state_vector(x), _as_derived_state_covariance(covariance)
 
     if type(filt) is IMMEstimator:
         models = getattr(filt, "models", None)
@@ -607,7 +651,7 @@ def _validated_filter_state(filt: object) -> tuple[np.ndarray, np.ndarray]:
             ):
                 difference = state_x - x
                 covariance += probability * (state_covariance + np.outer(difference, difference))
-        return _as_state_vector(x), _as_state_covariance(covariance)
+        return _as_state_vector(x), _as_derived_state_covariance(covariance)
 
     state = getattr(filt, "state", None)
     if state is None:
@@ -1131,11 +1175,9 @@ class Track:
         misses_in_window = len(self.hits) - n_hits
         _, covariance = _validated_filter_state(self.filt)
         pos_cov = covariance[:POS_DIM, :POS_DIM]
-        determinant_sign, log_cov_volume = np.linalg.slogdet(pos_cov)
-        if not np.isfinite(determinant_sign) or determinant_sign < 0 or np.isnan(log_cov_volume):
-            raise FloatingPointError("position covariance has an invalid determinant")
-        covariance_limit_exceeded = determinant_sign > 0 and log_cov_volume > math.log(
-            self.cfg.max_position_cov_volume
+        covariance_limit_exceeded = _position_covariance_volume_exceeds(
+            pos_cov,
+            self.cfg.max_position_cov_volume,
         )
         if n_hits >= self.cfg.confirm_hits:
             self.ever_confirmed = True
@@ -1455,16 +1497,13 @@ class MultiSensorTracker:
 
             n_hits = sum(track.hits)
             misses_in_window = len(track.hits) - n_hits
-            determinant_sign, log_cov_volume = np.linalg.slogdet(covariance[:POS_DIM, :POS_DIM])
-            if (
-                not np.isfinite(determinant_sign)
-                or determinant_sign < 0
-                or np.isnan(log_cov_volume)
-            ):
-                raise ValueError(f"tracks[{index}] covariance determinant is invalid")
-            covariance_limit_exceeded = determinant_sign > 0 and log_cov_volume > math.log(
-                self.cfg.max_position_cov_volume
-            )
+            try:
+                covariance_limit_exceeded = _position_covariance_volume_exceeds(
+                    covariance[:POS_DIM, :POS_DIM],
+                    self.cfg.max_position_cov_volume,
+                )
+            except FloatingPointError as exc:
+                raise ValueError(f"tracks[{index}] covariance determinant is invalid") from exc
             if n_hits >= self.cfg.confirm_hits and not bool(track.ever_confirmed):
                 raise ValueError(f"tracks[{index}] confirmation history was corrupted")
             if bool(track.ever_confirmed) and age < self.cfg.confirm_hits:

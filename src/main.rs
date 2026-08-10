@@ -219,7 +219,18 @@ fn verify_jpeg_file(path: &Path, expected: &[u8]) -> Result<FileIdentity> {
 }
 
 fn write_verified_jpeg_once(path: &Path, encoded: &[u8]) -> Result<()> {
-    let mut file = OpenOptions::new().write(true).create_new(true).open(path)?;
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        // The hard link published later exposes this exact inode. Set the mode
+        // at creation so a permissive process umask cannot make it writable by
+        // another account between linking and post-link authentication.
+        options.mode(0o600);
+    }
+    let mut file = options.open(path)?;
     file.write_all(encoded)?;
     file.sync_all()?;
     drop(file);
@@ -230,20 +241,24 @@ fn write_verified_jpeg_once(path: &Path, encoded: &[u8]) -> Result<()> {
 struct ImagePublication {
     parent_dir: BoundDirectory,
     stage_dir: BoundDirectory,
+    stage_name: OsString,
     stage_file: PathBuf,
     final_link_created: bool,
     committed: bool,
+    cleanup_started: bool,
 }
 
 impl ImagePublication {
     fn acquire(parent_dir: &Path) -> Result<Self> {
         let parent_dir = BoundDirectory::open(parent_dir)?;
+        parent_dir.require_owner_mutation_boundary()?;
         for _ in 0..MAX_OUTPUT_ATTEMPTS {
             let sequence = OUTPUT_STAGE_COUNTER.fetch_add(1, Ordering::Relaxed);
-            let stage_path = parent_dir.path().join(format!(
+            let stage_name = OsString::from(format!(
                 ".manwe-image-output-{}-{sequence}.in-progress",
                 std::process::id()
             ));
+            let stage_path = parent_dir.path().join(&stage_name);
             parent_dir.verify()?;
             match create_private_directory(&stage_path) {
                 Ok(()) => {
@@ -251,9 +266,13 @@ impl ImagePublication {
                     let stage_dir = match BoundDirectory::open(&stage_path) {
                         Ok(directory) => directory,
                         Err(error) => {
-                            if parent_dir.verify().is_ok() {
-                                let _ = fs::remove_dir_all(&stage_path);
-                                let _ = parent_dir.sync();
+                            let cleanup_result = parent_dir
+                                .remove_directory_entry(&stage_name)
+                                .and_then(|()| parent_dir.sync());
+                            if let Err(cleanup_error) = cleanup_result {
+                                return Err(error.context(format!(
+                                    "failed to bind the new staging directory; exact-entry cleanup was refused or its durability is unknown: {cleanup_error:#}"
+                                )));
                             }
                             return Err(error);
                         }
@@ -262,11 +281,13 @@ impl ImagePublication {
                         stage_file: stage_dir.path().join("output.jpg"),
                         parent_dir,
                         stage_dir,
+                        stage_name,
                         final_link_created: false,
                         committed: false,
+                        cleanup_started: false,
                     };
                     publication.parent_dir.sync()?;
-                    publication.stage_dir.verify()?;
+                    publication.stage_dir.require_owner_mutation_boundary()?;
                     return Ok(publication);
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
@@ -277,6 +298,22 @@ impl ImagePublication {
     }
 
     fn publish(&mut self, encoded: &[u8], base: &OsStr) -> Result<PathBuf> {
+        self.publish_with_hooks(encoded, base, |_| Ok(()), |_| Ok(()))
+    }
+
+    fn publish_with_hooks<AfterLink, BeforeCommit>(
+        &mut self,
+        encoded: &[u8],
+        base: &OsStr,
+        mut after_link: AfterLink,
+        before_commit: BeforeCommit,
+    ) -> Result<PathBuf>
+    where
+        AfterLink: FnMut(&Path) -> Result<()>,
+        BeforeCommit: FnOnce(&Path) -> Result<()>,
+    {
+        self.parent_dir.require_owner_mutation_boundary()?;
+        self.stage_dir.require_owner_mutation_boundary()?;
         write_verified_jpeg_once(&self.stage_file, encoded)?;
         self.stage_dir.sync()?;
         let mut output = None;
@@ -292,13 +329,25 @@ impl ImagePublication {
             match fs::hard_link(&self.stage_file, &candidate) {
                 Ok(()) => {
                     self.final_link_created = true;
-                    let stage_identity = verify_jpeg_file(&self.stage_file, encoded)?;
-                    self.parent_dir.verify()?;
-                    self.stage_dir.verify()?;
-                    let output_identity = verify_jpeg_file(&candidate, encoded)?;
-                    if output_identity != stage_identity {
-                        anyhow::bail!("published JPEG identity does not match the staged output")
-                    }
+                    let mut authenticate = || -> Result<()> {
+                        after_link(&candidate)?;
+                        let stage_identity = verify_jpeg_file(&self.stage_file, encoded)?;
+                        self.parent_dir.verify()?;
+                        self.stage_dir.verify()?;
+                        let output_identity = verify_jpeg_file(&candidate, encoded)?;
+                        if output_identity != stage_identity {
+                            anyhow::bail!(
+                                "published JPEG identity does not match the staged output"
+                            )
+                        }
+                        Ok(())
+                    };
+                    authenticate().with_context(|| {
+                        format!(
+                            "a final link was created at {}, but its content or visibility could not be authenticated",
+                            candidate.display()
+                        )
+                    })?;
                     output = Some(candidate);
                     break;
                 }
@@ -307,35 +356,63 @@ impl ImagePublication {
             }
         }
         let output = output.context("could not find an unused image-output name")?;
-        self.parent_dir.sync()?;
+        before_commit(&output).with_context(|| {
+            format!(
+                "the final link last authenticated at {} has unknown publication durability",
+                output.display()
+            )
+        })?;
+        self.parent_dir.sync().with_context(|| {
+            format!(
+                "the final link last authenticated at {} has unknown publication durability",
+                output.display()
+            )
+        })?;
         self.committed = true;
-        match self
-            .parent_dir
-            .verify()
-            .and_then(|()| self.stage_dir.verify())
-            .and_then(|()| fs::remove_dir_all(self.stage_dir.path()).map_err(Into::into))
-        {
-            Ok(()) => {
-                if let Err(error) = self.parent_dir.sync() {
-                    eprintln!("image was published but staging cleanup sync failed: {error}");
-                }
-            }
-            Err(error) => {
-                eprintln!("image was published but staging cleanup failed: {error}");
-            }
-        }
+        self.cleanup_started = true;
+        self.cleanup_staging(true).with_context(|| {
+            format!(
+                "output is committed at {}, but exact-entry staging cleanup is incomplete or its durability is unknown",
+                output.display()
+            )
+        })?;
         Ok(output)
+    }
+
+    fn cleanup_staging(&self, require_staged_output: bool) -> Result<()> {
+        self.cleanup_staging_with_hook(require_staged_output, || {})
+    }
+
+    fn cleanup_staging_with_hook<F>(
+        &self,
+        require_staged_output: bool,
+        after_directory_removal: F,
+    ) -> Result<()>
+    where
+        F: FnOnce(),
+    {
+        self.parent_dir.require_owner_mutation_boundary()?;
+        self.stage_dir.require_owner_mutation_boundary()?;
+
+        let output_name = OsStr::new("output.jpg");
+        if require_staged_output {
+            self.stage_dir.remove_file_entry(output_name)?;
+        } else {
+            self.stage_dir.remove_file_entry_if_exists(output_name)?;
+        }
+        self.stage_dir.sync()?;
+
+        self.parent_dir.remove_directory_entry(&self.stage_name)?;
+        after_directory_removal();
+        self.parent_dir.sync()
     }
 }
 
 impl Drop for ImagePublication {
     fn drop(&mut self) {
-        if (self.committed || !self.final_link_created)
-            && self.parent_dir.verify().is_ok()
-            && self.stage_dir.verify().is_ok()
-        {
-            let _ = fs::remove_dir_all(self.stage_dir.path());
-            let _ = self.parent_dir.sync();
+        if !self.cleanup_started && !self.committed && !self.final_link_created {
+            self.cleanup_started = true;
+            let _ = self.cleanup_staging(false);
         }
     }
 }
@@ -478,8 +555,101 @@ mod tests {
         std::fs::remove_dir_all(directory).unwrap();
     }
 
+    #[cfg(unix)]
     #[test]
-    fn output_staging_failure_never_creates_a_final_looking_file() {
+    fn published_output_is_never_group_or_world_accessible() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = std::env::temp_dir().join(format!(
+            "manwe-output-mode-test-{}-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("unnamed")
+        ));
+        let _ = fs::remove_dir_all(&directory);
+        fs::create_dir(&directory).unwrap();
+        let input = directory.join("frame.png");
+        fs::write(&input, b"input-marker").unwrap();
+
+        let image = DynamicImage::ImageRgb8(image::RgbImage::new(2, 2));
+        let output = save_output(&input, &image).unwrap();
+        let mode = fs::metadata(&output).unwrap().permissions().mode();
+
+        assert_eq!(mode & 0o077, 0);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn post_link_failure_reports_the_visible_path_and_preserves_evidence() {
+        let directory = std::env::temp_dir().join(format!(
+            "manwe-output-post-link-failure-test-{}-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("unnamed")
+        ));
+        let _ = fs::remove_dir_all(&directory);
+        fs::create_dir(&directory).unwrap();
+        let mut publication = ImagePublication::acquire(&directory).unwrap();
+        let output = publication.parent_dir.path().join("frame.pp.jpg");
+        let stage_dir = publication.stage_dir.path().to_path_buf();
+
+        let error = publication
+            .publish_with_hooks(
+                &encoded_test_jpeg(),
+                OsStr::new("frame.pp"),
+                |_path| anyhow::bail!("injected post-link authentication failure"),
+                |_path| Ok(()),
+            )
+            .unwrap_err();
+
+        let rendered = format!("{error:#}");
+        assert!(rendered.contains(&output.display().to_string()));
+        assert!(rendered.contains("content or visibility could not be authenticated"));
+        assert!(output.is_file());
+        assert!(stage_dir.join("output.jpg").is_file());
+        drop(publication);
+        assert!(output.is_file());
+        assert!(stage_dir.join("output.jpg").is_file());
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn pre_commit_sync_failure_reports_the_authenticated_path_and_unknown_durability() {
+        let directory = std::env::temp_dir().join(format!(
+            "manwe-output-pre-commit-sync-test-{}-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("unnamed")
+        ));
+        let moved = directory.with_extension("moved");
+        let _ = fs::remove_dir_all(&directory);
+        let _ = fs::remove_dir_all(&moved);
+        fs::create_dir(&directory).unwrap();
+        let mut publication = ImagePublication::acquire(&directory).unwrap();
+        let output = publication.parent_dir.path().join("frame.pp.jpg");
+
+        let error = publication
+            .publish_with_hooks(
+                &encoded_test_jpeg(),
+                OsStr::new("frame.pp"),
+                |_path| Ok(()),
+                |_path| {
+                    fs::rename(&directory, &moved)?;
+                    fs::create_dir(&directory)?;
+                    Ok(())
+                },
+            )
+            .unwrap_err();
+
+        let rendered = format!("{error:#}");
+        assert!(rendered.contains(&output.display().to_string()));
+        assert!(rendered.contains("unknown publication durability"));
+        assert!(moved.join("frame.pp.jpg").is_file());
+        drop(publication);
+        assert!(moved.join("frame.pp.jpg").is_file());
+        fs::remove_dir_all(directory).unwrap();
+        fs::remove_dir_all(moved).unwrap();
+    }
+
+    #[test]
+    fn output_staging_failure_preserves_an_unexpected_directory_without_publishing() {
         let directory = std::env::temp_dir().join(format!(
             "manwe-output-failure-test-{}-{}",
             std::process::id(),
@@ -498,6 +668,25 @@ mod tests {
         drop(publication);
 
         assert!(!directory.join("frame.pp.jpg").exists());
+        assert!(stage_dir.is_dir());
+        assert!(stage_dir.join("output.jpg").is_dir());
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn dropping_an_unused_publication_removes_only_its_empty_staging_entry() {
+        let directory = std::env::temp_dir().join(format!(
+            "manwe-output-empty-stage-test-{}-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("unnamed")
+        ));
+        let _ = fs::remove_dir_all(&directory);
+        fs::create_dir(&directory).unwrap();
+        let publication = ImagePublication::acquire(&directory).unwrap();
+        let stage_dir = publication.stage_dir.path().to_path_buf();
+
+        drop(publication);
+
         assert!(!stage_dir.exists());
         fs::remove_dir_all(directory).unwrap();
     }
@@ -578,6 +767,172 @@ mod tests {
         drop(publication);
 
         assert_eq!(fs::read(&replacement).unwrap(), b"replacement-directory");
+        fs::remove_dir_all(directory).unwrap();
+        fs::remove_dir_all(moved).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn output_publication_rejects_a_group_writable_parent_before_staging() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = std::env::temp_dir().join(format!(
+            "manwe-output-boundary-test-{}-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("unnamed")
+        ));
+        let _ = fs::remove_dir_all(&directory);
+        fs::create_dir(&directory).unwrap();
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o770)).unwrap();
+
+        let result = ImagePublication::acquire(&directory);
+
+        assert!(result.is_err());
+        assert!(fs::read_dir(&directory).unwrap().next().is_none());
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn output_publication_rechecks_the_parent_boundary_before_linking() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = std::env::temp_dir().join(format!(
+            "manwe-output-boundary-recheck-test-{}-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("unnamed")
+        ));
+        let _ = fs::remove_dir_all(&directory);
+        fs::create_dir(&directory).unwrap();
+        let mut publication = ImagePublication::acquire(&directory).unwrap();
+        let stage_dir = publication.stage_dir.path().to_path_buf();
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o770)).unwrap();
+
+        let error = publication
+            .publish(&encoded_test_jpeg(), OsStr::new("frame.pp"))
+            .unwrap_err();
+
+        assert!(format!("{error:#}").contains("group- or world-writable"));
+        assert!(!directory.join("frame.pp.jpg").exists());
+        drop(publication);
+        assert!(stage_dir.is_dir());
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn output_cleanup_preserves_a_replacement_staging_directory() {
+        let directory = std::env::temp_dir().join(format!(
+            "manwe-output-stage-replacement-test-{}-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("unnamed")
+        ));
+        let _ = fs::remove_dir_all(&directory);
+        fs::create_dir(&directory).unwrap();
+        let publication = ImagePublication::acquire(&directory).unwrap();
+        let stage_dir = publication.stage_dir.path().to_path_buf();
+        let detached_stage = directory.join("detached-original-stage");
+        fs::rename(&stage_dir, &detached_stage).unwrap();
+        fs::create_dir(&stage_dir).unwrap();
+        let replacement_marker = stage_dir.join("replacement-marker");
+        fs::write(&replacement_marker, b"do-not-delete").unwrap();
+
+        drop(publication);
+
+        assert_eq!(fs::read(&replacement_marker).unwrap(), b"do-not-delete");
+        assert!(detached_stage.is_dir());
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn output_cleanup_never_follows_a_replacement_staging_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let directory = std::env::temp_dir().join(format!(
+            "manwe-output-stage-symlink-test-{}-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("unnamed")
+        ));
+        let _ = fs::remove_dir_all(&directory);
+        fs::create_dir(&directory).unwrap();
+        let publication = ImagePublication::acquire(&directory).unwrap();
+        let stage_dir = publication.stage_dir.path().to_path_buf();
+        let detached_stage = directory.join("detached-original-stage");
+        let victim = directory.join("victim");
+        fs::create_dir(&victim).unwrap();
+        let victim_marker = victim.join("victim-marker");
+        fs::write(&victim_marker, b"do-not-delete").unwrap();
+        fs::rename(&stage_dir, &detached_stage).unwrap();
+        symlink(&victim, &stage_dir).unwrap();
+
+        drop(publication);
+
+        assert!(fs::symlink_metadata(&stage_dir)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(fs::read(&victim_marker).unwrap(), b"do-not-delete");
+        assert!(detached_stage.is_dir());
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn committed_output_reports_and_preserves_unexpected_staging_content() {
+        let directory = std::env::temp_dir().join(format!(
+            "manwe-output-committed-cleanup-test-{}-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("unnamed")
+        ));
+        let _ = fs::remove_dir_all(&directory);
+        fs::create_dir(&directory).unwrap();
+        let mut publication = ImagePublication::acquire(&directory).unwrap();
+        let stage_dir = publication.stage_dir.path().to_path_buf();
+        let unexpected = stage_dir.join("unexpected-content");
+        fs::write(&unexpected, b"do-not-delete").unwrap();
+
+        let error = publication
+            .publish(&encoded_test_jpeg(), OsStr::new("frame.pp"))
+            .unwrap_err();
+
+        assert!(format!("{error:#}").contains("output is committed"));
+        assert!(directory.join("frame.pp.jpg").is_file());
+        assert_eq!(fs::read(&unexpected).unwrap(), b"do-not-delete");
+        drop(publication);
+        assert_eq!(fs::read(&unexpected).unwrap(), b"do-not-delete");
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn cleanup_reports_a_parent_replacement_after_exact_entry_removal_without_retrying() {
+        let directory = std::env::temp_dir().join(format!(
+            "manwe-output-cleanup-sync-race-test-{}-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("unnamed")
+        ));
+        let moved = directory.with_extension("moved");
+        let _ = fs::remove_dir_all(&directory);
+        let _ = fs::remove_dir_all(&moved);
+        fs::create_dir(&directory).unwrap();
+        let mut publication = ImagePublication::acquire(&directory).unwrap();
+        let stage_name = publication.stage_name.clone();
+        publication.cleanup_started = true;
+
+        let result = publication.cleanup_staging_with_hook(false, || {
+            fs::rename(&directory, &moved).unwrap();
+            fs::create_dir(&directory).unwrap();
+            fs::write(directory.join("replacement-marker"), b"do-not-delete").unwrap();
+        });
+
+        assert!(result.is_err());
+        assert!(!moved.join(&stage_name).exists());
+        assert!(!directory.join(&stage_name).exists());
+        drop(publication);
+        assert_eq!(
+            fs::read(directory.join("replacement-marker")).unwrap(),
+            b"do-not-delete"
+        );
         fs::remove_dir_all(directory).unwrap();
         fs::remove_dir_all(moved).unwrap();
     }

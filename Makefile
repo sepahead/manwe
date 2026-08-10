@@ -21,23 +21,23 @@ test-core: ## Run the same core/config suite in the prepared development environ
 	cd python && PYTHONWARNINGS=error $(UV_RUN) .venv/bin/python -m pytest tests
 
 lint: ## Ruff lint
-	cd python && $(UV_RUN) .venv/bin/ruff check src tests
+	cd python && $(UV_RUN) .venv/bin/ruff check src tests ../scripts/verify_python_sdist.py
 
 fmt: ## Ruff format
-	cd python && $(UV_RUN) .venv/bin/ruff format src tests
+	cd python && $(UV_RUN) .venv/bin/ruff format src tests ../scripts/verify_python_sdist.py
 
 typecheck: ## mypy on the package
-	cd python && $(UV_RUN) .venv/bin/python -m mypy src/manwe
+	cd python && $(UV_RUN) .venv/bin/python -m mypy src/manwe ../scripts/verify_python_sdist.py
 
 secret-scan: ## Scan current Git files for common credential material
 	python3 scripts/check_secrets.py
 
 smoke: ## Generate an offline synthetic dataset
 	tmp=$$(mktemp -d); trap 'rm -rf "$$tmp"' EXIT; \
-	  cd python && $(UV_RUN) .venv/bin/python -m manwe.cli synth "$$tmp/dataset"
+	  cd python && PYTHONPATH=src $(UV_RUN) .venv/bin/python -m manwe.cli synth "$$tmp/dataset"
 
 fusion-sim: ## Compare all filters on a synthetic multi-sensor scenario
-	cd python && $(UV_RUN) .venv/bin/python -m manwe.cli fusion-sim
+	cd python && PYTHONPATH=src $(UV_RUN) .venv/bin/python -m manwe.cli fusion-sim
 
 rust-build: ## Build the Rust inference CLI (CPU)
 	cargo build --release --locked --no-default-features

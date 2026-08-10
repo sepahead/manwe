@@ -83,7 +83,7 @@ MODEL_ZOO: dict[str, ModelSpec] = {
         9.5,
         "AGPL-3.0",
         "tooling",
-        "NMS-free, DFL-free, one .pt → 4 backends",
+        "NMS/DFL-free; 3 implemented export targets (MLX unimplemented)",
     ),
     # RT-DETR (via Ultralytics) — NMS-free transformer, Apache-ish upstream.
     "rtdetr-l": ModelSpec(

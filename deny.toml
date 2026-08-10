@@ -3,6 +3,10 @@ all-features = true
 
 [advisories]
 yanked = "deny"
+# Safe Rust must not admit undefined behavior through a transitive dependency.
+# cargo-deny's default scope covers workspace crates only, while Manwe's viewer
+# and inference paths necessarily execute substantial third-party code.
+unsound = "all"
 ignore = [
   { id = "RUSTSEC-2024-0436", reason = "Transitive through Candle/gemm; no fixed release is available. Monitor upstream replacement of paste." },
   { id = "RUSTSEC-2026-0192", reason = "Transitive through ab_glyph/imageproc; no fixed release is available. No untrusted font parser API is exposed." },

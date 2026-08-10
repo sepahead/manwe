@@ -98,7 +98,7 @@ MANIFEST
 *.env
 .envrc
 .netrc
-.venv
+.venv*/
 env/
 venv/
 ENV/

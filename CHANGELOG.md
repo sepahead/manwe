@@ -14,6 +14,11 @@ This is the first planned tagged alpha after the untagged Rust/Candle prototypes
   export receipts, and candidate model contracts.
 - A bounded CLI with offline dependency policy, explicit artifact digests, lazy
   heavy extras, and reproducible `uv` locking.
+- Source distributions now use an explicit package/test/lock allowlist. CI
+  accepts only the bounded generated metadata plus regular source members whose
+  exact paths are tracked and whose bytes match the release checkout, rejecting
+  ignored environments, untracked nested files, links, special entries, and
+  other workstation state.
 - Linux CPU and arm64 macOS Metal CI across the supported Python/Rust floors,
   package smoke tests, dependency/license audits, and current/range secret scans.
 - Architecture, model-contract, integration-status, security, research, license,
@@ -24,6 +29,11 @@ This is the first planned tagged alpha after the untagged Rust/Candle prototypes
 - Corrected general-alpha GOSPA to follow its cut-off-metric definition and
   corrected the synthetic scenario's constant-acceleration position step; the
   deterministic `fusion-sim` reference values now reflect the exact kinematics.
+- Weighted particle/IMM moment covariances now repair only roundoff-sized
+  indefiniteness before exact PSD certification, while admitted Gaussian state
+  remains strict. Track covariance-volume limits use exact 3×3 determinants, so
+  singular PSD particle states no longer fail on a spurious floating determinant
+  sign; the default five-filter `fusion-sim` command is pinned end to end.
 - Particle tracks now own independent seeded random streams, so birthing an
   unrelated track cannot change an existing track's future process noise.
 - New-track clustering is invariant to producer order and sensor-ID renaming;
@@ -71,11 +81,29 @@ This is the first planned tagged alpha after the untagged Rust/Candle prototypes
   cache/network/optional-codec side channels, binds the audited TensorRT and
   ModelOpt route, rejects silent FP32 fallback and unbounded ModelOpt work, and
   rechecks both the source manifest and declared dataset tree before publication.
+- Detection manifests now require nonempty `train` and `val` splits and
+  descriptor-inventory every selected tree under aggregate work limits. Nested
+  links and special entries are rejected, and regular-file identities must be
+  unique within and across splits, so hardlink aliases cannot bypass overlap
+  validation. A reverse-order confirmation pass rejects mutations between split
+  observations; mutation after a path's final check remains an OS-isolation
+  boundary rather than a filesystem-snapshot claim.
 - The Metal benchmark harness now reuses the root model implementation, records
   digest-verified no-replace evidence, bounds work, validates the fixed COCO
   schema and every finite output value, and removes incomparable legacy runners.
 - Camera URLs and model paths are supplied at runtime; credential-bearing values
   are no longer embedded or echoed by current source.
+- Annotated-image publication now requires an owner-controlled parent directory
+  and creates the published inode with owner-only permissions. It removes only
+  its exact known staging file and empty directory through bound descriptors.
+  Recursive path-based cleanup was removed; post-link errors report the
+  last-authenticated path and visibility/durability state, and incomplete
+  committed cleanup is explicit.
+- Updated the optional viewer graph from `event-listener` 5.4.1 to 5.4.2, which
+  fixes RUSTSEC-2026-0221. Both Rust dependency gates now deny soundness
+  advisories for transitive code instead of treating them as informational.
+  CI now pins cargo-deny 0.20.2, whose advisory fetch remains on the database's
+  main branch across repeated root/benchmark checks.
 - Raised the Rust floor from 1.88 to 1.95 across both crates, CI, and the docs.
   Bevy 0.19 sets it (`rust-version = 1.95.0`, reached through the optional `viewer`
   feature); Candle 0.11 independently needs 1.94 on aarch64 (`stdarch_neon_f16`,
@@ -106,9 +134,14 @@ This is the first planned tagged alpha after the untagged Rust/Candle prototypes
   silently ignored upstream. CI now checks the installed `TrainConfig`,
   network-denied model construction, and exactly-one-OpenCV ownership; it does not
   execute or qualify a training run.
-- Pinned CI to actions/checkout v7.0.0 and actions/setup-python v6.3.0 by commit
+- Pinned CI to actions/checkout v7.0.1 and actions/setup-python v7.0.0 by commit
   SHA. checkout v7 blocks fork-PR checkout under `pull_request_target` and
   `workflow_run`; neither trigger is used here, so no opt-in is taken.
+- Removed unreachable SVG definitions and styles from both logos, added native
+  title/description accessibility metadata, retained reduced-motion behavior,
+  and tuned genuinely distinct light/dark palettes without changing the mark's
+  geometry. The model catalog now reports only the three implemented export
+  targets rather than implying that MLX conversion exists.
 
 ### Known alpha limits
 

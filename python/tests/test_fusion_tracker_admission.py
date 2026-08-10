@@ -602,6 +602,62 @@ def test_state_covariance_rejects_even_tiny_negative_eigenvalues():
         tracker_module._as_state_covariance(covariance)
 
 
+def test_derived_state_covariance_repairs_only_roundoff_sized_indefiniteness():
+    covariance = np.eye(6)
+    covariance[0, 1] = covariance[1, 0] = 1.0 + 5e-11
+    original = covariance.copy()
+
+    repaired = tracker_module._as_derived_state_covariance(covariance)
+
+    assert np.array_equal(covariance, original)
+    assert np.array_equal(np.diag(repaired), np.diag(original))
+    assert tracker_module._is_exactly_positive_semidefinite(repaired)
+
+    material = np.eye(6)
+    material[0, 1] = material[1, 0] = 1.0 + 2e-10
+    material_original = material.copy()
+    with pytest.raises(ValueError, match="positive semidefinite"):
+        tracker_module._as_derived_state_covariance(material)
+    assert np.array_equal(material, material_original)
+
+
+def test_position_covariance_volume_uses_the_exact_determinant_boundary():
+    # This exact rank-one PSD matrix is from the deterministic particle
+    # regression. LAPACK reports a negative determinant sign on macOS even
+    # though the dyadic-rational determinant is exactly zero.
+    singular = np.array(
+        [
+            [1.068306992286503e-25, 1.1612032524853294e-25, -3.251369106958922e-26],
+            [1.1612032524853294e-25, 1.262177448353619e-25, -3.534096855390133e-26],
+            [-3.251369106958922e-26, -3.534096855390133e-26, 9.895471195092372e-27],
+        ]
+    )
+    assert tracker_module._is_exactly_positive_semidefinite(singular)
+    assert not tracker_module._position_covariance_volume_exceeds(singular, 1.0)
+
+    covariance = np.diag([2.0, 3.0, 5.0])
+    assert not tracker_module._position_covariance_volume_exceeds(covariance, 30.0)
+    assert tracker_module._position_covariance_volume_exceeds(
+        covariance,
+        float(np.nextafter(30.0, -np.inf)),
+    )
+    assert not tracker_module._position_covariance_volume_exceeds(
+        covariance,
+        float(np.nextafter(30.0, np.inf)),
+    )
+
+    extreme_scale = np.diag([2.0**500, 2.0**-500, 2.0])
+    assert not tracker_module._position_covariance_volume_exceeds(extreme_scale, 2.0)
+    assert tracker_module._position_covariance_volume_exceeds(
+        extreme_scale,
+        float(np.nextafter(2.0, -np.inf)),
+    )
+
+    indefinite = np.diag([1.0, 1.0, -float(np.nextafter(0.0, 1.0))])
+    with pytest.raises(FloatingPointError, match="invalid determinant"):
+        tracker_module._position_covariance_volume_exceeds(indefinite, 1.0)
+
+
 def test_state_covariance_rejects_zero_variance_cross_terms():
     covariance = np.eye(6)
     covariance[0, 0] = 0.0

@@ -13,6 +13,7 @@ import tempfile
 import warnings
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
+from functools import partial
 from itertools import combinations
 
 from .config_io import (
@@ -95,6 +96,13 @@ class _CalibrationImage:
     width: int
     height: int
     image_format: str
+
+
+@dataclass(frozen=True)
+class _SplitInventory:
+    regular_files: tuple[tuple[pathlib.Path, tuple[int, int]], ...]
+    entry_count: int
+    byte_count: int
 
 
 def _reject_remote_or_archive(value: str, field: str) -> None:
@@ -219,6 +227,15 @@ def _regular_file_identity(metadata: os.stat_result) -> tuple[int, int, int, int
 
 def _directory_identity(metadata: os.stat_result) -> tuple[int, int]:
     return metadata.st_dev, metadata.st_ino
+
+
+def _split_entry_identity(metadata: os.stat_result, *, subject: str) -> tuple[int, int]:
+    """Require the stable POSIX identity used to prove split disjointness."""
+    device = getattr(metadata, "st_dev", None)
+    inode = getattr(metadata, "st_ino", None)
+    if type(device) is not int or type(inode) is not int or device < 0 or inode <= 0:
+        raise ValueError(f"{subject} filesystem does not expose a stable device/inode identity")
+    return device, inode
 
 
 def _read_regular_utf8_at(
@@ -565,6 +582,209 @@ def _stat_relative_entry(
     ):
         raise ValueError(f"{subject} must be a regular file or directory")
     return metadata
+
+
+def _inventory_selected_split_path(
+    root_fd: int,
+    candidate: pathlib.Path,
+    relative: pathlib.PurePath,
+    metadata: os.stat_result,
+    *,
+    field: str,
+    max_entries: int,
+    max_bytes: int,
+) -> _SplitInventory:
+    """Inventory one selected path through authenticated, bounded descriptors."""
+    from .artifacts import _descriptor_tree_entries, _open_descriptor_entry
+
+    subject = f"dataset {field} split {candidate}"
+    if max_entries < 1:
+        raise ValueError(
+            f"selected dataset splits exceed the {_MAX_DATASET_ENTRIES}-entry safety limit"
+        )
+    expected_identity = _regular_file_identity(metadata)
+    if stat.S_ISREG(metadata.st_mode):
+        if metadata.st_size > max_bytes:
+            raise ValueError(
+                f"selected dataset splits exceed the {_MAX_DATASET_BYTES}-byte safety limit"
+            )
+        try:
+            entry_fd, observed = _open_descriptor_entry(
+                root_fd,
+                relative.as_posix(),
+                expect_directory=False,
+            )
+        except (OSError, ValueError) as exc:
+            raise ValueError(f"{subject} could not be bound safely: {exc}") from exc
+        try:
+            if _regular_file_identity(observed) != expected_identity:
+                raise ValueError(f"{subject} changed while it was being bound")
+            file_identity = _split_entry_identity(observed, subject=subject)
+        except BaseException as primary:
+            _release_resources(
+                ((f"{subject} descriptor cleanup also failed", lambda: os.close(entry_fd)),),
+                primary=primary,
+            )
+            raise
+        _release_resources(((f"{subject} descriptor cleanup failed", lambda: os.close(entry_fd)),))
+        current = _stat_relative_entry(
+            root_fd,
+            relative,
+            subject=subject,
+            require_directory=False,
+        )
+        if _regular_file_identity(current) != expected_identity:
+            raise ValueError(f"{subject} changed while it was being inventoried")
+        return _SplitInventory(((candidate, file_identity),), 1, metadata.st_size)
+
+    directory_fd = _open_relative_directory_nofollow(root_fd, relative, subject)
+    try:
+        opened = os.fstat(directory_fd)
+        if _regular_file_identity(opened) != expected_identity:
+            raise ValueError(f"{subject} changed while it was being bound")
+        descendant_budget = max_entries - 1
+        inventory_limit = max(descendant_budget, 1)
+        try:
+            entries = _descriptor_tree_entries(
+                directory_fd,
+                display=subject,
+                max_entries=inventory_limit,
+            )
+        except (OSError, ValueError) as exc:
+            raise ValueError(f"{subject} inventory failed: {exc}") from exc
+        if len(entries) > descendant_budget:
+            raise ValueError(
+                f"selected dataset splits exceed the {_MAX_DATASET_ENTRIES}-entry safety limit"
+            )
+
+        regular_files: list[tuple[pathlib.Path, tuple[int, int]]] = []
+        byte_count = 0
+        for entry in entries:
+            try:
+                entry_fd, observed = _open_descriptor_entry(
+                    directory_fd,
+                    entry.relative,
+                    expect_directory=entry.is_directory,
+                )
+            except (OSError, ValueError) as exc:
+                raise ValueError(
+                    f"{subject} entry changed during bounded inventory: {entry.relative}"
+                ) from exc
+            try:
+                if _regular_file_identity(observed) != entry.identity:
+                    raise ValueError(
+                        f"{subject} entry changed during bounded inventory: {entry.relative}"
+                    )
+                if not entry.is_directory:
+                    byte_count += observed.st_size
+                    if byte_count > max_bytes:
+                        raise ValueError(
+                            "selected dataset splits exceed the "
+                            f"{_MAX_DATASET_BYTES}-byte safety limit"
+                        )
+                    entry_path = candidate / pathlib.PurePosixPath(entry.relative)
+                    regular_files.append(
+                        (
+                            entry_path,
+                            _split_entry_identity(observed, subject=str(entry_path)),
+                        )
+                    )
+            except BaseException as primary:
+                _release_resources(
+                    (
+                        (
+                            f"{subject} entry descriptor cleanup also failed",
+                            partial(os.close, entry_fd),
+                        ),
+                    ),
+                    primary=primary,
+                )
+                raise
+            _release_resources(
+                (
+                    (
+                        f"{subject} entry descriptor cleanup failed",
+                        partial(os.close, entry_fd),
+                    ),
+                )
+            )
+
+        try:
+            after_entries = _descriptor_tree_entries(
+                directory_fd,
+                display=subject,
+                max_entries=inventory_limit,
+            )
+        except (OSError, ValueError) as exc:
+            raise ValueError(f"{subject} changed during bounded inventory: {exc}") from exc
+        if entries != after_entries:
+            raise ValueError(f"{subject} changed during bounded inventory")
+        after = os.fstat(directory_fd)
+        if _regular_file_identity(after) != expected_identity:
+            raise ValueError(f"{subject} changed during bounded inventory")
+        current = _stat_relative_entry(
+            root_fd,
+            relative,
+            subject=subject,
+            require_directory=True,
+        )
+        if _regular_file_identity(current) != expected_identity:
+            raise ValueError(f"{subject} changed during bounded inventory")
+    except BaseException as primary:
+        _release_resources(
+            (
+                (
+                    f"{subject} directory descriptor cleanup also failed",
+                    lambda: os.close(directory_fd),
+                ),
+            ),
+            primary=primary,
+        )
+        raise
+    _release_resources(
+        ((f"{subject} directory descriptor cleanup failed", lambda: os.close(directory_fd)),)
+    )
+    return _SplitInventory(tuple(regular_files), len(entries) + 1, byte_count)
+
+
+def _inventory_selected_split_set(
+    root_fd: int,
+    split_roots: Mapping[
+        str,
+        Sequence[tuple[pathlib.Path, pathlib.PurePath, os.stat_result]],
+    ],
+    *,
+    reverse: bool,
+) -> dict[str, tuple[tuple[pathlib.Path, tuple[int, int]], ...]]:
+    """Inventory the complete selected split set within one aggregate budget."""
+    remaining_entries = _MAX_DATASET_ENTRIES
+    remaining_bytes = _MAX_DATASET_BYTES
+    split_files: dict[str, tuple[tuple[pathlib.Path, tuple[int, int]], ...]] = {}
+    fields = list(split_roots.items())
+    if reverse:
+        fields.reverse()
+    for field, roots in fields:
+        ordered_roots = list(roots)
+        if reverse:
+            ordered_roots.reverse()
+        field_files: list[tuple[pathlib.Path, tuple[int, int]]] = []
+        for candidate, root_relative, metadata in ordered_roots:
+            inventory = _inventory_selected_split_path(
+                root_fd,
+                candidate,
+                root_relative,
+                metadata,
+                field=field,
+                max_entries=remaining_entries,
+                max_bytes=remaining_bytes,
+            )
+            remaining_entries -= inventory.entry_count
+            remaining_bytes -= inventory.byte_count
+            field_files.extend(inventory.regular_files)
+        # Canonical ordering makes the forward/reverse set observations directly
+        # comparable without making declaration order part of the invariant.
+        split_files[field] = tuple(sorted(field_files, key=lambda item: str(item[0])))
+    return split_files
 
 
 def _pillow_open_function(image_module):
@@ -1476,12 +1696,16 @@ def validate_local_detection_manifest(
             root = source_root.path
 
         sanitized: dict[str, object] = {"path": str(root)}
-        split_paths: dict[str, list[pathlib.Path]] = {}
+        split_roots: dict[str, list[tuple[pathlib.Path, pathlib.PurePath, os.stat_result]]] = {}
         for field in ("train", "val", "test"):
-            if payload.get(field) in (None, ""):
+            if field not in payload:
                 continue
+            if field == "test" and payload[field] in (None, ""):
+                continue
+            values = _split_values(payload[field], field)
             normalized_paths: list[str] = []
-            for raw in _split_values(payload[field], field):
+            roots: list[tuple[pathlib.Path, pathlib.PurePath, os.stat_result]] = []
+            for raw in values:
                 _reject_remote_or_archive(raw, field)
                 raw_candidate = pathlib.Path(raw).expanduser()
                 if raw_candidate.is_absolute():
@@ -1504,36 +1728,78 @@ def validate_local_detection_manifest(
                     raise ValueError(
                         f"dataset {field} must remain inside the declared dataset root"
                     ) from exc
-                _stat_relative_entry(
+                metadata = _stat_relative_entry(
                     source_root.fd,
                     relative,
                     subject=f"dataset {field}",
                     require_directory=None,
                 )
                 normalized_paths.append(str(candidate))
+                roots.append((candidate, relative, metadata))
             if len(set(normalized_paths)) != len(normalized_paths):
                 raise ValueError(f"dataset {field} must not contain duplicate paths")
-            for left, right in combinations((pathlib.Path(value) for value in normalized_paths), 2):
+            paths = [pathlib.Path(value) for value in normalized_paths]
+            for left, right in combinations(paths, 2):
                 if left in right.parents or right in left.parents:
                     raise ValueError(
                         f"dataset {field} paths overlap and would select files more than once: "
                         f"{left} and {right}"
                     )
-            split_paths[field] = [pathlib.Path(value) for value in normalized_paths]
+            split_roots[field] = roots
             sanitized[field] = (
                 normalized_paths[0] if len(normalized_paths) == 1 else normalized_paths
             )
 
-        for (left_name, left_paths), (right_name, right_paths) in combinations(
-            split_paths.items(), 2
+        for (left_name, left_roots), (right_name, right_roots) in combinations(
+            split_roots.items(), 2
         ):
-            for left in left_paths:
-                for right in right_paths:
+            for left, _left_relative, _left_metadata in left_roots:
+                for right, _right_relative, _right_metadata in right_roots:
                     if left == right or left in right.parents or right in left.parents:
                         raise ValueError(
                             f"dataset {left_name} and {right_name} paths overlap: "
                             f"{left} and {right}"
                         )
+
+        split_files = _inventory_selected_split_set(
+            source_root.fd,
+            split_roots,
+            reverse=False,
+        )
+        try:
+            confirmed_split_files = _inventory_selected_split_set(
+                source_root.fd,
+                split_roots,
+                reverse=True,
+            )
+        except (OSError, ValueError) as exc:
+            raise ValueError("selected dataset splits changed during aggregate inventory") from exc
+        if split_files != confirmed_split_files:
+            raise ValueError("selected dataset splits changed during aggregate inventory")
+
+        split_origins: dict[str, dict[tuple[int, int], pathlib.Path]] = {}
+        for field, inventoried_files in split_files.items():
+            origins: dict[tuple[int, int], pathlib.Path] = {}
+            for split_path, identity in inventoried_files:
+                previous = origins.get(identity)
+                if previous is not None:
+                    raise ValueError(
+                        f"dataset {field} paths identify the same filesystem entry and would "
+                        f"select files more than once: {previous} and {split_path}"
+                    )
+                origins[identity] = split_path
+            split_origins[field] = origins
+
+        for (left_name, left_origins), (right_name, right_origins) in combinations(
+            split_origins.items(), 2
+        ):
+            for identity, left in left_origins.items():
+                right_origin = right_origins.get(identity)
+                if right_origin is not None:
+                    raise ValueError(
+                        f"dataset {left_name} and {right_name} paths identify the same "
+                        f"filesystem entry: {left} and {right_origin}"
+                    )
 
         names = payload["names"]
         if isinstance(names, Mapping):

@@ -135,7 +135,11 @@ TensorRT version/route, loader policy, `imgsz`, normalized manifest, validated
 inventory, and exact copied tree; both the caller-visible manifest file and its
 declared source tree are pinned and rechecked through descriptor-relative POSIX
 I/O before publication. Dataset roots and splits must be absolute or descendant-
-relative (`..`, symlinks, and special path components are rejected).
+relative, with nonempty `train` and `val` selections. Every selected split tree is
+descriptor-inventoried under aggregate entry and byte limits: traversal rejects
+`..`, nested symlinks, and special entries, while regular-file identities must be
+unique both within and across splits. Opposite-order aggregate inventories reject
+changes during admission.
 These checks prove availability and byte/tensor uniqueness, not target-domain
 representativeness or per-layer INT8 execution. `precision="int8"` records the
 requested mixed-precision route; engine-inspector and fidelity evidence remain
@@ -144,10 +148,10 @@ promotion requirements. TensorRT 11 preflights locally installed
 image sizes whose conservative 10× tensor-materialization estimate exceeds
 8 GiB. The ModelOpt version and TensorRT route are not yet explicit receipt
 fields, so independent reconstruction still needs the build environment record.
-This is not an operating-system filesystem snapshot: privileged mount changes,
-SHA-256 collisions, and malicious same-UID mutation of the process-owned private
-loader tree during backend reads require an isolated build worker or stronger OS
-containment.
+This is not an operating-system filesystem snapshot: mutation after a source
+path's final admission check, privileged mount changes, SHA-256 collisions, and
+malicious same-UID mutation of the process-owned private loader tree during
+backend reads require an isolated build worker or stronger OS containment.
 
 `uv run --locked --no-sync -- .venv/bin/manwe fusion-sim` on the default
 3-target, 3-sensor (visual + radar + acoustic)
@@ -158,7 +162,7 @@ filter           OSPA  localization  cardinality
 kalman           4.30          1.78         2.95
 ekf              4.30          1.78         2.95
 ukf              4.30          1.78         2.95
-particle         9.90          2.03         9.23
+particle         5.61          2.10         4.21
 imm              9.33          1.88         8.89
 ```
 
@@ -185,12 +189,16 @@ No checked-in converter currently produces that graph, so treat the commands as 
 reference runtime until a pinned artifact manifest and golden forward fixture are
 available. Neither accelerator path is a downstream deployment adapter.
 
-Annotated JPEGs are staged, synced, and verified before no-replace publication. A
-hard interruption may leave a sibling `.manwe-image-output-*.in-progress`
-directory, optionally beside a complete-looking JPEG; treat the marker as an
-incomplete publication and inspect it before cleanup. A failure after the final
-link deliberately preserves both artifacts rather than unlinking a pathname that
-may already have been replaced.
+Annotated JPEGs are created owner-private, staged, synced, and verified before
+no-replace publication. A hard interruption may leave a sibling
+`.manwe-image-output-*.in-progress` directory, optionally beside a complete-looking
+JPEG. The marker means either that publication is uncommitted/indeterminate or
+that the output was committed but exact-entry staging cleanup is incomplete;
+follow the CLI error's last-authenticated path and durability state, then inspect
+both entries before cleanup. If a parent directory identity changed, the output's
+current location is intentionally not guessed. A failure after the final link
+deliberately preserves both artifacts rather than unlinking a pathname that may
+already have been replaced.
 
 CI compiles/tests the CPU path on Linux and the Metal/viewer path on arm64 macOS.
 The CUDA feature remains a target-hardware gate: it needs an NVIDIA runner, the

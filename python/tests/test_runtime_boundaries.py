@@ -559,6 +559,233 @@ def test_dataset_manifest_rejects_duplicate_or_nested_splits(tmp_path):
         validate_local_detection_manifest(manifest)
 
 
+@pytest.mark.parametrize(
+    ("train", "val", "message"),
+    [
+        ("null", "val", "dataset train must be a path string or nonempty path list"),
+        ("train", "null", "dataset val must be a path string or nonempty path list"),
+        ("''", "val", "dataset train must be a nonempty local filesystem path"),
+        ("train", "[]", "dataset val must contain nonempty path strings"),
+    ],
+)
+def test_dataset_manifest_requires_nonempty_train_and_val(tmp_path, train, val, message):
+    (tmp_path / "train").mkdir()
+    (tmp_path / "val").mkdir()
+    manifest = tmp_path / "data.yaml"
+    manifest.write_text(f"path: .\ntrain: {train}\nval: {val}\nnames: [drone]\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match=message):
+        validate_local_detection_manifest(manifest)
+
+
+def test_dataset_manifest_rejects_nested_cross_split_hardlink_alias(tmp_path):
+    train = tmp_path / "train"
+    val = tmp_path / "val"
+    train.mkdir()
+    val.mkdir()
+    shared = train / "shared.jpg"
+    alias = val / "alias.jpg"
+    shared.write_bytes(b"shared image")
+    try:
+        os.link(shared, alias)
+    except OSError as exc:  # pragma: no cover - filesystem capability boundary
+        pytest.skip(f"hard links are unavailable: {exc}")
+    manifest = tmp_path / "data.yaml"
+    manifest.write_text("path: .\ntrain: train\nval: val\nnames: [drone]\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="train and val paths identify the same filesystem entry"):
+        validate_local_detection_manifest(manifest)
+
+
+def test_dataset_manifest_rejects_nested_within_split_hardlink_alias(tmp_path):
+    train = tmp_path / "train"
+    val = tmp_path / "val"
+    train.mkdir()
+    val.mkdir()
+    original = train / "original.jpg"
+    alias = train / "alias.jpg"
+    original.write_bytes(b"shared image")
+    (val / "distinct.jpg").write_bytes(b"validation image")
+    try:
+        os.link(original, alias)
+    except OSError as exc:  # pragma: no cover - filesystem capability boundary
+        pytest.skip(f"hard links are unavailable: {exc}")
+    manifest = tmp_path / "data.yaml"
+    manifest.write_text("path: .\ntrain: train\nval: val\nnames: [drone]\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="train paths identify the same filesystem entry"):
+        validate_local_detection_manifest(manifest)
+
+
+def test_dataset_manifest_accepts_distinct_same_byte_nested_files(tmp_path):
+    train = tmp_path / "train"
+    val = tmp_path / "val"
+    train.mkdir()
+    val.mkdir()
+    (train / "image.jpg").write_bytes(b"identical image bytes")
+    (val / "image.jpg").write_bytes(b"identical image bytes")
+    manifest = tmp_path / "data.yaml"
+    manifest.write_text("path: .\ntrain: train\nval: val\nnames: [drone]\n", encoding="utf-8")
+
+    with validate_local_detection_manifest(manifest) as snapshot:
+        payload = snapshot.path.read_text(encoding="utf-8")
+        assert str(train) in payload
+        assert str(val) in payload
+
+
+def test_dataset_manifest_rejects_nested_symlink_escape_and_special_entry(tmp_path):
+    root = tmp_path / "dataset"
+    train = root / "train"
+    val = root / "val"
+    train.mkdir(parents=True)
+    val.mkdir()
+    (val / "image.jpg").write_bytes(b"validation image")
+    outside = tmp_path / "outside.jpg"
+    outside.write_bytes(b"outside")
+    nested = train / "escape.jpg"
+    nested.symlink_to(outside)
+    manifest = root / "data.yaml"
+    manifest.write_text("path: .\ntrain: train\nval: val\nnames: [drone]\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="symbolic link"):
+        validate_local_detection_manifest(manifest)
+
+    nested.unlink()
+    os.mkfifo(train / "pipe")
+    with pytest.raises(ValueError, match="unsupported entry"):
+        validate_local_detection_manifest(manifest)
+
+
+@pytest.mark.parametrize("test_value", ["null", "''"])
+def test_dataset_manifest_omits_empty_optional_test_split(tmp_path, test_value):
+    (tmp_path / "train").mkdir()
+    (tmp_path / "val").mkdir()
+    manifest = tmp_path / "data.yaml"
+    manifest.write_text(
+        f"path: .\ntrain: train\nval: val\ntest: {test_value}\nnames: [drone]\n",
+        encoding="utf-8",
+    )
+
+    with validate_local_detection_manifest(manifest) as snapshot:
+        assert "test:" not in snapshot.path.read_text(encoding="utf-8")
+
+
+def test_dataset_manifest_bounds_selected_split_inventory(tmp_path, monkeypatch):
+    from manwe.common import dataset_manifest
+
+    train = tmp_path / "train"
+    val = tmp_path / "val"
+    train.mkdir()
+    val.mkdir()
+    (train / "one.jpg").write_bytes(b"one")
+    (train / "two.jpg").write_bytes(b"two")
+    manifest = tmp_path / "data.yaml"
+    manifest.write_text("path: .\ntrain: train\nval: val\nnames: [drone]\n", encoding="utf-8")
+
+    monkeypatch.setattr(dataset_manifest, "_MAX_DATASET_ENTRIES", 2)
+    with pytest.raises(ValueError, match="entry safety limit"):
+        validate_local_detection_manifest(manifest)
+
+
+def test_dataset_manifest_bounds_selected_split_bytes(tmp_path, monkeypatch):
+    from manwe.common import dataset_manifest
+
+    train = tmp_path / "train"
+    val = tmp_path / "val"
+    train.mkdir()
+    val.mkdir()
+    (train / "image.jpg").write_bytes(b"too large")
+    manifest = tmp_path / "data.yaml"
+    manifest.write_text("path: .\ntrain: train\nval: val\nnames: [drone]\n", encoding="utf-8")
+
+    monkeypatch.setattr(dataset_manifest, "_MAX_DATASET_BYTES", 4)
+    with pytest.raises(ValueError, match="byte safety limit"):
+        validate_local_detection_manifest(manifest)
+
+
+def test_dataset_manifest_rejects_split_mutation_during_inventory(tmp_path, monkeypatch):
+    from manwe.common import artifacts
+
+    train = tmp_path / "train"
+    val = tmp_path / "val"
+    train.mkdir()
+    val.mkdir()
+    image = train / "image.jpg"
+    image.write_bytes(b"original")
+    manifest = tmp_path / "data.yaml"
+    manifest.write_text("path: .\ntrain: train\nval: val\nnames: [drone]\n", encoding="utf-8")
+    original_inventory = artifacts._descriptor_tree_entries
+    replaced = False
+
+    def replace_after_inventory(directory_fd, **kwargs):
+        nonlocal replaced
+        entries = original_inventory(directory_fd, **kwargs)
+        if not replaced and str(kwargs["display"]).startswith("dataset train split"):
+            image.unlink()
+            image.write_bytes(b"attacker replacement")
+            replaced = True
+        return entries
+
+    monkeypatch.setattr(artifacts, "_descriptor_tree_entries", replace_after_inventory)
+    with pytest.raises(ValueError, match="changed during bounded inventory"):
+        validate_local_detection_manifest(manifest)
+
+
+def test_dataset_manifest_rejects_mutation_between_split_inventories(tmp_path, monkeypatch):
+    from manwe.common import dataset_manifest
+
+    train = tmp_path / "train"
+    val = tmp_path / "val"
+    train.mkdir()
+    val.mkdir()
+    train_image = train / "image.jpg"
+    val_image = val / "image.jpg"
+    train_image.write_bytes(b"training image")
+    val_image.write_bytes(b"validation image")
+    manifest = tmp_path / "data.yaml"
+    manifest.write_text("path: .\ntrain: train\nval: val\nnames: [drone]\n", encoding="utf-8")
+    original_inventory = dataset_manifest._inventory_selected_split_path
+    replaced = False
+
+    def replace_after_train(*args, **kwargs):
+        nonlocal replaced
+        inventory = original_inventory(*args, **kwargs)
+        if not replaced and kwargs["field"] == "train":
+            train_image.unlink()
+            os.link(val_image, train_image)
+            replaced = True
+        return inventory
+
+    monkeypatch.setattr(
+        dataset_manifest,
+        "_inventory_selected_split_path",
+        replace_after_train,
+    )
+    with pytest.raises(ValueError, match="changed during aggregate inventory"):
+        validate_local_detection_manifest(manifest)
+    assert train_image.stat().st_ino == val_image.stat().st_ino
+
+
+def test_dataset_manifest_rejects_unavailable_regular_file_identity(tmp_path, monkeypatch):
+    from manwe.common import dataset_manifest
+
+    (tmp_path / "train.jpg").write_bytes(b"train")
+    (tmp_path / "val.jpg").write_bytes(b"val")
+    manifest = tmp_path / "data.yaml"
+    manifest.write_text(
+        "path: .\ntrain: train.jpg\nval: val.jpg\nnames: [drone]\n", encoding="utf-8"
+    )
+    checked_identity = dataset_manifest._split_entry_identity
+
+    def identity_without_inode(metadata, *, subject):
+        unavailable = SimpleNamespace(st_dev=metadata.st_dev, st_ino=0)
+        return checked_identity(unavailable, subject=subject)
+
+    monkeypatch.setattr(dataset_manifest, "_split_entry_identity", identity_without_inode)
+    with pytest.raises(ValueError, match="stable device/inode identity"):
+        validate_local_detection_manifest(manifest)
+
+
 def test_calibration_digest_binds_dataset_content_and_enforces_coverage(tmp_path, monkeypatch):
     from manwe.common import dataset_manifest
 
@@ -799,7 +1026,7 @@ def test_calibration_source_tree_limit_fails_before_image_decoding(tmp_path, mon
         lambda *_args, **_kwargs: pytest.fail("tree bound must run before image decoding"),
     )
 
-    with pytest.raises(ValueError, match="calibration dataset exceeds"):
+    with pytest.raises(ValueError, match="(?:calibration dataset|selected dataset splits) exceed"):
         snapshot_local_calibration_dataset(manifest, image_size=32)
 
 

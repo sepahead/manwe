@@ -2,8 +2,11 @@
 
 import builtins
 import hashlib
+import os
+import subprocess
 import sys
 import tempfile
+from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
@@ -409,6 +412,39 @@ def test_cli_numpy_only_commands(capsys, monkeypatch):
             ]
         )
         == 0
+    )
+
+
+def test_cli_default_fusion_sim_matches_the_documented_regression():
+    source_root = (Path(__file__).resolve().parents[1] / "src").resolve(strict=True)
+    environment = os.environ.copy()
+    inherited_pythonpath = environment.get("PYTHONPATH", "")
+    environment["PYTHONPATH"] = os.pathsep.join(
+        [
+            str(source_root),
+            *(component for component in inherited_pythonpath.split(os.pathsep) if component),
+        ]
+    )
+    completed = subprocess.run(
+        [sys.executable, "-m", "manwe.cli", "fusion-sim"],
+        check=False,
+        capture_output=True,
+        env=environment,
+        text=True,
+        timeout=60,
+    )
+
+    assert completed.returncode == 0
+    assert completed.stderr == ""
+    assert completed.stdout == (
+        "scenario: 3 targets, 41 frames, modalities=['visual', 'radar', 'acoustic']\n"
+        "\n"
+        "filter           OSPA  localization  cardinality\n"
+        "kalman           4.30          1.78         2.95\n"
+        "ekf              4.30          1.78         2.95\n"
+        "ukf              4.30          1.78         2.95\n"
+        "particle         5.61          2.10         4.21\n"
+        "imm              9.33          1.88         8.89\n"
     )
 
 
