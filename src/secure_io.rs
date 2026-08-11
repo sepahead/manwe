@@ -2025,12 +2025,27 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn resolved_executable_retains_a_recheckable_identity() {
-        let executable = resolve_executable(&std::env::current_exe().unwrap()).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+
+        // The test runner itself may deliberately live below an untrusted path
+        // component (GitHub-hosted Linux runners give `/home` an extended ACL).
+        // Copy the same native image below our private, sticky-temp boundary so
+        // this test measures descriptor retention rather than runner policy.
+        let directory = test_directory("recheckable-executable");
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir(&directory).unwrap();
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let executable_path = directory.join("tool");
+        std::fs::copy(std::env::current_exe().unwrap(), &executable_path).unwrap();
+        std::fs::set_permissions(&executable_path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let executable = resolve_executable(&executable_path).unwrap();
 
         executable.verify().unwrap();
         executable.require_native_executable().unwrap();
         assert!(executable.path().is_absolute());
         assert_eq!(executable.sha256().len(), 64);
+        drop(executable);
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[cfg(unix)]
