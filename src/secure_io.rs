@@ -543,8 +543,13 @@ impl BoundDirectory {
         // SAFETY: successful `fstatat` initialized the complete structure.
         let status = unsafe { status.assume_init() };
         self.verify()?;
+        // `dev_t` is signed 32-bit on macOS but unsigned 64-bit on Linux. The
+        // explicit normalization matches `MetadataExt::dev()` on both targets;
+        // the cast is therefore necessary in one half of the supported matrix.
+        #[allow(clippy::unnecessary_cast)]
+        let device = status.st_dev as u64;
         Ok(UnixEntryIdentity {
-            device: status.st_dev as u64,
+            device,
             inode: status.st_ino,
             is_regular: status.st_mode & libc::S_IFMT == libc::S_IFREG,
         })
