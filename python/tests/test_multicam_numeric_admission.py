@@ -177,6 +177,34 @@ def test_camera_constructor_admits_all_raw_arrays_before_any_float_copy(
     assert bomb.calls == 0
 
 
+def test_camera_canonicalizes_tolerated_pinhole_roundoff():
+    intrinsics = np.array([[800.0, 0.0, 320.0], [5e-13, 800.0, 240.0], [5e-13, -5e-13, 1.0]])
+    camera = Camera(intrinsics, np.eye(3), np.zeros(3))
+
+    assert camera.K[1, 0] == 0.0
+    assert np.array_equal(camera.K[2], [0.0, 0.0, 1.0])
+
+
+def test_camera_canonicalizes_tolerated_rotation_roundoff() -> None:
+    rotation = np.array(
+        [
+            [1.0, 4e-9, 0.0],
+            [-3e-9, 1.0, 5e-9],
+            [0.0, -4e-9, 1.0],
+        ]
+    )
+    camera = Camera(np.diag([800.0, 800.0, 1.0]), rotation, np.zeros(3))
+
+    assert np.allclose(camera.R @ camera.R.T, np.eye(3), rtol=0.0, atol=2e-15)
+    assert np.linalg.det(camera.R) == pytest.approx(1.0, abs=2e-15)
+    point = np.array([0.2, -0.4, 5.0])
+    pixel = camera.project(point)
+    origin, direction = camera.backproject_ray(pixel)
+    expected_direction = point - origin
+    expected_direction /= np.linalg.norm(expected_direction)
+    assert np.allclose(direction, expected_direction, rtol=0.0, atol=2e-15)
+
+
 def test_aggregate_preflight_precedes_sequence_materialization(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -556,6 +584,51 @@ def test_covariance_eigendecomposition_failures_are_normalized(
 def test_tracking_scalar_cast_rejects_finite_longdouble_overflow() -> None:
     with pytest.raises(ValueError, match="finite"):
         _detection_2d([0, 0], confidence=_wider_finite_value())
+
+
+def test_detection_3d_covariance_validation_is_relative_to_its_own_scale() -> None:
+    tiny_valid = np.diag([1e-250, 2e-250, 3e-250])
+    accepted = _detection_3d(position_covariance=tiny_valid)
+    assert np.array_equal(accepted.position_covariance, tiny_valid)
+
+    tiny_materially_indefinite = tiny_valid.copy()
+    tiny_materially_indefinite[0, 0] = -1e-250
+    with pytest.raises(ValueError, match="positive semidefinite"):
+        _detection_3d(position_covariance=tiny_materially_indefinite)
+
+    zero_variance_with_cross_term = np.zeros((3, 3))
+    zero_variance_with_cross_term[0, 1] = zero_variance_with_cross_term[1, 0] = 1e-250
+    with pytest.raises(ValueError, match="positive semidefinite"):
+        _detection_3d(position_covariance=zero_variance_with_cross_term)
+
+    hidden_indefinite_block = np.diag([1e300, 1e-250, 1e-250])
+    hidden_indefinite_block[1, 2] = hidden_indefinite_block[2, 1] = 2e-250
+    with pytest.raises(ValueError, match="positive semidefinite"):
+        _detection_3d(position_covariance=hidden_indefinite_block)
+
+    extreme_rank_one_block = np.array(
+        [
+            [1e300, 1.0, 0.0],
+            [1.0, 1e-300, 0.0],
+            [0.0, 0.0, 1.0],
+        ]
+    )
+    accepted_extreme = _detection_3d(position_covariance=extreme_rank_one_block)
+    assert np.array_equal(
+        np.diag(accepted_extreme.position_covariance),
+        np.diag(extreme_rank_one_block),
+    )
+
+
+def test_parallel_midpoint_rejects_a_finite_range_contract() -> None:
+    with pytest.raises(ValueError, match="finite constrained"):
+        triangulate_midpoint(
+            np.zeros(3),
+            np.array([1.0, 0.0, 0.0]),
+            np.array([100.0, 3.0, 0.0]),
+            np.array([1.0, 0.0, 0.0]),
+            max_range_m=10.0,
+        )
 
 
 def test_scalar_integer_overflow_is_normalized_to_value_error() -> None:

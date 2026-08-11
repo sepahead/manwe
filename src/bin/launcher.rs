@@ -4,7 +4,7 @@ use std::process::Command;
 use anyhow::{Context, Result};
 use clap::Parser;
 use manwe::secure_io::resolve_executable;
-use manwe::stream_url::{validate_rtsp_url, INVALID_RTSP_URL};
+use manwe::stream_url::{validate_rtsp_url, INVALID_RTSP_URL, MAX_STREAMS};
 
 const CHILD_ENV_ALLOWLIST: &[&str] = &[
     "HOME",
@@ -39,14 +39,6 @@ fn apply_child_environment(command: &mut Command, urls: &[String]) {
     command.env("MANWE_RTSP_URLS", urls.join("\u{1f}"));
 }
 
-fn sha256_digest(value: &str) -> std::result::Result<String, String> {
-    if value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-        Ok(value.to_ascii_lowercase())
-    } else {
-        Err("SHA-256 must contain exactly 64 hexadecimal characters".to_string())
-    }
-}
-
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
 struct Args {
@@ -73,24 +65,24 @@ struct Args {
     #[arg(long, env = "MANWE_FFMPEG", hide_env_values = true)]
     ffmpeg: Option<PathBuf>,
 
-    /// Forward a local safetensors model to camera_view.
-    #[arg(long, env = "MANWE_MODEL", hide_env_values = true)]
-    model: PathBuf,
-
-    /// Forward the expected SHA-256 for the model artifact.
-    #[arg(
-        long,
-        env = "MANWE_MODEL_SHA256",
-        value_parser = sha256_digest,
-        hide_env_values = true
-    )]
-    model_sha256: String,
+    /// Forward a schema-2 model contract to camera_view.
+    #[arg(long, env = "MANWE_CONTRACT", hide_env_values = true)]
+    contract: PathBuf,
 }
 
 fn main() -> Result<()> {
     let args = Args::parse();
+    // Clap has copied the values into owned arguments. Remove every launcher-
+    // specific ambient input before executable discovery or process creation;
+    // the child receives only the explicit, allowlisted values below.
+    for name in ["MANWE_RTSP_URLS", "MANWE_FFMPEG", "MANWE_CONTRACT"] {
+        std::env::remove_var(name);
+    }
     if args.urls.is_empty() || args.urls.iter().any(|url| validate_rtsp_url(url).is_err()) {
         anyhow::bail!(INVALID_RTSP_URL)
+    }
+    if args.urls.len() > MAX_STREAMS {
+        anyhow::bail!("at most {MAX_STREAMS} concurrent streams are supported")
     }
     let executable = match args.camera_view {
         Some(path) => path,
@@ -105,6 +97,8 @@ fn main() -> Result<()> {
             .unwrap_or_else(|| std::path::Path::new("ffmpeg")),
     )?;
 
+    executable.require_native_executable()?;
+    ffmpeg.require_native_executable()?;
     executable.verify()?;
     ffmpeg.verify()?;
     let mut command = Command::new(executable.path());
@@ -114,8 +108,7 @@ fn main() -> Result<()> {
         command.arg("--cpu");
     }
     command.arg("--ffmpeg").arg(ffmpeg.path());
-    command.arg("--model").arg(args.model);
-    command.arg("--model-sha256").arg(args.model_sha256);
+    command.arg("--contract").arg(args.contract);
 
     let status = command
         .status()
@@ -131,10 +124,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn launcher_rejects_control_characters_and_bad_digests() {
+    fn launcher_rejects_control_characters_in_stream_urls() {
         assert!(validate_rtsp_url("rtsp://example.invalid/live\nnext").is_err());
-        assert!(sha256_digest("not-a-digest").is_err());
-        assert!(sha256_digest(&"0".repeat(64)).is_ok());
     }
 
     #[test]

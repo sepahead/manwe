@@ -131,10 +131,17 @@ DATASETS: dict[str, DatasetSpec] = {
 
 
 def list_datasets(modality: str | None = None) -> list[str]:
+    if modality is not None and (
+        type(modality) is not str
+        or modality not in {"rgb", "thermal", "audio", "multimodal", "multicam"}
+    ):
+        raise ValueError("modality must be rgb, thermal, audio, multimodal, multicam, or None")
     return [k for k, v in DATASETS.items() if modality is None or v.modality == modality]
 
 
 def get_dataset(name: str) -> DatasetSpec:
+    if type(name) is not str:
+        raise TypeError("dataset name must be a string")
     if name not in DATASETS:
         raise ValueError(f"unknown dataset {name!r}; known: {list_datasets()}")
     return DATASETS[name]

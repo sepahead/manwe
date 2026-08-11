@@ -58,12 +58,22 @@ ab_glyph = "0.2"
 # 1.89). nalgebra is not optional, so 0.27 cannot be had below 1.89. `draw_text_mut`
 # moved behind the `text` feature in this line, so it is enabled explicitly.
 imageproc = { version = "0.27.0", default-features = false, features = ["text"] }
+# Native trace and publication staging names are unguessable rather than
+# PID/counter-derived. Pin the already-locked implementation so this small
+# security boundary cannot drift independently of review.
+getrandom = "=0.3.4"
 libc = "0.2"
 # sha2 0.11 (digest 0.11) replaces generic-array with hybrid-array, whose fixed
 # output no longer implements LowerHex; every digest is rendered by the single
 # audited `secure_io::sha256_hex`. Default features would add `oid`, pulling
 # const-oid purely for ASN.1 identifiers this workspace never emits.
 sha2 = { version = "0.11", default-features = false }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+# Keep native contract text aligned with Python's `str.isprintable()` boundary:
+# letters, marks, numbers, punctuation, symbols, and ordinary ASCII space only.
+# This crate is already present in Candle's locked dependency graph.
+unicode_categories = "0.1.1"
 
 [[bin]]
 name = "camera_view"

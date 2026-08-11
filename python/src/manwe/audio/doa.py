@@ -10,6 +10,8 @@ from typing import Any
 
 import numpy as np
 
+from ..common.numeric import finite_float64_scalar, widen_to_float64
+
 SPEED_OF_SOUND = 343.0  # m/s at approximately 20 degrees C
 MAX_SIGNAL_SAMPLES = 1_000_000
 MAX_INTERPOLATED_FFT_POINTS = 16_777_216
@@ -22,15 +24,10 @@ MAX_SRP_FREQUENCY_WORK = 100_000_000
 def _finite_scalar(
     value: Any, name: str, *, positive: bool = False, nonnegative: bool = False
 ) -> float:
-    if isinstance(value, bool) or not isinstance(value, (int, float, np.integer, np.floating)):
-        raise ValueError(f"{name} must be a finite number")
     try:
-        with np.errstate(over="ignore", invalid="ignore"):
-            value = float(np.float64(value))
-    except (TypeError, ValueError, OverflowError) as exc:
+        value = finite_float64_scalar(value, name)
+    except ValueError as exc:
         raise ValueError(f"{name} must be representable as a finite float") from exc
-    if not np.isfinite(value):
-        raise ValueError(f"{name} must be representable as a finite float")
     if positive and value <= 0:
         raise ValueError(f"{name} must be > 0")
     if nonnegative and value < 0:
@@ -56,9 +53,8 @@ def _raw_real_array(value: Any, name: str) -> np.ndarray:
 
 def _float_array(raw: np.ndarray, name: str) -> np.ndarray:
     try:
-        with np.errstate(over="ignore", invalid="ignore"):
-            return np.asarray(raw, dtype=float)
-    except (TypeError, ValueError, OverflowError) as exc:
+        return widen_to_float64(raw, name, validate_exact_integers=True)
+    except ValueError as exc:
         raise ValueError(f"{name} must contain real numeric values") from exc
 
 
@@ -193,6 +189,13 @@ def gcc_phat(
 
 
 def _direction(azimuth: float, elevation: float) -> np.ndarray:
+    # cos(±π/2) is about 6e-17 in binary64, not zero.  At a physical pole that
+    # rounding residue is not a horizontal direction: preserving it makes an
+    # arbitrary azimuth appear observable and can give repeated pole grid cells
+    # slightly different steering delays.  Canonicalize the exact endpoints of
+    # the public elevation domain before constructing the unit vector.
+    if abs(elevation) == np.pi / 2.0:
+        return np.array([0.0, 0.0, float(np.copysign(1.0, elevation))])
     cos_elevation = np.cos(elevation)
     return np.array(
         [
@@ -207,7 +210,7 @@ def _validate_search_observability(
     baselines: dict[tuple[int, int], np.ndarray],
     az_grid: np.ndarray,
     el_grid: np.ndarray,
-) -> None:
+) -> np.ndarray:
     """Require array steering to distinguish the requested direction space.
 
     Let ``B`` contain the microphone baselines and let ``V`` be the linear span
@@ -227,7 +230,7 @@ def _validate_search_observability(
     differences = directions - directions[0]
     direction_scale = float(np.max(np.abs(differences)))
     if direction_scale == 0.0:
-        return
+        return directions.reshape(el_grid.size, az_grid.size, 3)
     normalized_differences = differences / direction_scale
     _, singular_values, right_vectors = np.linalg.svd(
         normalized_differences,
@@ -244,6 +247,7 @@ def _validate_search_observability(
         raise ValueError(
             "microphone geometry cannot uniquely observe the requested direction search"
         )
+    return directions.reshape(el_grid.size, az_grid.size, 3)
 
 
 def srp_peak_prominence(power: np.ndarray) -> float:
@@ -351,12 +355,12 @@ def srp_phat(
     el_grid = _search_grid(el_grid, "el_grid")
     if np.any(np.abs(az_grid) > 2.0 * np.pi):
         raise ValueError("az_grid values must lie in [-2pi, 2pi]")
-    if np.any(np.abs(el_grid) > np.pi / 2.0 + 1e-12):
+    if np.any(np.abs(el_grid) > np.pi / 2.0):
         raise ValueError("el_grid values must lie in [-pi/2, pi/2]")
     grid_cells = int(az_grid.size) * int(el_grid.size)
     if grid_cells > MAX_SEARCH_CELLS:
         raise ValueError(f"search grid exceeds the {MAX_SEARCH_CELLS}-cell safety limit")
-    _validate_search_observability(baselines, az_grid, el_grid)
+    directions = _validate_search_observability(baselines, az_grid, el_grid)
 
     nfft = 1 << (2 * n_samples - 1).bit_length()
     frequency_bins = nfft // 2 + 1
@@ -370,7 +374,12 @@ def srp_phat(
     frequencies = _frequency_bins(nfft, fs)
     if not np.isfinite(spectra).all() or not np.isfinite(frequencies).all():
         raise FloatingPointError("SRP-PHAT spectra or frequencies are not finite")
-    cross: dict[tuple[int, int], np.ndarray] = {}
+    power = np.zeros((el_grid.size, az_grid.size))
+    two_pi_f = 2.0 * np.pi * frequencies
+    # Retaining one complex spectrum for every microphone pair can consume
+    # 1.6 GB at the admitted work limit even though only one pair is needed at
+    # a time. Pair-major accumulation preserves each grid cell's pair order and
+    # numerical result while bounding working memory to one spectrum.
     for first, second in pairs:
         with np.errstate(over="ignore", invalid="ignore", divide="ignore"):
             cross_spectrum = spectra[first] * np.conj(spectra[second])
@@ -379,28 +388,25 @@ def srp_phat(
             )
         if not np.isfinite(normalized_cross).all():
             raise FloatingPointError("SRP-PHAT cross spectrum is not finite")
-        cross[(first, second)] = normalized_cross
-
-    power = np.zeros((el_grid.size, az_grid.size))
-    two_pi_f = 2.0 * np.pi * frequencies
-    for elevation_index, elevation in enumerate(el_grid):
-        for azimuth_index, azimuth in enumerate(az_grid):
-            direction = _direction(float(azimuth), float(elevation))
-            accumulated_power = 0.0
-            for first, second in pairs:
+        baseline = baselines[(first, second)]
+        for elevation_index, _elevation in enumerate(el_grid):
+            for azimuth_index, _azimuth in enumerate(az_grid):
+                direction = directions[elevation_index, azimuth_index]
                 with np.errstate(over="ignore", invalid="ignore"):
-                    delay = -float(np.einsum("i,i->", baselines[(first, second)], direction)) / c
+                    delay = -float(np.einsum("i,i->", baseline, direction)) / c
                     phase = two_pi_f * delay
                 if not np.isfinite(delay) or not np.isfinite(phase).all():
                     raise FloatingPointError("SRP-PHAT steering delay is not finite")
                 with np.errstate(over="ignore", invalid="ignore"):
-                    steered = cross[(first, second)] * np.exp(1j * phase)
+                    steered = normalized_cross * np.exp(1j * phase)
                 if not np.isfinite(steered).all():
                     raise FloatingPointError("SRP-PHAT steered spectrum is not finite")
-                accumulated_power += float(np.real(np.sum(steered)))
-            if not np.isfinite(accumulated_power):
-                raise FloatingPointError("SRP-PHAT power is not finite")
-            power[elevation_index, azimuth_index] = accumulated_power
+                updated_power = power[elevation_index, azimuth_index] + float(
+                    np.real(np.sum(steered))
+                )
+                if not np.isfinite(updated_power):
+                    raise FloatingPointError("SRP-PHAT power is not finite")
+                power[elevation_index, azimuth_index] = updated_power
 
     prominence = srp_peak_prominence(power)
     if min_peak_prominence is not None and prominence < min_peak_prominence:
@@ -410,11 +416,20 @@ def srp_phat(
         )
     peak_index = np.unravel_index(int(np.argmax(power)), power.shape)
     elevation_index, azimuth_index = int(peak_index[0]), int(peak_index[1])
-    return (
-        float(az_grid[azimuth_index]),
-        float(el_grid[elevation_index]),
-        power,
+    elevation = float(el_grid[elevation_index])
+    # Azimuth is undefined at zenith/nadir.  All azimuth cells represent the
+    # same direction there, so do not leak grid ordering through the result.
+    azimuth = (
+        0.0
+        if abs(elevation) == np.pi / 2.0
+        else float(
+            np.arctan2(
+                np.sin(float(az_grid[azimuth_index])),
+                np.cos(float(az_grid[azimuth_index])),
+            )
+        )
     )
+    return azimuth, elevation, power
 
 
 def synth_plane_wave(

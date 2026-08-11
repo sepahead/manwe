@@ -8,7 +8,7 @@ import pathlib
 import stat
 import tempfile
 import warnings
-from collections.abc import Collection, Iterator
+from collections.abc import Callable, Collection, Iterator
 from contextlib import contextmanager
 from typing import NamedTuple
 
@@ -135,7 +135,7 @@ def _update_from_open_regular_fd(
         after.st_mtime_ns,
         after.st_ctime_ns,
     )
-    if before_identity != after_identity:
+    if total != before.st_size or before_identity != after_identity:
         raise ValueError(f"artifact changed while it was being hashed: {display}")
     return total
 
@@ -415,7 +415,7 @@ def sha256_directory_fd(
     max_entries: int = DEFAULT_MAX_ARTIFACT_ENTRIES,
 ) -> str:
     """Hash an authenticated tree with the canonical global path ordering."""
-    if isinstance(directory_fd, bool) or not isinstance(directory_fd, int) or directory_fd < 0:
+    if type(directory_fd) is not int or directory_fd < 0:
         raise ValueError("directory_fd must be an open directory descriptor")
     if not isinstance(display, str) or not display:
         raise ValueError("display must be a nonempty string")
@@ -499,6 +499,7 @@ def _copy_directory_fd(
     max_entries: int,
     destination_directory_mode: int = 0o500,
     destination_file_mode: int = 0o400,
+    source_tree_validator: Callable[[tuple[_DescriptorTreeEntry, ...]], None] | None = None,
 ) -> None:
     """Copy an authenticated tree with live descriptors bounded independently of depth."""
     for value, name in (
@@ -511,6 +512,8 @@ def _copy_directory_fd(
         raise ValueError("max_bytes must be a positive integer")
     if type(max_entries) is not int or max_entries <= 0:
         raise ValueError("max_entries must be a positive integer")
+    if source_tree_validator is not None and not callable(source_tree_validator):
+        raise TypeError("source_tree_validator must be callable or None")
     nofollow = getattr(os, "O_NOFOLLOW", 0)
     cloexec = getattr(os, "O_CLOEXEC", 0)
     directory_flags = os.O_RDONLY | cloexec | getattr(os, "O_DIRECTORY", 0) | nofollow
@@ -520,6 +523,11 @@ def _copy_directory_fd(
         display=display,
         max_entries=max_entries,
     )
+    if source_tree_validator is not None:
+        # The same immutable inventory drives validation and every subsequent
+        # descriptor-relative copy. The post-copy inventory equality below
+        # closes the mutation window after this policy decision.
+        source_tree_validator(tuple(entries))
     total_bytes = 0
     regular_files = sum(not entry.is_directory for entry in entries)
     if regular_files == 0:
@@ -659,6 +667,7 @@ def sha256_artifact_at(
     *,
     max_bytes: int = DEFAULT_MAX_ARTIFACT_BYTES,
     max_entries: int = DEFAULT_MAX_ARTIFACT_ENTRIES,
+    expect_directory: bool | None = None,
 ) -> str:
     """Hash one entry relative to a retained parent-directory descriptor.
 
@@ -666,7 +675,7 @@ def sha256_artifact_at(
     descriptor. A renamed or substituted pathname therefore cannot redirect the
     digest to a different tree.
     """
-    if isinstance(parent_fd, bool) or not isinstance(parent_fd, int) or parent_fd < 0:
+    if type(parent_fd) is not int or parent_fd < 0:
         raise ValueError("parent_fd must be an open directory descriptor")
     if not isinstance(name, str) or not name or name in {".", ".."} or "/" in name or "\0" in name:
         raise ValueError("artifact name must be one nonempty path component")
@@ -674,6 +683,8 @@ def sha256_artifact_at(
         raise ValueError("max_bytes must be a positive integer")
     if type(max_entries) is not int or max_entries <= 0:
         raise ValueError("max_entries must be a positive integer")
+    if expect_directory is not None and type(expect_directory) is not bool:
+        raise TypeError("expect_directory must be a boolean or None")
 
     nofollow = getattr(os, "O_NOFOLLOW", 0)
     cloexec = getattr(os, "O_CLOEXEC", 0)
@@ -684,6 +695,10 @@ def sha256_artifact_at(
     root_metadata = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
     if stat.S_ISLNK(root_metadata.st_mode):
         raise ValueError(f"artifact root must not be a symbolic link: {name}")
+    if expect_directory is True and not stat.S_ISDIR(root_metadata.st_mode):
+        raise ValueError(f"artifact must be a directory bundle: {name}")
+    if expect_directory is False and not stat.S_ISREG(root_metadata.st_mode):
+        raise ValueError(f"artifact must be a regular file: {name}")
 
     hasher = hashlib.sha256()
     if stat.S_ISREG(root_metadata.st_mode):
@@ -1100,11 +1115,14 @@ class ArtifactSnapshot:
         allowed_suffixes: Collection[str] | None = None,
         max_bytes: int = DEFAULT_MAX_ARTIFACT_BYTES,
         max_entries: int = DEFAULT_MAX_ARTIFACT_ENTRIES,
+        expect_directory: bool | None = None,
     ) -> None:
         if type(max_bytes) is not int or max_bytes <= 0:
             raise ValueError("max_bytes must be a positive integer")
         if type(max_entries) is not int or max_entries <= 0:
             raise ValueError("max_entries must be a positive integer")
+        if expect_directory is not None and type(expect_directory) is not bool:
+            raise TypeError("expect_directory must be a boolean or None")
         source = _absolute_artifact_path(path)
         if allowed_suffixes is not None:
             normalized = {suffix.lower() for suffix in allowed_suffixes}
@@ -1125,6 +1143,10 @@ class ArtifactSnapshot:
             metadata = source.lstat()
             if stat.S_ISLNK(metadata.st_mode):
                 raise ValueError(f"artifact root must not be a symbolic link: {source}")
+            if expect_directory is True and not stat.S_ISDIR(metadata.st_mode):
+                raise ValueError(f"artifact must be a directory bundle: {source}")
+            if expect_directory is False and not stat.S_ISREG(metadata.st_mode):
+                raise ValueError(f"artifact must be a regular file: {source}")
             if stat.S_ISREG(metadata.st_mode):
                 source_handle = open_regular_nofollow(source, "artifact file")
                 flags = (
@@ -1238,6 +1260,7 @@ class ArtifactSnapshot:
             self._temporary.assert_visible()
             self.path = destination
             self.sha256 = actual
+            self._closed = False
         except BaseException as error:
             try:
                 self._temporary.cleanup()
@@ -1246,7 +1269,9 @@ class ArtifactSnapshot:
             raise
 
     def close(self) -> None:
-        self._temporary.cleanup()
+        if not self._closed:
+            self._temporary.cleanup()
+            self._closed = True
 
     @classmethod
     def from_directory_fd(
@@ -1257,14 +1282,17 @@ class ArtifactSnapshot:
         display: str = "artifact directory",
         max_bytes: int = DEFAULT_MAX_ARTIFACT_BYTES,
         max_entries: int = DEFAULT_MAX_ARTIFACT_ENTRIES,
+        source_tree_validator: Callable[[tuple[_DescriptorTreeEntry, ...]], None] | None = None,
     ) -> ArtifactSnapshot:
         """Copy a verified tree from an already authenticated directory descriptor."""
-        if isinstance(directory_fd, bool) or not isinstance(directory_fd, int) or directory_fd < 0:
+        if type(directory_fd) is not int or directory_fd < 0:
             raise ValueError("directory_fd must be an open directory descriptor")
         if type(max_bytes) is not int or max_bytes <= 0:
             raise ValueError("max_bytes must be a positive integer")
         if type(max_entries) is not int or max_entries <= 0:
             raise ValueError("max_entries must be a positive integer")
+        if source_tree_validator is not None and not callable(source_tree_validator):
+            raise TypeError("source_tree_validator must be callable or None")
         expected = normalize_sha256(expected_sha256)
         instance = cls.__new__(cls)
         instance._temporary = _PrivateSnapshotDirectory(max_entries=max_entries)
@@ -1290,6 +1318,7 @@ class ArtifactSnapshot:
                     display=display,
                     max_bytes=max_bytes,
                     max_entries=max_entries,
+                    source_tree_validator=source_tree_validator,
                 )
                 actual = sha256_directory_fd(
                     bound_destination_fd,
@@ -1306,6 +1335,7 @@ class ArtifactSnapshot:
             instance._temporary.assert_visible()
             instance.path = destination
             instance.sha256 = actual
+            instance._closed = False
             return instance
         except BaseException as error:
             try:
@@ -1315,6 +1345,8 @@ class ArtifactSnapshot:
             raise
 
     def __enter__(self) -> ArtifactSnapshot:
+        if self._closed:
+            raise RuntimeError("artifact snapshot is closed")
         return self
 
     def __exit__(self, _exc_type, _exc, _traceback) -> None:

@@ -1,0 +1,75 @@
+{
+  "model_name": "manwe-airspace-yolov8",
+  "model_version": "fixture-v1",
+  "source": "Manwe cross-language schema fixture",
+  "rights": "test fixture only",
+  "backend": "candle",
+  "file_path": "model.safetensors",
+  "file_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+  "inputs": [
+    {
+      "name": "images",
+      "shape": [1, 3, 640, 640],
+      "dtype": "float32",
+      "layout": "NCHW/RGB",
+      "notes": "letterboxed RGB input"
+    }
+  ],
+  "outputs": [
+    {
+      "name": "predictions",
+      "shape": [1, 9, 8400],
+      "dtype": "float32",
+      "layout": "",
+      "notes": "cxcywh plus five class probabilities"
+    }
+  ],
+  "preprocess": "RGB; centered square letterbox; Catmull-Rom; pad 114; divide by 255",
+  "postprocess": "class argmax; confidence > 0.25; class-aware NMS IoU 0.45; max 300",
+  "class_map": {
+    "0": "drone",
+    "1": "bird",
+    "2": "aircraft",
+    "3": "helicopter",
+    "4": "unknown"
+  },
+  "validation_data": "cross-language schema fixture; no accuracy claim",
+  "benchmark_context": "not benchmarked",
+  "failure_behavior": "reject any contract, digest, tensor, or runtime mismatch before inference",
+  "schema_version": "2.0",
+  "num_classes": 5,
+  "source_classes": ["drone", "bird", "aircraft", "helicopter", "unknown"],
+  "source_sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+  "export_options": "native Candle YOLOv8 detect weights",
+  "signature_evidence": "fixture tensor interface",
+  "runtime": {
+    "adapter": "manwe-candle-yolov8-detect-v1",
+    "model_variant": "s",
+    "input": {
+      "tensor_name": "images",
+      "width": 640,
+      "height": 640,
+      "dtype": "float32",
+      "layout": "NCHW/RGB",
+      "color_order": "RGB",
+      "resize": "letterbox",
+      "interpolation": "catmull-rom",
+      "alignment": 32,
+      "pad_value": 114,
+      "scale": 0.00392156862745098,
+      "mean": [0.0, 0.0, 0.0],
+      "std": [1.0, 1.0, 1.0]
+    },
+    "output": {
+      "tensor_name": "predictions",
+      "box_format": "cxcywh",
+      "coordinate_space": "input-pixels",
+      "class_scores": "probabilities",
+      "confidence_threshold": 0.25,
+      "iou_threshold": 0.45,
+      "max_detections": 300,
+      "keypoint_confidence_threshold": null
+    },
+    "keypoint_names": []
+  }
+}

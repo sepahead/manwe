@@ -16,7 +16,10 @@ Defaults follow the 2026 SOTA survey (``docs/research/SOTA-2026.md``):
 
 from __future__ import annotations
 
+import os
+import sys
 from dataclasses import dataclass
+from importlib import metadata
 
 from ..common.deps import require
 from ..common.ultralytics import harden_ultralytics_runtime, verify_ultralytics_policy
@@ -26,6 +29,54 @@ from ..common.ultralytics import harden_ultralytics_runtime, verify_ultralytics_
 DEFAULT_DETECTOR = "yolo11s"
 #: Default when maximising accuracy / domain transfer (Apache size).
 DEFAULT_ACCURACY = "rfdetr-medium"
+_VETTED_RFDETR_VERSION = "1.8.3"
+
+
+def _blocked_rfdetr_download(*_args, **_kwargs):
+    raise RuntimeError(
+        "RF-DETR network downloads are disabled; Manwe training starts from random "
+        "initialization and accepts no backend-managed checkpoint"
+    )
+
+
+def _harden_rfdetr_runtime() -> None:
+    """Make the pinned RF-DETR construction path fail closed offline."""
+    for name, value in {
+        "HF_HUB_OFFLINE": "1",
+        "TRANSFORMERS_OFFLINE": "1",
+        "HF_DATASETS_OFFLINE": "1",
+        "HF_HUB_DISABLE_TELEMETRY": "1",
+        "DISABLE_TELEMETRY": "1",
+        "WANDB_MODE": "disabled",
+    }.items():
+        os.environ[name] = value
+
+    # RF-DETR imports the downloader into detr.py. Patch both bindings if a
+    # caller imported the package before Manwe so a future constructor change
+    # cannot silently turn the from-scratch route into network I/O.
+    for module_name in ("rfdetr.assets.model_weights", "rfdetr.detr"):
+        module = sys.modules.get(module_name)
+        if module is not None and hasattr(module, "download_pretrain_weights"):
+            vars(module)["download_pretrain_weights"] = _blocked_rfdetr_download
+
+
+def _verify_rfdetr_policy() -> None:
+    """Require the exact audited RF-DETR runtime and disabled downloader bindings."""
+    _harden_rfdetr_runtime()
+    try:
+        installed_version = metadata.version("rfdetr")
+    except metadata.PackageNotFoundError as exc:
+        raise RuntimeError("RF-DETR distribution metadata is unavailable") from exc
+    if installed_version != _VETTED_RFDETR_VERSION:
+        raise RuntimeError(
+            f"RF-DETR {installed_version} is not the vetted {_VETTED_RFDETR_VERSION} runtime"
+        )
+    for module_name in ("rfdetr.assets.model_weights", "rfdetr.detr"):
+        module = sys.modules.get(module_name)
+        if module is None or getattr(module, "download_pretrain_weights", None) is not (
+            _blocked_rfdetr_download
+        ):
+            raise RuntimeError("RF-DETR pretrained-weight downloads could not be disabled")
 
 
 @dataclass(frozen=True)
@@ -103,25 +154,25 @@ MODEL_ZOO: dict[str, ModelSpec] = {
         "rfdetr-nano",
         "rfdetr",
         "rfdetr_nano",
-        30.0,
+        30.5,
         "Apache-2.0",
         "accuracy",
-        "48.0 AP; Apache implementation tier; verify weight/data rights",
+        "48.4 AP; Apache implementation tier; verify weight/data rights",
     ),
     "rfdetr-small": ModelSpec(
         "rfdetr-small",
         "rfdetr",
         "rfdetr_small",
-        30.0,
+        32.1,
         "Apache-2.0",
         "accuracy",
-        "Apache implementation tier; verify weight/data rights",
+        "53.0 AP; Apache implementation tier; verify weight/data rights",
     ),
     "rfdetr-medium": ModelSpec(
         "rfdetr-medium",
         "rfdetr",
         "rfdetr_medium",
-        33.0,
+        33.7,
         "Apache-2.0",
         "accuracy",
         "54.7 AP; Apache implementation tier; verify weight/data rights",
@@ -130,16 +181,18 @@ MODEL_ZOO: dict[str, ModelSpec] = {
         "rfdetr-large",
         "rfdetr",
         "rfdetr_large",
-        60.0,
+        33.9,
         "Apache-2.0",
         "accuracy",
-        "large; Apache implementation tier; verify weight/data rights",
+        "56.5 AP; Apache implementation tier; verify weight/data rights",
     ),
 }
 
 
 def list_models(track: str | None = None) -> list[str]:
     """List zoo model names, optionally filtered by ``track`` (tooling/accuracy)."""
+    if track is not None and (type(track) is not str or track not in {"tooling", "accuracy"}):
+        raise ValueError("track must be 'tooling', 'accuracy', or None")
     return [k for k, v in MODEL_ZOO.items() if track is None or v.track == track]
 
 
@@ -155,6 +208,8 @@ def build_model(
     review bootstrap artifacts outside this API, then use a digest-bound training
     workflow once that model family has an implemented local-checkpoint adapter.
     """
+    if type(name) is not str:
+        raise TypeError("model name must be a string")
     spec = MODEL_ZOO.get(name)
     if spec is None:
         raise ValueError(f"unknown model {name!r}; choose from {list_models()}")
@@ -166,7 +221,10 @@ def build_model(
         raise ValueError("num_classes must be an integer in [1, 4096] when provided")
 
     if spec.family == "rfdetr":
+        _harden_rfdetr_runtime()
         rfdetr = require("rfdetr", "rfdetr")
+        _harden_rfdetr_runtime()
+        _verify_rfdetr_policy()
         ctor = getattr(rfdetr, _rfdetr_class(spec.weight))
         kwargs: dict[str, object] = {}
         if num_classes is not None:

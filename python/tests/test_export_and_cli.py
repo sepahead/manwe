@@ -14,7 +14,7 @@ import pytest
 
 from manwe.cli import main
 from manwe.common.artifacts import require_pickle_acknowledgement
-from manwe.common.contracts import TensorSpec
+from manwe.common.contracts import TensorSpec, detection_runtime
 from manwe.eval.detection import Detections, GroundTruth
 from manwe.export import (
     ExportReceipt,
@@ -22,8 +22,17 @@ from manwe.export import (
     build_export_contract,
     fidelity_report,
 )
+from manwe.schemas import candle_detect_example_bytes
 
 _SOURCE_CLASSES = ("drone", "bird", "aircraft", "helicopter", "unknown")
+
+
+def _runtime(input_name: str = "images", output_name: str = "output"):
+    return detection_runtime(
+        input_tensor=input_name,
+        output_tensor=output_name,
+        image_size=640,
+    )
 
 
 @pytest.mark.parametrize("acknowledgement", [1, "yes", object(), np.bool_(True)])
@@ -69,6 +78,7 @@ def _export_pair(
         source_classes=_SOURCE_CLASSES,
         inputs=inputs or (TensorSpec("images", [1, 3, 640, 640], "float32", "NCHW/RGB"),),
         outputs=outputs or (TensorSpec("output", [1, 9, 8400], "float32"),),
+        runtime=_runtime(),
         preprocess="fixture-inspected letterbox contract",
         postprocess="fixture-inspected external NMS contract",
         failure_behavior="fixture-backed shape mismatch raises",
@@ -117,6 +127,7 @@ def test_build_export_contract_complete(tmp_path):
         source_classes=("drone", "bird", "aircraft", "helicopter", "unknown"),
         inputs=(TensorSpec("images", [1, 3, 640, 640], "float32", "NCHW/RGB"),),
         outputs=(TensorSpec("output", [1, 9, 8400], "float32"),),
+        runtime=_runtime(),
         preprocess="fixture-inspected letterbox contract",
         postprocess="fixture-inspected external NMS contract",
         failure_behavior="fixture-backed shape mismatch raises",
@@ -156,6 +167,7 @@ def test_verified_signature_rejects_noncanonical_tensor_metadata(tensor):
             source_classes=("drone",),
             inputs=(tensor,),
             outputs=(TensorSpec("output", [1, 5, "A"], "float32"),),
+            runtime=_runtime(),
             preprocess="fixture",
             postprocess="fixture",
             failure_behavior="fixture",
@@ -173,6 +185,7 @@ def test_verified_signature_rejects_unbounded_output_symbol():
             source_classes=("drone",),
             inputs=(TensorSpec("images", [1, 3, 640, 640], "float32", "NCHW/RGB"),),
             outputs=(TensorSpec("output", [1, 5, "UNBOUNDED"], "float32"),),
+            runtime=_runtime(),
             preprocess="fixture",
             postprocess="fixture",
             failure_behavior="fixture",
@@ -191,6 +204,7 @@ def test_verified_signature_rejects_duplicate_interface_names():
             source_classes=("drone",),
             inputs=(duplicate,),
             outputs=(TensorSpec("tensor", [1, 5, "A"], "float32"),),
+            runtime=_runtime("tensor", "tensor"),
             preprocess="fixture",
             postprocess="fixture",
             failure_behavior="fixture",
@@ -355,6 +369,11 @@ def test_receipt_and_signature_reject_forged_public_values():
             source_classes=("drone",),
             inputs=(TensorSpec("images", [1, 3, 32, 32], "float32"),),
             outputs=(TensorSpec("output", [1, 5, 1], "float32"),),
+            runtime=detection_runtime(
+                input_tensor="images",
+                output_tensor="output",
+                image_size=32,
+            ),
             preprocess="fixture",
             postprocess="fixture",
             failure_behavior="fixture",
@@ -415,6 +434,84 @@ def test_cli_numpy_only_commands(capsys, monkeypatch):
     )
 
 
+def test_doctor_hardens_ultralytics_before_optional_runtime_imports(capsys, monkeypatch):
+    from manwe.common import ultralytics as policy
+
+    events: list[str] = []
+    monkeypatch.setattr(policy, "harden_ultralytics_runtime", lambda: events.append("hardened"))
+    real_import = builtins.__import__
+    optional_modules = {
+        "torch",
+        "ultralytics",
+        "rfdetr",
+        "sahi",
+        "onnxruntime",
+        "coremltools",
+    }
+
+    def inspect_optional_import(name, *args, **kwargs):
+        if name in optional_modules:
+            assert events == ["hardened"]
+            raise ImportError(f"simulated absent optional dependency: {name}")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", inspect_optional_import)
+    assert main(["doctor"]) == 0
+    assert events == ["hardened"]
+    capsys.readouterr()
+
+
+def test_doctor_reports_policy_setup_failure_without_reimporting_ultralytics(capsys, monkeypatch):
+    from manwe.common import ultralytics as policy
+
+    def fail_policy_setup():
+        raise RuntimeError("simulated broken pre-imported runtime")
+
+    real_import = builtins.__import__
+    imported: list[str] = []
+
+    def inspect_import(name, *args, **kwargs):
+        if name in {
+            "torch",
+            "ultralytics",
+            "rfdetr",
+            "sahi",
+            "onnxruntime",
+            "coremltools",
+        }:
+            imported.append(name)
+            if name == "ultralytics":
+                raise AssertionError("doctor retried an unhardened Ultralytics import")
+            raise ImportError(f"simulated absent optional dependency: {name}")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(policy, "harden_ultralytics_runtime", fail_policy_setup)
+    monkeypatch.setattr(builtins, "__import__", inspect_import)
+
+    assert main(["doctor"]) == 0
+    output = capsys.readouterr().out
+    assert "ultralytics    ✗ installed but failed the offline safety policy" in output
+    assert "ultralytics" not in imported
+
+
+def test_doctor_reports_unexpected_optional_import_failure(capsys, monkeypatch):
+    real_import = builtins.__import__
+
+    def import_with_runtime_failure(name, *args, **kwargs):
+        if name == "sahi":
+            raise RuntimeError("simulated import-time failure")
+        if name in {"torch", "ultralytics", "rfdetr", "onnxruntime", "coremltools"}:
+            raise ImportError(f"simulated absent optional dependency: {name}")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", import_with_runtime_failure)
+
+    assert main(["doctor"]) == 0
+    assert (
+        "sahi           ✗ installed but failed to load (runtime error)" in capsys.readouterr().out
+    )
+
+
 def test_cli_default_fusion_sim_matches_the_documented_regression():
     source_root = (Path(__file__).resolve().parents[1] / "src").resolve(strict=True)
     environment = os.environ.copy()
@@ -446,6 +543,38 @@ def test_cli_default_fusion_sim_matches_the_documented_regression():
         "particle         5.61          2.10         4.21\n"
         "imm              9.33          1.88         8.89\n"
     )
+
+
+def test_contract_cli_verifies_and_reports_the_bound_artifact(tmp_path, capsys):
+    receipt, signature = _export_pair(tmp_path)
+    contract = _build_test_contract(receipt, signature)
+    artifact = Path(receipt.artifact_path)
+    sidecar = artifact.with_suffix(".contract.json")
+    sidecar.write_text(contract.to_json(), encoding="utf-8")
+
+    assert main(["contract", str(sidecar)]) == 0
+    output = capsys.readouterr().out
+    assert "model:    manwe-aerial 0.2.0" in output
+    assert "backend:  onnx (ultralytics-raw-detect-v1)" in output
+    assert f"artifact: {artifact.name} [verified]" in output
+    assert contract.file_sha256 in output
+
+    assert main(["contract", str(sidecar), "--json"]) == 0
+    canonical = capsys.readouterr().out
+    assert '"schema_version": "2.0"' in canonical
+    assert '"runtime": {' in canonical
+
+    artifact.write_bytes(b"tampered")
+    with pytest.raises(SystemExit, match="2"):
+        main(["contract", str(sidecar)])
+    assert "SHA-256" in capsys.readouterr().err
+
+
+def test_contract_cli_can_explicitly_validate_metadata_only(tmp_path, capsys):
+    fixture = tmp_path / "model.contract.json"
+    fixture.write_bytes(candle_detect_example_bytes())
+    assert main(["contract", str(fixture), "--no-verify-artifact"]) == 0
+    assert "artifact: model.safetensors [not requested]" in capsys.readouterr().out
 
 
 @pytest.mark.parametrize(
@@ -573,7 +702,7 @@ def test_device_resolution_and_description_isolate_broken_cuda_from_mps(monkeypa
 
         def is_available(self):
             self.calls += 1
-            raise OSError("broken CUDA probe")
+            raise RuntimeError("broken CUDA probe")
 
     class HealthyMps:
         @staticmethod

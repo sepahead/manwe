@@ -1,7 +1,7 @@
 """Offline synthetic data so every pipeline runs with zero downloads.
 
 Generates a tiny YOLO-format detection dataset of coloured shapes standing in for
-the crebain classes, written with a dependency-free PNG encoder. Enough to smoke-
+the Manwe airspace classes, written with a dependency-free PNG encoder. Enough to smoke-
 exercise dataset parsing without touching a real corpus. It does not establish
 model quality or export compatibility. For
 fusion/multi-modal synthetic data use :func:`manwe.fusion.make_scenario`.
@@ -19,8 +19,8 @@ from contextlib import suppress
 
 import numpy as np
 
-from ..common.config_io import open_directory_nofollow
-from ..common.contracts import CREBAIN_CLASSES
+from ..common.config_io import open_directory_nofollow, reject_unmodeled_directory_acl
+from ..common.contracts import AIRSPACE_CLASSES
 from ..common.fd_io import attach_cleanup_failure, owned_binary_writer
 
 MAX_PNG_PIXELS = 32_000_000
@@ -32,6 +32,21 @@ MAX_DATASET_OBJECTS = 5_000_000
 
 def _entry_identity(metadata: os.stat_result) -> tuple[int, int]:
     return metadata.st_dev, metadata.st_ino
+
+
+def _require_owner_mutation_boundary(
+    directory_fd: int,
+    display: pathlib.Path,
+) -> None:
+    """Require a directory that another ordinary account cannot mutate."""
+    metadata = os.fstat(directory_fd)
+    if not stat.S_ISDIR(metadata.st_mode):
+        raise RuntimeError(f"output directory is not a directory: {display}")
+    if metadata.st_uid != os.geteuid():
+        raise PermissionError(f"output directory must be owned by the effective user: {display}")
+    reject_unmodeled_directory_acl(directory_fd, display, "output directory")
+    if metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+        raise PermissionError(f"output directory must not be group- or other-writable: {display}")
 
 
 def _assert_directory_path(
@@ -283,6 +298,13 @@ def _open_or_create_output_root(
                 opened
             ):
                 raise RuntimeError("output directory was replaced while it was being created")
+            # Do not let a permissive caller umask turn a just-created output
+            # chain into a cross-account mutation surface. Intermediate
+            # ancestors may be traversed but never written by other accounts;
+            # the dataset root stays private until every entry is committed.
+            os.fchmod(child_fd, 0o700 if index == len(ordered_missing) - 1 else 0o755)
+            os.fsync(child_fd)
+            os.fsync(current_fd)
             if index == len(ordered_missing) - 1:
                 root_identity = _entry_identity(opened)
                 _assert_directory_path(root, root_identity, "output directory")
@@ -308,11 +330,23 @@ def _open_or_create_output_root(
 
 def write_png(path: str | pathlib.Path, rgb: np.ndarray) -> None:
     """Write an ``(H, W, 3)`` uint8 array as a PNG using only the stdlib."""
-    destination = pathlib.Path(path).expanduser().resolve(strict=False)
+    requested = pathlib.Path(path).expanduser()
     try:
+        try:
+            requested_metadata = requested.lstat()
+        except FileNotFoundError:
+            requested_metadata = None
+        if requested_metadata is not None:
+            raise FileExistsError(f"output path already exists: {requested}")
+        # Resolve only the parent. Symlinked parent directories remain an
+        # explicit convenience, while the final component is always handed to
+        # openat as a literal no-follow basename and can never redirect output.
+        if requested.name in {"", ".", ".."}:
+            raise FileExistsError(f"output path has no filename: {requested}")
+        destination = requested.parent.resolve(strict=False) / requested.name
         _write_exclusive(destination, _encode_png(rgb))
     except FileExistsError as exc:
-        raise FileExistsError(f"refusing to overwrite existing PNG: {destination}") from exc
+        raise FileExistsError(f"refusing to overwrite existing PNG: {requested}") from exc
 
 
 # distinct colours per class so the toy task is learnable
@@ -367,7 +401,18 @@ def make_vision_smoke(
     raw_output = str(out_dir)
     if any(character in raw_output for character in "\0\r\n"):
         raise ValueError("output directory path contains a control character")
-    root = pathlib.Path(out_dir).expanduser().resolve(strict=False)
+    requested_root = pathlib.Path(out_dir).expanduser()
+    try:
+        requested_metadata = requested_root.lstat()
+    except FileNotFoundError:
+        requested_metadata = None
+    if requested_metadata is not None and stat.S_ISLNK(requested_metadata.st_mode):
+        raise FileExistsError(
+            f"output directory must be absent or an actual empty directory: {requested_root}"
+        )
+    if requested_root.name in {"", ".", ".."}:
+        raise FileExistsError(f"output directory must name one final component: {requested_root}")
+    root = requested_root.parent.resolve(strict=False) / requested_root.name
     root_parent_fd: int | None = None
     root_fd: int | None = None
     root_created = False
@@ -376,6 +421,7 @@ def make_vision_smoke(
     rng = np.random.default_rng(seed)
     try:
         root_parent_fd, root_fd, root_identity, root_created = _open_or_create_output_root(root)
+        _require_owner_mutation_boundary(root_fd, root)
         if os.listdir(root_fd):
             raise FileExistsError(f"output directory must be absent or empty: {root}")
 
@@ -401,16 +447,19 @@ def make_vision_smoke(
                 img = rng.integers(20, 60, size=(size, size, 3), dtype=np.uint8)  # dim sky-ish bg
                 lines = []
                 for _ in range(int(rng.integers(1, max_objs + 1))):
-                    cls_i = int(rng.integers(0, len(CREBAIN_CLASSES)))
-                    cls = CREBAIN_CLASSES[cls_i]
+                    cls_i = int(rng.integers(0, len(AIRSPACE_CLASSES)))
+                    cls = AIRSPACE_CLASSES[cls_i]
                     bw = int(rng.integers(size // 12, size // 4))
                     bh = int(rng.integers(size // 12, size // 4))
                     cx = int(rng.integers(bw, size - bw))
                     cy = int(rng.integers(bh, size - bh))
                     x1, y1 = cx - bw // 2, cy - bh // 2
                     img[y1 : y1 + bh, x1 : x1 + bw] = _CLASS_COLORS[cls]
+                    normalized_cx = (x1 + bw / 2.0) / size
+                    normalized_cy = (y1 + bh / 2.0) / size
                     lines.append(
-                        f"{cls_i} {cx / size:.6f} {cy / size:.6f} {bw / size:.6f} {bh / size:.6f}"
+                        f"{cls_i} {normalized_cx:.6f} {normalized_cy:.6f} "
+                        f"{bw / size:.6f} {bh / size:.6f}"
                     )
                 image_name = f"{split}_{i:03d}.png"
                 image_identity = _write_exclusive_at(
@@ -439,7 +488,7 @@ def make_vision_smoke(
                         "path": str(root),
                         "train": "images/train",
                         "val": "images/val",
-                        "names": list(CREBAIN_CLASSES),
+                        "names": list(AIRSPACE_CLASSES),
                     },
                     indent=2,
                 )
@@ -451,7 +500,10 @@ def make_vision_smoke(
         for _parent_fd, _name, child_fd, _identity in reversed(directory_records):
             os.fchmod(child_fd, 0o755)
             os.fsync(child_fd)
+        if root_created:
+            os.fchmod(root_fd, 0o755)
         os.fsync(root_fd)
+        os.fsync(root_parent_fd)
         _assert_directory_path(root, root_identity, "output directory")
         return data_yaml
     except BaseException as error:

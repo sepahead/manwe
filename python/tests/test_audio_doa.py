@@ -77,6 +77,51 @@ def test_acoustic_detection_to_measurement_bridge():
     assert np.all(np.linalg.eigvalsh(m.covariance) > 0)
 
 
+@pytest.mark.parametrize(("elevation", "expected_z"), ((np.pi / 2, 1.0), (-np.pi / 2, -1.0)))
+def test_acoustic_poles_have_no_phantom_horizontal_direction(elevation, expected_z):
+    detection = AcousticDetection(azimuth=1.234, elevation=elevation, range_estimate=10, spl_db=60)
+
+    assert np.array_equal(detection.direction(), np.array([0.0, 0.0, expected_z]))
+
+
+def test_srp_pole_result_has_canonical_zero_azimuth():
+    signals = np.vstack((np.arange(16, dtype=float), np.arange(16, dtype=float)))
+    microphones = np.array([[0.0, 0.0, 0.0], [0.1, 0.0, 0.0]])
+
+    azimuth, elevation, _ = srp_phat(
+        signals,
+        microphones,
+        fs=16_000,
+        az_grid=np.array([-1.0, 1.0]),
+        el_grid=np.array([np.pi / 2]),
+        min_peak_prominence=None,
+    )
+
+    assert azimuth == 0.0
+    assert elevation == np.pi / 2
+
+
+@pytest.mark.parametrize(
+    ("distance", "elevation", "message"),
+    (
+        (0.0, 0.0, "range"),
+        (1e-7, 0.0, "range"),
+        (1e20, np.pi / 2, "vertical axis"),
+        (1e20, -np.pi / 2, "vertical axis"),
+    ),
+)
+def test_acoustic_bridge_rejects_singular_spherical_geometry(distance, elevation, message):
+    detection = AcousticDetection(
+        0.0,
+        elevation,
+        distance,
+        60.0,
+        range_observed=True,
+    )
+    with pytest.raises(ValueError, match=message):
+        detection.to_measurement()
+
+
 def _tetrahedral_mics() -> np.ndarray:
     extent = 0.1
     return np.array(
@@ -98,6 +143,15 @@ def test_stft_pads_short_input_and_rejects_invalid_input():
         stft(np.array([0.0, np.nan]), n_fft=16)
     with pytest.raises(ValueError, match="window"):
         stft(np.ones(16), n_fft=16, window="mystery")
+
+
+def test_stft_unit_frames_are_vectorized_and_exact():
+    signal = np.array([1.0, -2.0, 3.5, 0.25])
+    spectrum = stft(signal, n_fft=1, hop=1, window="boxcar")
+
+    assert spectrum.shape == (1, signal.size)
+    assert np.array_equal(spectrum.real[0], signal)
+    assert np.array_equal(spectrum.imag[0], np.zeros(signal.size))
 
 
 def test_srp_rejects_silence_and_incoherent_noise():
@@ -172,6 +226,28 @@ def test_acoustic_bridge_rotates_position_and_covariance():
     )
     with pytest.raises(ValueError, match="determinant"):
         detection.to_measurement(sensor_rotation=np.diag([1.0, 1.0, -1.0]))
+
+
+def test_acoustic_bridge_canonicalizes_tolerated_rotation_roundoff():
+    detection = AcousticDetection(0.0, 0.0, 10.0, 60.0, range_observed=True)
+    angle = 0.37
+    exact = np.array(
+        [
+            [np.cos(angle), -np.sin(angle), 0.0],
+            [np.sin(angle), np.cos(angle), 0.0],
+            [0.0, 0.0, 1.0],
+        ]
+    )
+    rounded = exact.copy()
+    rounded[0, 0] += 2e-8
+
+    measurement = detection.to_measurement(sensor_rotation=rounded)
+
+    # A rigid transform must preserve the independently observed range exactly
+    # to floating precision; retaining the near-rotation would scale this norm.
+    assert np.isclose(np.linalg.norm(measurement.position), 10.0, rtol=0.0, atol=2e-14)
+    assert np.allclose(measurement.position / 10.0, exact[:, 0], rtol=0.0, atol=2e-8)
+    assert np.all(np.linalg.eigvalsh(measurement.covariance) > 0.0)
 
 
 def test_log_mel_happy_path_is_runtime_warning_free():

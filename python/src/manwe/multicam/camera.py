@@ -259,12 +259,38 @@ def _bounded_angle(value: Any, name: str) -> float:
 def _validate_rotation(rotation: np.ndarray, name: str = "R") -> np.ndarray:
     if np.any(np.abs(rotation) > 1.0 + _ROTATION_ATOL):
         raise ValueError(f"{name} must be orthonormal; entries exceed rotation-matrix bounds")
-    if not np.allclose(rotation @ rotation.T, np.eye(3), rtol=0.0, atol=_ROTATION_ATOL):
+    gram = rotation @ rotation.T
+    if not np.allclose(gram, np.eye(3), rtol=0.0, atol=_ROTATION_ATOL):
         raise ValueError(f"{name} must be orthonormal")
     determinant = float(np.linalg.det(rotation))
     if not np.isclose(determinant, 1.0, rtol=0.0, atol=_ROTATION_ATOL):
         raise ValueError(f"{name} must be a proper rotation with determinant +1")
-    return rotation
+    if np.array_equal(gram, np.eye(3)) and determinant == 1.0:
+        return rotation
+
+    # Project tolerated serialization/calibration roundoff onto SO(3). Leaving a
+    # merely near-orthonormal matrix in the value would make ``R.T`` differ from
+    # its inverse, even though ``center`` and ``backproject_ray`` rely on that
+    # exact rotation invariant. The admission checks above bound this repair to
+    # roundoff-sized changes; materially invalid matrices never reach the SVD.
+    try:
+        left, _singular_values, right_transpose = np.linalg.svd(rotation)
+    except np.linalg.LinAlgError as exc:
+        raise ValueError(f"{name} orthonormalization did not converge") from exc
+    projected = left @ right_transpose
+    if float(np.linalg.det(projected)) < 0.0:
+        left[:, -1] *= -1.0
+        projected = left @ right_transpose
+    if not np.isfinite(projected).all() or not np.allclose(
+        projected @ projected.T,
+        np.eye(3),
+        rtol=0.0,
+        atol=16.0 * np.finfo(np.float64).eps,
+    ):
+        raise ValueError(f"{name} could not be canonicalized as a proper rotation")
+    if not np.isclose(float(np.linalg.det(projected)), 1.0, rtol=0.0, atol=1e-12):
+        raise ValueError(f"{name} could not be canonicalized as a proper rotation")
+    return projected
 
 
 def _reject_unknown_keys(data: Mapping[str, Any], allowed: set[str], name: str) -> None:
@@ -275,11 +301,11 @@ def _reject_unknown_keys(data: Mapping[str, Any], allowed: set[str], name: str) 
 
 
 def _camera_name(value: Any) -> str:
-    if not isinstance(value, str):
+    if type(value) is not str:
         raise ValueError("name must be a string")
-    if any(ord(character) < 0x20 or ord(character) == 0x7F for character in value):
-        raise ValueError("name must not contain control characters")
     name = value.strip()
+    if name and not name.isprintable():
+        raise ValueError("name must contain only printable characters")
     try:
         encoded = name.encode("utf-8")
     except UnicodeEncodeError as exc:
@@ -354,11 +380,16 @@ class Camera:
             raise ValueError("K must have final row [0, 0, 1]")
         if abs(float(intrinsics[1, 0])) > _GEOMETRY_EPS:
             raise ValueError("K must use the standard upper-triangular pinhole form")
+        # Values accepted only through the tolerance are representation noise,
+        # not projective degrees of freedom. Canonicalize them so every later
+        # solve uses the exact pinhole form that this type promises.
+        intrinsics[1, 0] = 0.0
+        intrinsics[2] = [0.0, 0.0, 1.0]
         if intrinsics[0, 0] <= 0 or intrinsics[1, 1] <= 0:
             raise ValueError("K focal lengths must be positive")
         determinant_sign, log_abs_determinant = np.linalg.slogdet(intrinsics)
-        if determinant_sign == 0 or not np.isfinite(log_abs_determinant):
-            raise ValueError("K must be invertible")
+        if determinant_sign <= 0 or not np.isfinite(log_abs_determinant):
+            raise ValueError("K must be invertible with positive orientation")
 
         if width:
             fov_x = float(np.degrees(2.0 * np.arctan(width / (2.0 * intrinsics[0, 0]))))
@@ -683,7 +714,7 @@ class CameraRig:
         if len(self.cameras) > max_cameras:
             raise ValueError("rig camera count exceeds max_cameras")
         cameras = tuple(self.cameras)
-        if any(not isinstance(camera, Camera) for camera in cameras):
+        if any(type(camera) is not Camera for camera in cameras):
             raise TypeError("cameras must contain only Camera instances")
         names = [camera.name for camera in cameras]
         if any(not name for name in names):

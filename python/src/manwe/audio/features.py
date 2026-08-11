@@ -6,6 +6,8 @@ from typing import Any
 
 import numpy as np
 
+from ..common.numeric import finite_float64_scalar, widen_to_float64
+
 MAX_SIGNAL_SAMPLES = 10_000_000
 MAX_FFT_POINTS = 1_048_576
 MAX_SPECTRUM_CELLS = 16_000_000
@@ -22,15 +24,10 @@ def _positive_int(value: Any, name: str) -> int:
 def _finite_scalar(
     value: Any, name: str, *, positive: bool = False, nonnegative: bool = False
 ) -> float:
-    if isinstance(value, bool) or not isinstance(value, (int, float, np.integer, np.floating)):
-        raise ValueError(f"{name} must be a finite number")
     try:
-        with np.errstate(over="ignore", invalid="ignore"):
-            value = float(np.float64(value))
-    except (TypeError, ValueError, OverflowError) as exc:
+        value = finite_float64_scalar(value, name)
+    except ValueError as exc:
         raise ValueError(f"{name} must be representable as a finite float") from exc
-    if not np.isfinite(value):
-        raise ValueError(f"{name} must be representable as a finite float")
     if positive and value <= 0:
         raise ValueError(f"{name} must be > 0")
     if nonnegative and value < 0:
@@ -50,9 +47,8 @@ def _raw_real_array(value: Any, name: str) -> np.ndarray:
 
 def _float_array(raw: np.ndarray, name: str) -> np.ndarray:
     try:
-        with np.errstate(over="ignore", invalid="ignore"):
-            return np.asarray(raw, dtype=float)
-    except (TypeError, ValueError, OverflowError) as exc:
+        return widen_to_float64(raw, name, validate_exact_integers=True)
+    except ValueError as exc:
         raise ValueError(f"{name} must contain real numeric values") from exc
 
 
@@ -78,11 +74,11 @@ def stft(signal: np.ndarray, n_fft: int = 1024, hop: int = 256, window: str = "h
     A non-empty signal shorter than ``n_fft`` is zero-padded to one complete
     frame. Empty and non-finite inputs are rejected explicitly.
     """
-    signal = _finite_signal(signal)
     n_fft = _positive_int(n_fft, "n_fft")
     hop = _positive_int(hop, "hop")
     if n_fft > MAX_FFT_POINTS:
         raise ValueError(f"n_fft exceeds the {MAX_FFT_POINTS}-point safety limit")
+    signal = _finite_signal(signal)
     win = _window(window, n_fft)
     if signal.size < n_fft:
         signal = np.pad(signal, (0, n_fft - signal.size))
@@ -90,11 +86,15 @@ def stft(signal: np.ndarray, n_fft: int = 1024, hop: int = 256, window: str = "h
     if n_frames * (n_fft // 2 + 1) > MAX_SPECTRUM_CELLS:
         raise ValueError(f"STFT output exceeds the {MAX_SPECTRUM_CELLS}-value safety limit")
     with np.errstate(over="ignore", invalid="ignore"):
-        frames = np.stack(
-            [signal[index * hop : index * hop + n_fft] * win for index in range(n_frames)],
-            axis=1,
-        )
-        spectrum = np.fft.rfft(frames, axis=0)
+        # A list comprehension creates one ndarray object per frame.  At the
+        # admitted n_fft=1 boundary that would mean ten million Python objects
+        # even though the numeric output itself is bounded.  Keep framing as a
+        # view and allocate only the bounded windowed matrix and FFT result.
+        frames = np.lib.stride_tricks.sliding_window_view(signal, n_fft)[::hop]
+        if frames.shape != (n_frames, n_fft):  # pragma: no cover - NumPy invariant guard
+            raise RuntimeError("STFT frame view does not match the computed output shape")
+        windowed = frames * win[np.newaxis, :]
+        spectrum = np.fft.rfft(windowed, axis=1).T
     if not np.isfinite(spectrum).all():
         raise ValueError("signal magnitude overflows the STFT")
     return spectrum
@@ -177,10 +177,10 @@ def log_mel_spectrogram(
 ) -> np.ndarray:
     """Log-mel spectrogram in dB, floored ``top_db`` below its peak."""
     top_db = _finite_scalar(top_db, "top_db", positive=True)
-    spectrum = stft(signal, n_fft, hop)
     n_mels = _positive_int(n_mels, "n_mels")
     if n_mels > MAX_MEL_BANDS:
         raise ValueError(f"n_mels exceeds the {MAX_MEL_BANDS}-band safety limit")
+    spectrum = stft(signal, n_fft, hop)
     n_frequencies, n_frames = spectrum.shape
     if n_mels * n_frames > MAX_SPECTRUM_CELLS:
         raise ValueError(f"log-mel output exceeds the {MAX_SPECTRUM_CELLS}-value safety limit")

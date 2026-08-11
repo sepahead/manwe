@@ -7,6 +7,7 @@ from typing import Any
 
 import numpy as np
 
+from ..common.numeric import validated_psd_covariance
 from .camera import (
     Camera,
     _admit_fixed_array,
@@ -93,7 +94,7 @@ def _preflight_inputs(
         raise ValueError("triangulation view count exceeds max_cameras")
     if 2 * view_count > _MAX_TRIANGULATION_COORDINATES:
         raise ValueError("triangulation coordinate work exceeds the supported bound")
-    if any(not isinstance(camera, Camera) for camera in cameras):
+    if any(type(camera) is not Camera for camera in cameras):
         raise TypeError("cameras must contain only Camera instances")
     for index, pixel in enumerate(pixels):
         _preflight_fixed_shape(pixel, f"pixels[{index}]", (2,))
@@ -267,8 +268,8 @@ def triangulate_midpoint(
     cross = np.cross(first_direction, second_direction)
     denominator = float(cross @ cross)
     if denominator < 1e-15:
-        if require_forward:
-            raise ValueError("parallel rays do not define a finite forward intersection")
+        if require_forward or max_range_m is not None:
+            raise ValueError("parallel rays do not define a finite constrained intersection")
         perpendicular = offset - (offset @ first_direction) * first_direction
         midpoint = 0.5 * (first_origin + second_origin)
         return midpoint, _stable_norm(perpendicular)
@@ -418,28 +419,11 @@ def triangulation_covariance(
     covariance = weighted_jacobian @ weighted_jacobian.T
     if not np.isfinite(covariance).all():
         raise ValueError("triangulation covariance is non-finite")
-    covariance = 0.5 * covariance + 0.5 * covariance.T
-    if not np.isfinite(covariance).all():
-        raise ValueError("triangulation covariance symmetrization is non-finite")
-    scale = max(1.0, float(np.max(np.abs(covariance))))
-    normalized = covariance / scale
-    try:
-        values, vectors = np.linalg.eigh(normalized)
-    except np.linalg.LinAlgError as exc:
-        raise ValueError("triangulation covariance eigendecomposition did not converge") from exc
-    if not np.isfinite(values).all() or not np.isfinite(vectors).all():
-        raise ValueError("triangulation covariance eigendecomposition is non-finite")
-    if float(values[0]) < -1e-10:
-        raise ValueError("triangulation covariance is not positive semidefinite")
-    if values[0] < 0.0:
-        normalized = vectors @ np.diag(np.maximum(values, 0.0)) @ vectors.T
-        normalized = 0.5 * normalized + 0.5 * normalized.T
-        covariance = normalized * scale
-        if not np.isfinite(covariance).all():
-            raise ValueError("triangulation covariance repair is non-finite")
-    if float(np.trace(normalized)) <= 0.0:
-        raise ValueError("triangulation covariance has no measurable uncertainty")
-    return covariance
+    return validated_psd_covariance(
+        covariance,
+        "triangulation covariance",
+        require_nonzero=True,
+    )
 
 
 __all__ = [

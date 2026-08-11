@@ -1,4 +1,4 @@
-"""Vision postprocessing + crebain mapping (torch-free)."""
+"""Vision postprocessing + Manwe airspace mapping (torch-free)."""
 
 from types import SimpleNamespace
 
@@ -9,6 +9,7 @@ from manwe.common.device import Device
 from manwe.vision import (
     Detection,
     Detector,
+    airspace_class_map,
     crebain_class_map,
     letterbox_params,
     nms,
@@ -17,6 +18,7 @@ from manwe.vision import (
     scale_boxes,
     xywh2xyxy,
 )
+from manwe.vision.sahi_infer import _sahi_predictions_to_detections
 
 
 def test_letterbox_params_centre_pad():
@@ -65,10 +67,10 @@ def test_nms_suppresses_overlaps():
     assert 1 not in keep
 
 
-def test_crebain_class_map_from_coco_and_native():
-    coco = crebain_class_map({4: "airplane", 14: "bird", 2: "car"})
+def test_airspace_class_map_from_coco_and_native_with_legacy_alias():
+    coco = airspace_class_map({4: "airplane", 14: "bird", 2: "car"})
     assert coco == {4: 2, 14: 1}  # airplane→aircraft(2), bird→bird(1); car dropped
-    native = crebain_class_map({0: "drone", 1: "helicopter"})
+    native = airspace_class_map({0: "drone", 1: "helicopter"})
     assert native == {0: 0, 1: 3}
     normalized = crebain_class_map({0: "  DRONE\t", 4: " AirPlane "})
     assert normalized == {0: 0, 4: 2}
@@ -80,8 +82,62 @@ def test_results_to_detections_drops_unmapped():
     cls = np.array([0, 1])  # 0→"drone", 1→"car" (dropped)
     dets = results_to_detections(boxes, confs, cls, {0: "drone", 1: "car"})
     assert len(dets) == 1
+    assert dets[0].airspace_class == "drone"
     assert dets[0].crebain_class == "drone"
     assert dets[0].class_index == 0
+
+    legacy_keyword = Detection(
+        np.array([0.0, 0.0, 1.0, 1.0]),
+        0.5,
+        class_index=0,
+        crebain_class="drone",
+    )
+    assert legacy_keyword.airspace_class == "drone"
+
+
+def test_results_to_detections_rejects_backend_class_outside_declared_table():
+    with pytest.raises(ValueError, match="outside the declared model class table"):
+        results_to_detections(
+            np.array([[0.0, 0.0, 10.0, 10.0]]),
+            np.array([0.9]),
+            np.array([2]),
+            {0: "drone", 1: "car"},
+        )
+
+
+def test_results_to_detections_enforces_the_source_image_geometry_when_known():
+    edge_box = np.array([[0.0, 0.0, 20.0, 10.0]])
+    detections = results_to_detections(
+        edge_box,
+        np.array([0.9]),
+        np.array([0]),
+        {0: "drone"},
+        image_hw=(10, 20),
+    )
+    assert len(detections) == 1
+
+    for malformed in (
+        np.array([[-0.1, 0.0, 1.0, 1.0]]),
+        np.array([[0.0, 0.0, 20.1, 10.0]]),
+        np.array([[0.0, 0.0, 20.0, 10.1]]),
+    ):
+        with pytest.raises(ValueError, match="source image bounds"):
+            results_to_detections(
+                malformed,
+                np.array([0.9]),
+                np.array([0]),
+                {0: "drone"},
+                image_hw=(10, 20),
+            )
+
+    with pytest.raises(ValueError, match="image_hw"):
+        results_to_detections(
+            edge_box,
+            np.array([0.9]),
+            np.array([0]),
+            {0: "drone"},
+            image_hw=(True, 20),
+        )
 
 
 def test_detection_multicam_bridge_requires_explicit_geometry_uncertainty():
@@ -335,6 +391,7 @@ def test_detector_bounds_backend_output_before_any_device_to_host_copy():
             raise AssertionError("oversized backend output must not be copied to the host")
 
     class BackendModel:
+        task = "detect"
         names = {0: "drone"}
 
         def predict(self, _image, **kwargs):
@@ -351,6 +408,7 @@ def test_detector_bounds_backend_output_before_any_device_to_host_copy():
     detector = Detector.__new__(Detector)
     detector._closed = False
     detector.model = BackendModel()
+    detector._model_names = ("drone",)
     detector.device = Device("cpu")
     detector.conf = 0.25
     detector.iou = 0.45
@@ -367,3 +425,19 @@ def test_resolve_ultralytics_device():
     assert resolve_ultralytics_device(Device("cuda", index=1)) == "1"
     assert resolve_ultralytics_device(Device("mps")) == "mps"
     assert resolve_ultralytics_device(Device("cpu")) == "cpu"
+
+
+def test_sahi_predictions_are_converted_to_owned_manwe_detections():
+    prediction = SimpleNamespace(
+        bbox=SimpleNamespace(to_xyxy=lambda: [1.0, 2.0, 5.0, 7.0]),
+        score=SimpleNamespace(value=0.8),
+        category=SimpleNamespace(id=0, name="drone"),
+    )
+    converted = _sahi_predictions_to_detections([prediction], {0: "drone"}, image_hw=(10, 10))
+    assert len(converted) == 1
+    assert converted[0].airspace_class == "drone"
+    np.testing.assert_array_equal(converted[0].bbox, [1.0, 2.0, 5.0, 7.0])
+
+    prediction.category.name = "bird"
+    with pytest.raises(ValueError, match="disagrees"):
+        _sahi_predictions_to_detections([prediction], {0: "drone"}, image_hw=(10, 10))

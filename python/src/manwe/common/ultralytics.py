@@ -36,9 +36,11 @@ def _blocked_download(*_args, **_kwargs):
 
 def _offline_is_url(url, check: bool = False) -> bool:
     """Recognize URL syntax without ever probing the network."""
+    if type(url) is not str or type(check) is not bool:
+        return False
     try:
-        result = parse.urlparse(str(url))
-    except Exception:
+        result = parse.urlparse(url)
+    except ValueError:
         return False
     syntactically_valid = bool(result.scheme and result.netloc)
     return syntactically_valid and not check

@@ -74,6 +74,11 @@ def test_measurement_rejects_radar_azimuth_singularity(elevation):
         Measurement("radar", [1.0, 0.0, elevation], [1.0, 1e-3, 1e-3], 0.0)
 
 
+def test_measurement_rejects_exact_vertical_axis_even_at_huge_range():
+    with pytest.raises(ValueError, match="singular"):
+        Measurement("radar", [1e20, 0.0, np.pi / 2], [1.0, 1e-3, 1e-3], 0.0)
+
+
 @pytest.mark.parametrize("elevation", [-np.pi / 2 - 1e-12, np.pi / 2 + 1e-12, 1e300])
 def test_measurement_rejects_noncanonical_radar_elevation(elevation):
     with pytest.raises(ValueError, match="elevation"):
@@ -185,6 +190,35 @@ def test_single_measurement_covariance_seeds_track():
     covariance = np.diag([4.0, 9.0, 16.0])
     tracker.step([Measurement("visual", [1.0, 2.0, 3.0], covariance, 0.0)], 0.0)
     assert np.allclose(tracker.tracks[0].filt.state.P[:3, :3], covariance)
+
+
+def test_lost_track_releases_capacity_before_same_cycle_birth():
+    tracker = MultiSensorTracker(
+        TrackerConfig(
+            confirm_hits=1,
+            confirm_window=1,
+            coast_after_misses=1,
+            max_missed_in_window=1,
+            max_tracks=1,
+            gate_chi2=1.0,
+            init_merge_dist=0.0,
+            sigma_a=0.0,
+        )
+    )
+    tracker.step(
+        [Measurement("visual", [0.0, 0.0, 0.0], [1.0, 1.0, 1.0], 0.0)],
+        0.0,
+    )
+
+    outputs = tracker.step(
+        [Measurement("visual", [100.0, 0.0, 0.0], [1.0, 1.0, 1.0], 1.0)],
+        1.0,
+    )
+
+    assert len(tracker.tracks) == 1
+    assert tracker.tracks[0].id == 2
+    assert np.array_equal(tracker.tracks[0].filt.state.position, [100.0, 0.0, 0.0])
+    assert [output.id for output in outputs] == [2]
 
 
 def test_birth_clustering_never_merges_two_hits_from_the_same_modality():
@@ -894,3 +928,78 @@ def test_association_rejects_bad_covariance_and_gate_results():
         associate([Track()], position, np.array([np.diag([1.0, -1.0, 1.0])]))
     with pytest.raises(ValueError, match="invalid gating distance"):
         associate([Track()], position, np.array([np.eye(3)]))
+    with pytest.raises(ValueError, match="real numeric"):
+        associate([Track()], np.ones((1, 3), dtype=bool), np.array([np.eye(3)]))
+    with pytest.raises(ValueError, match="real numeric"):
+        associate([Track()], position, np.ones((1, 3, 3), dtype=bool))
+
+
+@pytest.mark.parametrize(
+    "covariance, message",
+    [
+        (
+            np.array(
+                [
+                    [1e-300, 2e-300, 0.0],
+                    [2e-300, 1e-300, 0.0],
+                    [0.0, 0.0, 1e-300],
+                ]
+            ),
+            "positive semidefinite",
+        ),
+        (
+            np.array(
+                [
+                    [1e-300, 0.9e-300, 0.0],
+                    [-0.9e-300, 1e-300, 0.0],
+                    [0.0, 0.0, 1e-300],
+                ]
+            ),
+            "symmetric",
+        ),
+        (
+            np.array(
+                [
+                    [0.0, np.nextafter(0.0, 1.0), 0.0],
+                    [np.nextafter(0.0, 1.0), 1.0, 0.0],
+                    [0.0, 0.0, 1.0],
+                ]
+            ),
+            "zero variances",
+        ),
+    ],
+)
+def test_association_covariance_validation_is_scale_invariant(covariance, message):
+    class Track:
+        def gating_distance(self, _position, _covariance):
+            return 0.0
+
+    with pytest.raises(ValueError, match=message):
+        associate(
+            [Track()],
+            np.array([[0.0, 0.0, 0.0]]),
+            covariance[np.newaxis, :, :],
+        )
+
+
+def test_association_validation_never_mutates_caller_arrays():
+    class Track:
+        def gating_distance(self, _position, _covariance):
+            return 0.0
+
+    positions = np.array([[0.0, 0.0, 0.0]])
+    covariance = np.array(
+        [
+            [1.0, 0.5, 0.0],
+            [np.nextafter(0.5, 1.0), 1.0, 0.0],
+            [0.0, 0.0, 1.0],
+        ]
+    )[np.newaxis, :, :]
+    expected_positions = positions.copy()
+    expected_covariance = covariance.copy()
+    positions.flags.writeable = False
+    covariance.flags.writeable = False
+
+    assert associate([Track()], positions, covariance) == ([(0, 0)], [], [])
+    assert np.array_equal(positions, expected_positions)
+    assert np.array_equal(covariance, expected_covariance)

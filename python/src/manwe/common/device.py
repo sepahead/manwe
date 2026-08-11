@@ -26,15 +26,19 @@ class Device:
     autocast_dtype: str = "float32"
 
     def __post_init__(self) -> None:
-        if self.kind not in {"cuda", "mps", "cpu"}:
+        if type(self.kind) is not str or self.kind not in {"cuda", "mps", "cpu"}:
             raise ValueError(f"unsupported device kind {self.kind!r}")
         if type(self.index) is not int or self.index < 0:
             raise ValueError("device index must be a nonnegative integer")
         if self.kind != "cuda" and self.index != 0:
             raise ValueError("only CUDA devices may have a nonzero index")
-        if not isinstance(self.name, str):
+        if type(self.name) is not str:
             raise TypeError("device name must be a string")
-        if self.autocast_dtype not in {"float32", "float16", "bfloat16"}:
+        if type(self.autocast_dtype) is not str or self.autocast_dtype not in {
+            "float32",
+            "float16",
+            "bfloat16",
+        }:
             raise ValueError("unsupported autocast dtype")
 
     @property
@@ -77,7 +81,7 @@ def resolve_device(prefer: str = "auto", *, allow_fallback: bool = False) -> Dev
         if kind not in {"auto", "cpu"} and not allow_fallback:
             raise RuntimeError(f"requested {prefer!r}, but torch is not installed") from None
         return Device(kind="cpu", name="torch not installed")
-    except OSError as exc:
+    except (OSError, RuntimeError) as exc:
         # A broken install (missing shared objects, bad CUDA libs) is exactly what
         # `manwe doctor` exists to surface, so 'auto'/allow_fallback degrade to CPU
         # here just as they do for a missing torch. An explicit accelerator request
@@ -121,14 +125,14 @@ def resolve_device(prefer: str = "auto", *, allow_fallback: bool = False) -> Dev
                 raise RuntimeError(
                     f"requested {prefer!r}, but only {available} CUDA device(s) are available"
                 )
-        except OSError as exc:
+        except (OSError, RuntimeError) as exc:
             if not allow_fallback:
                 raise RuntimeError(f"torch CUDA probing failed: {exc}") from exc
             probe_failed = True
         try:
             if mps_is_available():
                 return Device(kind="mps", name="Apple Metal (MPS)", autocast_dtype="float32")
-        except OSError:
+        except (OSError, RuntimeError):
             probe_failed = True
     elif kind == "mps":
         try:
@@ -136,25 +140,25 @@ def resolve_device(prefer: str = "auto", *, allow_fallback: bool = False) -> Dev
                 return Device(kind="mps", name="Apple Metal (MPS)", autocast_dtype="float32")
             if not allow_fallback:
                 raise RuntimeError("requested 'mps', but the MPS backend is unavailable")
-        except OSError as exc:
+        except (OSError, RuntimeError) as exc:
             if not allow_fallback:
                 raise RuntimeError(f"torch MPS probing failed: {exc}") from exc
             probe_failed = True
         try:
             if torch.cuda.is_available() and torch.cuda.device_count() > 0:
                 return resolved_cuda(0)
-        except OSError:
+        except (OSError, RuntimeError):
             probe_failed = True
     else:
         try:
             if torch.cuda.is_available() and torch.cuda.device_count() > 0:
                 return resolved_cuda(0)
-        except OSError:
+        except (OSError, RuntimeError):
             probe_failed = True
         try:
             if mps_is_available():
                 return Device(kind="mps", name="Apple Metal (MPS)", autocast_dtype="float32")
-        except OSError:
+        except (OSError, RuntimeError):
             probe_failed = True
 
     if probe_failed:
@@ -163,7 +167,7 @@ def resolve_device(prefer: str = "auto", *, allow_fallback: bool = False) -> Dev
 
 
 def _parse_prefer(prefer: str) -> tuple[str, int]:
-    if not isinstance(prefer, str):
+    if type(prefer) is not str:
         raise TypeError("device preference must be a string")
     prefer = prefer.strip().lower()
     if not prefer:
@@ -203,7 +207,7 @@ def describe_hardware() -> dict[str, object]:
         import torch
     except ImportError:
         return info
-    except OSError as exc:
+    except (OSError, RuntimeError) as exc:
         info["torch_error"] = str(exc)
         return info
 
@@ -219,13 +223,13 @@ def describe_hardware() -> dict[str, object]:
                 "version": getattr(torch.version, "cuda", None),
                 "bf16": torch.cuda.is_bf16_supported(),
             }
-    except OSError as exc:
+    except (OSError, RuntimeError) as exc:
         probe_errors.append(str(exc))
     try:
         mps = getattr(torch.backends, "mps", None)
         if mps is not None and mps.is_available():
             info["mps"] = {"available": True, "built": mps.is_built()}
-    except OSError as exc:
+    except (OSError, RuntimeError) as exc:
         probe_errors.append(str(exc))
     if probe_errors:
         info["torch_error"] = "; ".join(probe_errors)

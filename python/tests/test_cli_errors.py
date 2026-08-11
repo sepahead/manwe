@@ -16,6 +16,11 @@ import manwe.cli as cli
         (["fusion-sim", "--duration", "1"], "duration must be finite and >= 1.5"),
         (["fusion-sim", "--p-detect", "2"], "p-detect must be finite and in [0, 1]"),
         (["fusion-sim", "--modalities", "sonar"], "invalid choice"),
+        (["fusion-sim", "--filters", "kalman", "kalman"], "filters must not contain duplicates"),
+        (
+            ["fusion-sim", "--modalities", "visual", "visual"],
+            "modalities must not contain duplicates",
+        ),
         (
             [
                 "export",

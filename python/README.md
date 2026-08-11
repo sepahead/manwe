@@ -1,118 +1,136 @@
-# manwe (Python training ground)
+# Manwe Python training ground
 
-The Python package for Manwe: detector-training experiments, microphone-array
-direction-of-arrival, multi-camera triangulation, evaluation, and an independent
-multi-target fusion reference. Raw ONNX/CoreML/TensorRT conversion tools are
-available through optional dependencies; MLX conversion is not implemented.
+The `manwe-perception` distribution contains Manwe’s detector experiments,
+microphone-array direction-of-arrival, multi-camera geometry, independent
+multi-target fusion reference, evaluation, raw conversion, and schema-2 contract
+tooling. The import package and command are both `manwe`.
 
-Crebain is an intended consumer, not a drop-in runtime. Its class heads, artifact
-types, preprocessing and measurement schemas differ by backend. Galadriel,
-Engram/NCP, Prisoma and pid-rs also require explicit sequence/frame/shape or
-statistical adapters. Treat all generated artifacts as candidates until the
-root-level compatibility gates pass.
+The numerical core uses NumPy. Heavy ML runtimes are optional and imported only
+at their execution boundaries. Raw ONNX, CoreML, and TensorRT conversion is
+implemented; MLX conversion is not.
 
-The **core** (fusion, geometry, DOA, metrics, contracts) is pure-numpy and runs
-without ML runtimes on the tested Linux/macOS hosts. Windows is not an alpha
-release target because artifact/config publication currently relies on POSIX
-descriptor-relative I/O. Training and raw conversion dependencies are lazy
-optional extras; platform runtimes such as TensorRT are installed separately.
-
-Multi-camera position covariance currently propagates detection-pixel
-localization noise conditional on analytically exact camera intrinsics and
-extrinsics. It does not model calibration-parameter uncertainty or bias. The
-correlation boundary therefore requires `calibration_is_exact=True`; real
-estimated rigs fail closed until that covariance is supported.
-
-The distribution is named `manwe-perception`; the import package and CLI command
-remain `manwe`. Alpha artifacts are built for source/GitHub release validation and
-are not published under the unrelated `manwe` project on PyPI. That legacy project
-also owns the `manwe` import and command, so do not co-install it; use the isolated
-`uv` environment created by this checkout.
+## Environment
 
 ```bash
-uv sync --locked --extra dev                    # core, CLI, tests, lint, and typing
-uv sync --locked --extra vision --extra export # vetted local-only training/export adapters
-uv sync --locked --extra rfdetr                # exact RF-DETR 1.8.3 construction contract
-uv sync --locked --extra all --extra dev       # supported optional stack + tooling
+uv sync --locked --extra dev
+uv sync --locked --extra vision --extra export
+uv sync --locked --extra rfdetr
+uv sync --locked --extra all --extra dev
 
-uv run --locked --no-sync -- .venv/bin/manwe doctor      # hardware + installed extras
-uv run --locked --no-sync -- .venv/bin/manwe fusion-sim  # synthetic filter comparison
+uv run --locked --no-sync -- .venv/bin/manwe doctor
+uv run --locked --no-sync -- .venv/bin/manwe fusion-sim
 PYTHONWARNINGS=error uv run --locked --no-sync -- \
-  .venv/bin/python -m pytest tests  # core suite + config-contract dependency
+  .venv/bin/python -m pytest tests
 ```
 
-The example YAML files under `configs/` are repository fixtures and are not wheel
-package data. Source/GitHub quick starts assume a checkout; wheel users must pass
-their own explicit local config and dataset manifest.
+Python 3.10–3.14 is supported for the core. Python 3.11–3.12 is the conservative
+heavy-runtime path. Windows is not an alpha release target for workflows that
+require POSIX descriptor-relative file guarantees.
 
-The checked-in trainers construct model architectures without pretrained weights.
-Backend-managed downloads are disabled, and no digest-bound local-checkpoint
-fine-tuning adapter is implemented yet. Training therefore starts from random
-initialization; treat the resulting weights as experimental candidates.
+The YAML files under `configs/` are source-checkout/sdist fixtures, not wheel
+package data. Wheel users provide their own local config and dataset manifest.
+The wheel does ship the non-executable schema example under `manwe.schemas`.
 
-Backend-managed model downloads are disabled. Runtime inference/export requires a
-local artifact, exact SHA-256, and an explicit acknowledgement for pickle-backed
-checkpoints. Ultralytics runtime installation, analytics, and network downloads
-are disabled; dataset YAML is replaced with a private directive-free snapshot.
-Raw export also requires an unoccupied caller-selected destination and returns an
-`ExportReceipt`; a manifest requires separately inspected tensor-signature evidence.
-TensorRT INT8 export additionally copies the bounded calibration tree into a
-read-only private snapshot. The ≥1,000-image floor applies to unique, fully
-decodable 3-channel `uint8` `val` tensors after the pinned resize/letterbox path,
-rather than filename suffixes or unrelated splits. Candidates require matching
-suffix/content, identity EXIF orientation, and bounded encoded/decoded work. The
-pinned backend receives a deterministic hash-ranked 512-image,
-label/cache/adjacent-array-free private view with batch 1 and fraction 1.0.
-Ultralytics cache I/O and network URL probes are disabled, and its process-global
-`bgr=0` validation formatting is serialized and deterministic only during
-calibration. This makes the consumed set stable across the legacy TensorRT
-calibrator and TensorRT 11 ModelOpt. Export fails if
-TensorRT reports the capability state that makes Ultralytics silently build FP32.
-The receipt digest binds the TensorRT version/route, loader policy, `imgsz`,
-validated inventory, exact tree, and normalized source manifest. The caller-visible
-manifest file and its declared source tree are pinned and rechecked through
-descriptor-relative POSIX I/O before publication. Dataset roots and splits must be
-absolute or descendant-relative, with nonempty `train` and `val` selections. Every
-selected split tree is descriptor-inventoried under aggregate entry and byte
-limits: traversal rejects `..`, nested symlinks, and special entries, while
-regular-file identities must be unique both within and across splits. Opposite-
-order aggregate inventories reject changes during admission. This is a technical
-hygiene contract, not
-proof that the images represent the deployment domain or that every engine layer
-executes in INT8; `precision="int8"` records the requested mixed-precision route.
-Retain separate dataset provenance, engine-inspector, and fidelity evidence.
-TensorRT 11 preflights locally installed `nvidia-modelopt>=0.44`, binds its exact
-version into the digest, and rejects image sizes whose conservative 10×
-tensor-materialization estimate exceeds 8 GiB. That version and route are not
-yet explicit receipt fields, so retain the build environment record.
-The descriptor boundary is not an operating-system filesystem snapshot: mutation
-after a source path's final admission check, privileged mount changes, SHA-256
-collisions, and malicious same-UID mutation of the process-owned private loader
-tree during backend reads require an isolated build worker or stronger OS
+## CLI
+
+```bash
+manwe doctor
+manwe models --track accuracy
+manwe data
+manwe synth /tmp/manwe-smoke
+manwe fusion-sim
+manwe vision-train configs/vision/aerial.yaml
+
+manwe export /abs/best.pt -f onnx \
+  --weights-sha256 <64-hex> --allow-pickle-checkpoint \
+  --output /abs/candidate.onnx --allow-unverified
+
+manwe contract /abs/candidate.contract.json
+manwe contract /abs/candidate.contract.json --json
+```
+
+`--allow-pickle-checkpoint` acknowledges the code-execution risk of loading the
+exact digest-bound checkpoint. `--allow-unverified` acknowledges that conversion
+only produced raw bytes. A trusted model handoff still needs backend inspection,
+`VerifiedArtifactSignature`, schema-2 contract construction, fidelity evidence,
+and the target runtime/consumer fixture.
+
+Here “signature” is tensor-interface evidence, not cryptographic authorship.
+
+## Training data boundary
+
+Detection manifests are local-only and directive-free. Admission rejects escape
+paths, nested symlinks, special entries, overlapping roots, and duplicate/hardlink
+file identities within or across train/validation/test selections under aggregate
+entry and byte limits.
+
+Admission does not freeze caller-owned storage. Immediately before training,
+Manwe repeats validation, copies the bounded tree into a private read-only
+snapshot while checking split identities against the copier's exact descriptor
+inventory, writes a normalized private manifest, and gives only those paths to
+Ultralytics. Every backend-visible still image is authenticated as single-frame,
+identity-orientation, suffix/content-matched input with bounded encoded and real
+decoded dimensions before model construction. Present Ultralytics labels must be
+stable, bounded UTF-8 five-column detection rows with finite classes and
+normalized positive boxes contained by the image, and its pinned image-to-label mapping must be
+one-to-one. RF-DETR receives an equivalent private directory snapshot and must
+match its COCO dimensions and boxes to the actual image headers. Both private trees are re-authenticated after the backend
+returns.
+
+TensorRT INT8 calibration additionally validates the exact decoded `val` tensor
+semantics. It requires at least 1,000 unique effective images and exposes a
+deterministic hash-ranked 512-image private view with cache, URL, optional-codec,
+label, and adjacent-array side channels disabled. The digest binds loader policy,
+image size, normalized manifest, validated inventory, exact tree, and audited
+TensorRT/ModelOpt route. This establishes reproducibility and work bounds, not
+domain representativeness or proof that every engine layer is INT8.
+
+Privileged mount changes, SHA-256 collisions, or a hostile same-account process
+mutating Manwe’s own private tree still require an isolated worker or stronger OS
 containment.
-Contract JSON/Markdown sidecars use an adjacent private
-`.manwe-contract-*.in-progress` stage and no-replace hard links. If publication
-fails after either final link appears, Manwe deliberately preserves the final paths;
-failures detected before marker removal also preserve the marker for manual recovery.
-A successful return requires both final links to be durable and verified and the
-private marker removal to be synced. Authenticated cleanup failure preserves the
-marker and reports an error; its commit check revalidates the parent path, signed
-artifact, and both final sidecars immediately before removal. A parent-fsync failure
-after marker removal reports an indeterminate commit instead: finals are retained,
-the marker is currently absent, and a crash may restore it. Manwe never cleans final
-pathnames; active same-UID races against private-stage cleanup are outside the POSIX
-boundary.
 
-RF-DETR's upstream `train` extra currently installs both `opencv-python` and
-`opencv-python-headless`, which overwrite the same `cv2` package. Manwe therefore
-does not include that ambiguous extra in its lock; RF-DETR training requires a
-separately curated environment with exactly one OpenCV distribution. The adapter
-is pinned to the installed RF-DETR 1.8.3 contract. Do not infer support for a newer
-1.8 patch without a new installed-runtime review. CI checks the API and Manwe's
-argument mapping; it does not execute or qualify a training run or environment.
+## Model boundary
 
-Full documentation lives in the repository root: see `../README.md`,
-`../docs/ARCHITECTURE.md`, `../docs/INTEGRATION_CREBAIN.md`, and
-`../docs/MODEL_CONTRACTS.md`. The fidelity report emits threshold-specific
-AP50/AP50-small (not COCO mAP@[.50:.95]) and also gates deployed-threshold
-precision/recall/FPPI plus direct per-frame/class box and score agreement.
+The checked-in trainers construct architectures from random initialization.
+Backend-managed downloads are disabled, and no digest-bound local-checkpoint
+fine-tuning adapter is implemented. Generated weights are experimental candidates.
+Trainer output directories are backend-owned working state rather than an atomic
+Manwe publication surface; authenticate the exact selected checkpoint by SHA-256
+before passing it to inference or export.
+
+Python checkpoint inference is a digest-bound research wrapper. It is distinct
+from the native schema-2 runtime. Direct and sliced inference validate the
+checkpoint's detection task and complete class table around execution, reject
+out-of-image or malformed backend output, and return owned immutable Manwe
+`Detection` records rather than backend-owned result objects. A schema-2 contract
+binds a portable sibling artifact name and digest to exact tensors, typed
+preprocessing/decoding, source classes, optional Manwe airspace mapping, and
+postprocessing.
+
+The Rust CLI/viewer execute only the reviewed Candle adapters. Python can produce
+contracts for raw ONNX/CoreML/TensorRT evidence, but those records do not create an
+unimplemented runtime. The packaged Candle JSON is a placeholder template; no
+checked-in converter produces the required Candle weight-key layout.
+
+Contract JSON/Markdown publication is exclusive and durable. A failure after a
+final hard link appears preserves final paths and available staging evidence;
+manual recovery must compare bytes and digests rather than infer state from names.
+The artifact parent must pass the same mode/ACL publication policy as raw export:
+shared writable parents are accepted only when sticky and owned by the effective
+account or root.
+
+## Known runtime boundary
+
+RF-DETR’s upstream `train` extra installs competing OpenCV distributions. Manwe
+therefore pins RF-DETR 1.8.3 without that extra. Training requires a separately
+curated environment with exactly one OpenCV owner. CI validates the installed API
+and Manwe’s argument mapping; it does not qualify a real RF-DETR training run.
+
+Multi-camera covariance is conditional on analytically exact camera calibration.
+The current implementation does not propagate intrinsic/extrinsic parameter
+uncertainty, so an estimated real rig must not treat pixel-only covariance as a
+complete measurement covariance.
+
+See the root [architecture](../docs/ARCHITECTURE.md),
+[model-contract guide](../docs/MODEL_CONTRACTS.md), and
+[consumer compatibility audit](../docs/INTEGRATION_CREBAIN.md).

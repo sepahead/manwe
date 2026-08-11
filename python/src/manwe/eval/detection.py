@@ -10,9 +10,11 @@ gate export drift, and documented as such.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import cast
 
 import numpy as np
 
+from ..common.numeric import finite_float64_scalar
 from ..fusion.association import GATE_INF, linear_assignment
 
 # Keeping coordinates inside this envelope guarantees that subtracting any two
@@ -27,6 +29,9 @@ _MAX_CLASSES = 4096
 _MAX_EVALUATION_FRAMES = 10_000
 _MAX_TOTAL_EVALUATION_BOXES = 1_000_000
 _MAX_CLASS_MASK_WORK = 20_000_000
+_MAX_IMAGE_ID_BYTES = 4096
+_MIN_IMAGE_ID_INTEGER = -(1 << 63)
+_MAX_IMAGE_ID_INTEGER = (1 << 63) - 1
 
 # COCO area ranges (pixels²).
 AREA_RANGES = {
@@ -159,13 +164,11 @@ def _validated_labels(labels: np.ndarray, expected: int, name: str) -> np.ndarra
 
 
 def _validated_iou_threshold(iou_thr: float) -> float:
-    if isinstance(iou_thr, bool):
-        raise ValueError("iou_thr must be a finite number in (0, 1]")
     try:
-        threshold = float(iou_thr)
-    except (TypeError, ValueError) as exc:
+        threshold = finite_float64_scalar(iou_thr, "iou_thr")
+    except ValueError as exc:
         raise ValueError("iou_thr must be a finite number in (0, 1]") from exc
-    if not np.isfinite(threshold) or not 0.0 < threshold <= 1.0:
+    if not 0.0 < threshold <= 1.0:
         raise ValueError("iou_thr must be a finite number in (0, 1]")
     return threshold
 
@@ -181,7 +184,15 @@ def _metric_name(iou_thr: float, area: str = "all") -> str:
     return name if area == "all" else f"{name}-{area}"
 
 
-@dataclass
+def _immutable_array(value: np.ndarray) -> np.ndarray:
+    """Own one C-order array in immutable bytes-backed storage."""
+    contiguous = np.ascontiguousarray(value)
+    return np.frombuffer(contiguous.tobytes(order="C"), dtype=contiguous.dtype).reshape(
+        contiguous.shape
+    )
+
+
+@dataclass(frozen=True, slots=True, eq=False)
 class Detections:
     boxes: np.ndarray  # (N, 4) source-image pixel xyxy
     scores: np.ndarray  # (N,)
@@ -189,37 +200,63 @@ class Detections:
     image_id: str | int | None = None
 
     def __post_init__(self) -> None:
-        self.boxes = _validated_boxes(self.boxes, "detections.boxes")
-        self.scores = _validated_scores(self.scores, len(self.boxes), "detections.scores")
-        self.labels = _validated_labels(self.labels, len(self.boxes), "detections.labels")
-        self.image_id = _validated_image_id(self.image_id, "detections.image_id")
+        boxes = _validated_boxes(self.boxes, "detections.boxes")
+        scores = _validated_scores(self.scores, len(boxes), "detections.scores")
+        labels = _validated_labels(self.labels, len(boxes), "detections.labels")
+        object.__setattr__(self, "boxes", _immutable_array(boxes))
+        object.__setattr__(self, "scores", _immutable_array(scores))
+        object.__setattr__(self, "labels", _immutable_array(labels))
+        object.__setattr__(
+            self, "image_id", _validated_image_id(self.image_id, "detections.image_id")
+        )
 
 
-@dataclass
+@dataclass(frozen=True, slots=True, eq=False)
 class GroundTruth:
     boxes: np.ndarray  # (M, 4) source-image pixel xyxy
     labels: np.ndarray  # (M,)
     image_id: str | int | None = None
 
     def __post_init__(self) -> None:
-        self.boxes = _validated_boxes(self.boxes, "ground_truth.boxes")
-        self.labels = _validated_labels(self.labels, len(self.boxes), "ground_truth.labels")
-        self.image_id = _validated_image_id(self.image_id, "ground_truth.image_id")
+        boxes = _validated_boxes(self.boxes, "ground_truth.boxes")
+        labels = _validated_labels(self.labels, len(boxes), "ground_truth.labels")
+        object.__setattr__(self, "boxes", _immutable_array(boxes))
+        object.__setattr__(self, "labels", _immutable_array(labels))
+        object.__setattr__(
+            self, "image_id", _validated_image_id(self.image_id, "ground_truth.image_id")
+        )
 
 
 def _validated_image_id(value: str | int | None, name: str) -> str | int | None:
     if value is None:
         return None
-    if isinstance(value, bool) or not isinstance(value, (str, int)):
+    if type(value) not in {str, int}:
         raise ValueError(f"{name} must be a nonempty string, integer, or None")
-    if isinstance(value, str) and not value.strip():
-        raise ValueError(f"{name} must not be blank")
+    if type(value) is str:
+        if (
+            not value.strip()
+            or not value.isprintable()
+            or len(value.encode("utf-8")) > _MAX_IMAGE_ID_BYTES
+        ):
+            raise ValueError(
+                f"{name} must be printable text of 1..{_MAX_IMAGE_ID_BYTES} UTF-8 bytes"
+            )
+    else:
+        integer_value = cast(int, value)
+        if not _MIN_IMAGE_ID_INTEGER <= integer_value <= _MAX_IMAGE_ID_INTEGER:
+            raise ValueError(f"{name} integer must fit in signed 64-bit range")
     return value
 
 
 def _validate_aligned_image_ids(preds: list[Detections], gts: list[GroundTruth]) -> None:
-    pred_ids = [item.image_id for item in preds]
-    gt_ids = [item.image_id for item in gts]
+    pred_ids = [
+        _validated_image_id(item.image_id, f"preds[{index}].image_id")
+        for index, item in enumerate(preds)
+    ]
+    gt_ids = [
+        _validated_image_id(item.image_id, f"gts[{index}].image_id")
+        for index, item in enumerate(gts)
+    ]
     if not any(value is not None for value in pred_ids + gt_ids):
         return
     if any(value is None for value in pred_ids + gt_ids):
@@ -388,7 +425,7 @@ def mean_average_precision(
     if type(num_classes) is not int or not 1 <= num_classes <= _MAX_CLASSES:
         raise ValueError(f"num_classes must be an integer in [1, {_MAX_CLASSES}]")
     iou_thr = _validated_iou_threshold(iou_thr)
-    if not isinstance(area, str) or area not in AREA_RANGES:
+    if type(area) is not str or area not in AREA_RANGES:
         raise ValueError(f"unknown area {area!r}; expected one of {tuple(AREA_RANGES)}")
     if len(preds) != len(gts):
         raise ValueError(
@@ -400,9 +437,9 @@ def mean_average_precision(
         raise ValueError(f"evaluation exceeds the {_MAX_EVALUATION_FRAMES}-frame safety limit")
     validated_frames: list[tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]] = []
     for frame_index, (det, gt) in enumerate(zip(preds, gts, strict=True)):
-        if not isinstance(det, Detections):
+        if type(det) is not Detections:
             raise ValueError(f"preds[{frame_index}] must be a Detections instance")
-        if not isinstance(gt, GroundTruth):
+        if type(gt) is not GroundTruth:
             raise ValueError(f"gts[{frame_index}] must be a GroundTruth instance")
     _validate_aligned_image_ids(preds, gts)
     for frame_index, (det, gt) in enumerate(zip(preds, gts, strict=True)):

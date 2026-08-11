@@ -83,6 +83,14 @@ _SUPPORTED_BIT_GENERATOR_TYPES = frozenset(
 _MAX_RAW_SEQUENCE_CELLS = MAX_FILTER_PARTICLES * (2 * MAX_FILTER_DIMENSION + 1)
 
 
+def _polar_horizontal_range(radius: float, elevation: float) -> float:
+    """Return physical horizontal range without a floating ``cos(pi/2)`` leak."""
+    absolute_elevation = abs(float(elevation))
+    if absolute_elevation == np.pi / 2.0:
+        return 0.0
+    return float(radius) * abs(float(np.cos(elevation)))
+
+
 # ---------------------------------------------------------------------------
 # Motion / measurement models
 # ---------------------------------------------------------------------------
@@ -732,7 +740,7 @@ def _polar_measurement_inputs(
     z[1] = wrap_angle(z[1])
     if not -np.pi / 2.0 <= z[2] <= np.pi / 2.0:
         raise ValueError("polar elevation must be in [-pi/2, pi/2]")
-    if z[0] * abs(float(np.cos(z[2]))) <= MIN_POLAR_HORIZONTAL_RANGE:
+    if _polar_horizontal_range(float(z[0]), float(z[2])) <= MIN_POLAR_HORIZONTAL_RANGE:
         raise ValueError("polar azimuth is singular on the sensor's vertical axis")
     return z, R
 
@@ -1221,7 +1229,7 @@ class ParticleFilter:
         if not np.isfinite(raw_weights).all() or np.any(raw_weights < 0):
             raise ValueError("weights must be finite and nonnegative")
         particles = _float_array(raw_particles, "particles")
-        weights = _float_array(raw_weights, "weights")
+        weights = _float_array(raw_weights, "weights").copy()
         if not np.isfinite(particles).all():
             raise ValueError("particles must contain only finite values")
         if not np.isfinite(weights).all():
@@ -1230,6 +1238,7 @@ class ParticleFilter:
             total = float(weights.sum())
         if not np.isfinite(total) or not np.isclose(total, 1.0, rtol=1e-10, atol=1e-12):
             raise ValueError("weights must sum to 1")
+        weights /= total
         self.particles = particles
         self.weights = weights
         return particles, weights
@@ -2016,7 +2025,7 @@ class IMMEstimator:
             raise ValueError(f"transition must have shape ({size}, {size}), got {raw.shape}")
         if not np.isfinite(raw).all() or np.any(raw < 0):
             raise ValueError("transition must contain finite nonnegative probabilities")
-        matrix = _float_array(raw, "transition")
+        matrix = _float_array(raw, "transition").copy()
         if not np.isfinite(matrix).all():
             raise ValueError("transition must contain finite nonnegative probabilities")
         with np.errstate(over="ignore", invalid="ignore"):
@@ -2028,7 +2037,8 @@ class IMMEstimator:
             atol=1e-12,
         ):
             raise ValueError("each transition row must sum to 1")
-        return matrix.copy()
+        matrix /= row_sums[:, None]
+        return matrix
 
     @staticmethod
     def _validate_probabilities(values: np.ndarray, size: int, name: str) -> np.ndarray:
@@ -2037,14 +2047,15 @@ class IMMEstimator:
             raise ValueError(f"{name} must have shape ({size},), got {raw.shape}")
         if not np.isfinite(raw).all() or np.any(raw < 0):
             raise ValueError(f"{name} must contain finite nonnegative probabilities")
-        probabilities = _float_array(raw, name)
+        probabilities = _float_array(raw, name).copy()
         if not np.isfinite(probabilities).all():
             raise ValueError(f"{name} must contain finite nonnegative probabilities")
         with np.errstate(over="ignore", invalid="ignore"):
             total = float(probabilities.sum())
         if not np.isfinite(total) or not np.isclose(total, 1.0, rtol=1e-10, atol=1e-12):
             raise ValueError(f"{name} must sum to 1")
-        return probabilities.copy()
+        probabilities /= total
+        return probabilities
 
     def _validate_runtime(self) -> _IMMRuntime:
         if type(self.models) not in (list, tuple) or len(self.models) == 0:
@@ -2119,10 +2130,6 @@ class IMMEstimator:
             mode_probs=cast(np.ndarray, owner_namespace.get("mode_probs")),
             cbar=cast(np.ndarray, owner_namespace.get("_cbar")),
         )
-
-    @staticmethod
-    def _restore_transaction(self: IMMEstimator, transaction: _IMMTransaction) -> None:
-        _restore_imm_graph(transaction.journal)
 
     @staticmethod
     def _capture_seal(self: IMMEstimator, transaction: _IMMTransaction) -> _IMMSeal:
@@ -2264,33 +2271,6 @@ class IMMEstimator:
             m,
             "predicted mode probabilities",
         )
-
-    @staticmethod
-    def _validate_without_side_effects(
-        self: IMMEstimator,
-        transaction: _IMMTransaction,
-    ) -> _IMMRuntime:
-        validation_journal = _snapshot_imm_graph((self, *transaction.models))
-        runtime = IMMEstimator._validate_runtime(self)
-        if not _imm_graph_is_unchanged(validation_journal):
-            raise ValueError("IMM model validation must not mutate transaction state")
-        return runtime
-
-    @staticmethod
-    def _restore_original_exception(
-        self: IMMEstimator,
-        transaction: _IMMTransaction,
-        exc: BaseException,
-    ) -> None:
-        try:
-            IMMEstimator._restore_transaction(self, transaction)
-        except BaseException as rollback_exc:
-            try:
-                add_note = getattr(exc, "add_note", None)
-                if callable(add_note):
-                    add_note(f"IMM rollback also failed: {rollback_exc!r}")
-            except BaseException:
-                pass
 
     def predict(self, dt: float) -> None:
         trusted_type = IMMEstimator

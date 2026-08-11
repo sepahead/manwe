@@ -15,7 +15,11 @@ from typing import Literal
 
 import numpy as np
 
-from ..common.numeric import validate_exact_float64_integers, widen_to_float64
+from ..common.numeric import (
+    finite_float64_scalar,
+    validate_exact_float64_integers,
+    widen_to_float64,
+)
 from .association import linear_assignment
 
 _MAX_COORDINATE_MAGNITUDE = np.sqrt(np.finfo(np.float64).max) / 4.0
@@ -26,8 +30,7 @@ _MAX_POINT_CELLS = 262_144
 _MAX_PAIR_CELLS = 4_000_000
 _MAX_PAIR_COMPONENTS = 12_000_000
 _MAX_ASSIGNMENT_WORK = 50_000_000
-_REAL_NUMERIC_KINDS = frozenset("biuf")
-_FLOAT64_DTYPE = np.dtype(np.float64)
+_REAL_NUMERIC_KINDS = frozenset("iuf")
 
 
 def _pairwise(a: np.ndarray, b: np.ndarray) -> np.ndarray:
@@ -158,25 +161,11 @@ def _validate_aligned_sets(truth: np.ndarray, est: np.ndarray) -> tuple[np.ndarr
 
 
 def _float64_scalar(value: object, name: str) -> float:
-    """Convert a real scalar without invoking ``__float__`` on object values."""
+    """Convert an exact supported scalar without invoking user coercion hooks."""
     try:
-        array = np.asarray(value)
-    except (TypeError, ValueError, OverflowError) as exc:
+        return finite_float64_scalar(value, name)
+    except ValueError as exc:
         raise ValueError(f"{name} must be a real numeric scalar") from exc
-    if array.ndim != 0 or array.dtype.kind not in _REAL_NUMERIC_KINDS or array.dtype.kind == "b":
-        raise ValueError(f"{name} must be a real numeric scalar")
-    _validate_exact_float64_integers(array, name)
-    result = float(array)
-    if array.dtype.kind == "f" and np.isfinite(array) and not math.isfinite(result):
-        raise ValueError(f"{name} is outside the finite float64 range")
-    if (
-        array.dtype.kind == "f"
-        and array.dtype.itemsize > _FLOAT64_DTYPE.itemsize
-        and np.isfinite(array)
-        and np.asarray(result, dtype=array.dtype) != array
-    ):
-        raise ValueError(f"{name} loses numeric precision when converted to float64")
-    return result
 
 
 def _stable_nonnegative_power(values: np.ndarray, p: float, name: str) -> np.ndarray:

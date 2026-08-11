@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import importlib
+import json
 import logging
 import math
 import os
@@ -14,6 +15,7 @@ import sys
 import threading
 from contextlib import nullcontext
 from importlib.util import find_spec
+from pathlib import Path
 from types import ModuleType, SimpleNamespace
 
 import numpy as np
@@ -24,10 +26,11 @@ from manwe.cli import _cmd_vision_train
 from manwe.common.artifacts import ArtifactSnapshot
 from manwe.common.dataset_manifest import (
     snapshot_local_calibration_dataset,
+    snapshot_local_training_directory,
     validate_local_detection_manifest,
 )
 from manwe.common.device import Device, resolve_device
-from manwe.common.logging import get_logger
+from manwe.common.logging import configure_logging, get_logger
 from manwe.eval.detection import average_precision
 from manwe.export.backends import _publish_exclusive, export_model
 from manwe.vision.input import prepare_single_image
@@ -60,6 +63,29 @@ def _write_calibration_png(
     Image.new("RGB", size, color).save(path, format="PNG", pnginfo=pnginfo)
 
 
+def _write_rfdetr_coco_dataset(root: Path) -> None:
+    categories = [{"id": 1, "name": "drone"}]
+    for split, image_id in (("train", 1), ("valid", 2)):
+        directory = root / split
+        directory.mkdir(parents=True)
+        Image.new("RGB", (16, 12), (image_id, 2, 3)).save(directory / "frame.jpg", format="JPEG")
+        payload = {
+            "images": [{"id": image_id, "file_name": "frame.jpg", "width": 16, "height": 12}],
+            "annotations": [
+                {
+                    "id": image_id,
+                    "image_id": image_id,
+                    "category_id": 1,
+                    "bbox": [1, 1, 4, 3],
+                    "area": 12,
+                    "iscrowd": 0,
+                }
+            ],
+            "categories": categories,
+        }
+        (directory / "_annotations.coco.json").write_text(json.dumps(payload), encoding="utf-8")
+
+
 def test_artifact_snapshot_binds_verified_bytes_and_bounds_directory_entries(tmp_path):
     artifact = tmp_path / "model.pt"
     artifact.write_bytes(b"trusted")
@@ -80,6 +106,33 @@ def test_artifact_snapshot_binds_verified_bytes_and_bounds_directory_entries(tmp
 
     with pytest.raises(ValueError, match="entry safety limit"):
         sha256_artifact(bundle, max_entries=1)
+
+
+def test_artifact_snapshot_enforces_declared_root_kind(tmp_path):
+    file_artifact = tmp_path / "model.onnx"
+    file_artifact.write_bytes(b"model")
+    file_digest = hashlib.sha256(b"model").hexdigest()
+    with pytest.raises(ValueError, match="directory bundle"):
+        ArtifactSnapshot(file_artifact, file_digest, expect_directory=True)
+
+    bundle = tmp_path / "model.mlpackage"
+    bundle.mkdir()
+    (bundle / "weights").write_bytes(b"model")
+    from manwe.common.artifacts import sha256_artifact
+
+    with pytest.raises(ValueError, match="regular file"):
+        ArtifactSnapshot(bundle, sha256_artifact(bundle), expect_directory=False)
+
+
+def test_closed_artifact_snapshot_cannot_be_reentered(tmp_path):
+    artifact = tmp_path / "model.onnx"
+    artifact.write_bytes(b"model")
+    snapshot = ArtifactSnapshot(artifact, hashlib.sha256(b"model").hexdigest())
+    snapshot.close()
+    snapshot.close()
+
+    with pytest.raises(RuntimeError, match="snapshot is closed"):
+        snapshot.__enter__()
 
 
 def test_directory_snapshot_enforces_byte_limit_during_copy(tmp_path, monkeypatch):
@@ -415,11 +468,28 @@ def test_descriptor_hashes_preserve_canonical_global_path_order(tmp_path):
     try:
         assert sha256_directory_fd(root_fd) == canonical
         assert sha256_artifact_at(parent_fd, bundle.name) == canonical
+        assert sha256_artifact_at(parent_fd, bundle.name, expect_directory=True) == canonical
+        with pytest.raises(ValueError, match="regular file"):
+            sha256_artifact_at(parent_fd, bundle.name, expect_directory=False)
         with ArtifactSnapshot.from_directory_fd(root_fd, canonical) as snapshot:
             assert snapshot.sha256 == canonical
     finally:
         os.close(parent_fd)
         os.close(root_fd)
+
+    regular = tmp_path / "model.onnx"
+    regular.write_bytes(b"model")
+    parent_fd = open_directory_nofollow(tmp_path, "test artifact parent")
+    try:
+        assert sha256_artifact_at(
+            parent_fd, regular.name, expect_directory=False
+        ) == sha256_artifact(regular)
+        with pytest.raises(ValueError, match="directory bundle"):
+            sha256_artifact_at(parent_fd, regular.name, expect_directory=True)
+        with pytest.raises(TypeError, match="boolean or None"):
+            sha256_artifact_at(parent_fd, regular.name, expect_directory=1)  # type: ignore[arg-type]
+    finally:
+        os.close(parent_fd)
 
 
 def test_dataset_manifest_is_local_directive_free_private_snapshot(tmp_path):
@@ -509,7 +579,7 @@ def test_dataset_manifest_rejects_symlinked_path_components_and_special_splits(t
     fifo = tmp_path / "fifo"
     os.mkfifo(fifo)
     manifest.write_text("path: .\ntrain: fifo\nval: real/val\nnames: [drone]\n", encoding="utf-8")
-    with pytest.raises(ValueError, match="regular file or directory"):
+    with pytest.raises(ValueError, match="must be a directory"):
         validate_local_detection_manifest(manifest)
 
 
@@ -631,6 +701,103 @@ def test_dataset_manifest_accepts_distinct_same_byte_nested_files(tmp_path):
         payload = snapshot.path.read_text(encoding="utf-8")
         assert str(train) in payload
         assert str(val) in payload
+
+
+def test_training_snapshot_revalidates_split_identity_after_admission(tmp_path):
+    train = tmp_path / "train"
+    val = tmp_path / "val"
+    train.mkdir()
+    val.mkdir()
+    train_file = train / "frame.jpg"
+    val_file = val / "frame.jpg"
+    train_file.write_bytes(b"training image")
+    val_file.write_bytes(b"validation image")
+    manifest = tmp_path / "data.yaml"
+    manifest.write_text("path: .\ntrain: train\nval: val\nnames: [drone]\n", encoding="utf-8")
+
+    with validate_local_detection_manifest(manifest) as admitted:
+        val_file.unlink()
+        try:
+            os.link(train_file, val_file)
+        except OSError as exc:  # pragma: no cover - filesystem capability boundary
+            pytest.skip(f"hard links are unavailable: {exc}")
+        with pytest.raises(ValueError, match="train and val paths identify the same"):
+            admitted.snapshot_for_training()
+
+
+def test_training_snapshot_validates_the_exact_inventory_it_copies(tmp_path, monkeypatch):
+    from manwe.common import artifacts
+
+    train = tmp_path / "train"
+    val = tmp_path / "val"
+    train.mkdir()
+    val.mkdir()
+    train_file = train / "frame.jpg"
+    val_file = val / "frame.jpg"
+    # The directory digest deliberately binds paths and bytes, not inode
+    # topology. Equal bytes therefore isolate the hardlink-identity invariant.
+    train_file.write_bytes(b"same image bytes")
+    val_file.write_bytes(b"same image bytes")
+    manifest = tmp_path / "data.yaml"
+    manifest.write_text("path: .\ntrain: train\nval: val\nnames: [drone]\n", encoding="utf-8")
+    original_snapshot = artifacts.ArtifactSnapshot.from_directory_fd.__func__
+    replaced = False
+
+    def alias_immediately_before_copy(cls, *args, **kwargs):
+        nonlocal replaced
+        if not replaced:
+            train_file.unlink()
+            try:
+                os.link(val_file, train_file)
+            except OSError as exc:  # pragma: no cover - filesystem capability boundary
+                pytest.skip(f"hard links are unavailable: {exc}")
+            replaced = True
+        return original_snapshot(cls, *args, **kwargs)
+
+    monkeypatch.setattr(
+        artifacts.ArtifactSnapshot,
+        "from_directory_fd",
+        classmethod(alias_immediately_before_copy),
+    )
+    with (
+        validate_local_detection_manifest(manifest) as admitted,
+        pytest.raises(ValueError, match="train and val paths identify the same"),
+    ):
+        admitted.snapshot_for_training()
+    assert replaced
+
+
+def test_training_snapshot_rejects_rebound_manifest_or_root(tmp_path, monkeypatch):
+    from manwe.common import dataset_manifest
+
+    def write_dataset(root, payload):
+        (root / "train").mkdir(parents=True)
+        (root / "val").mkdir()
+        (root / "train" / "frame.jpg").write_bytes(payload)
+        (root / "val" / "frame.jpg").write_bytes(payload + b" validation")
+        manifest = root / "data.yaml"
+        manifest.write_text(
+            "path: .\ntrain: train\nval: val\nnames: [drone]\n",
+            encoding="utf-8",
+        )
+        return manifest
+
+    admitted_manifest = write_dataset(tmp_path / "admitted", b"admitted")
+    rebound_manifest = write_dataset(tmp_path / "rebound", b"rebound")
+
+    with validate_local_detection_manifest(admitted_manifest) as admitted:
+        rebound = validate_local_detection_manifest(rebound_manifest)
+        monkeypatch.setattr(
+            dataset_manifest,
+            "validate_local_detection_manifest",
+            lambda _path: rebound,
+        )
+        with pytest.raises(
+            ValueError,
+            match="manifest or declared root identity changed after admission",
+        ):
+            admitted.snapshot_for_training()
+        assert rebound._closed
 
 
 def test_dataset_manifest_rejects_nested_symlink_escape_and_special_entry(tmp_path):
@@ -769,12 +936,12 @@ def test_dataset_manifest_rejects_mutation_between_split_inventories(tmp_path, m
 def test_dataset_manifest_rejects_unavailable_regular_file_identity(tmp_path, monkeypatch):
     from manwe.common import dataset_manifest
 
-    (tmp_path / "train.jpg").write_bytes(b"train")
-    (tmp_path / "val.jpg").write_bytes(b"val")
+    (tmp_path / "train").mkdir()
+    (tmp_path / "val").mkdir()
+    (tmp_path / "train" / "frame.jpg").write_bytes(b"train")
+    (tmp_path / "val" / "frame.jpg").write_bytes(b"val")
     manifest = tmp_path / "data.yaml"
-    manifest.write_text(
-        "path: .\ntrain: train.jpg\nval: val.jpg\nnames: [drone]\n", encoding="utf-8"
-    )
+    manifest.write_text("path: .\ntrain: train\nval: val\nnames: [drone]\n", encoding="utf-8")
     checked_identity = dataset_manifest._split_entry_identity
 
     def identity_without_inode(metadata, *, subject):
@@ -784,6 +951,42 @@ def test_dataset_manifest_rejects_unavailable_regular_file_identity(tmp_path, mo
     monkeypatch.setattr(dataset_manifest, "_split_entry_identity", identity_without_inode)
     with pytest.raises(ValueError, match="stable device/inode identity"):
         validate_local_detection_manifest(manifest)
+
+
+@pytest.mark.parametrize("suffix", [".txt", ".jpg", ".yaml"])
+def test_dataset_manifest_rejects_every_path_list_file_spelling(tmp_path, suffix):
+    (tmp_path / "train").mkdir()
+    (tmp_path / "val").mkdir()
+    (tmp_path / "train" / "image.jpg").write_bytes(b"train")
+    (tmp_path / "val" / "image.jpg").write_bytes(b"val")
+    path_list = tmp_path / f"paths{suffix}"
+    path_list.write_text("/outside/private-snapshot.jpg\n", encoding="utf-8")
+    manifest = tmp_path / "data.yaml"
+    manifest.write_text(
+        f"path: .\ntrain: {path_list.name}\nval: val\nnames: [drone]\n",
+        encoding="utf-8",
+    )
+
+    message = "path-list indirection" if suffix == ".txt" else "must be a directory"
+    with pytest.raises(ValueError, match=message):
+        validate_local_detection_manifest(manifest)
+
+
+def test_training_snapshot_rejects_an_empty_required_split(tmp_path):
+    (tmp_path / "train").mkdir()
+    (tmp_path / "val").mkdir()
+    (tmp_path / "val" / "image.jpg").write_bytes(b"validation")
+    manifest = tmp_path / "data.yaml"
+    manifest.write_text(
+        "path: .\ntrain: train\nval: val\nnames: [drone]\n",
+        encoding="utf-8",
+    )
+
+    with (
+        validate_local_detection_manifest(manifest) as admitted,
+        pytest.raises(ValueError, match="train split must contain at least one"),
+    ):
+        admitted.snapshot_for_training()
 
 
 def test_calibration_digest_binds_dataset_content_and_enforces_coverage(tmp_path, monkeypatch):
@@ -2548,12 +2751,20 @@ def test_logger_cannot_mutate_the_process_root_logger():
     before = (list(root.handlers), root.level)
     with pytest.raises(ValueError, match="logger name"):
         get_logger("root", level="DEBUG")
+    with pytest.raises(TypeError, match="log level"):
+        configure_logging(0)  # type: ignore[arg-type]
     assert (list(root.handlers), root.level) == before
 
 
 def test_device_contract_rejects_bad_types_and_prefers_available_fallback(monkeypatch):
+    class StringSubclass(str):
+        def strip(self, *args, **kwargs):
+            raise AssertionError("string subclass callback must not run")
+
     with pytest.raises(TypeError, match="preference"):
         resolve_device([])  # type: ignore[arg-type]
+    with pytest.raises(TypeError, match="preference"):
+        resolve_device(StringSubclass("auto"))
     with pytest.raises(TypeError, match="allow_fallback"):
         resolve_device("auto", allow_fallback="false")  # type: ignore[arg-type]
     with pytest.raises(ValueError, match="device kind"):
@@ -2606,6 +2817,7 @@ def test_inference_input_is_one_owned_bounded_local_image(tmp_path):
             return self.value
 
     class FakeModel:
+        task = "detect"
         names = {0: "drone"}
 
         def predict(self, image, **kwargs):
@@ -2621,6 +2833,7 @@ def test_inference_input_is_one_owned_bounded_local_image(tmp_path):
     detector = Detector.__new__(Detector)
     detector._closed = False
     detector.model = FakeModel()
+    detector._model_names = ("drone",)
     detector.device = Device("cpu")
     detector.conf = 0.25
     detector.iou = 0.45
@@ -2638,6 +2851,17 @@ def test_inference_input_is_one_owned_bounded_local_image(tmp_path):
     assert observed_images[0].flags.owndata
     assert not np.shares_memory(observed_images[0], rgb)
     np.testing.assert_array_equal(rgb, np.array([[[255, 0, 0], [0, 0, 255]]]))
+
+    class MutatingModel(FakeModel):
+        def predict(self, image, **kwargs):
+            results = super().predict(image, **kwargs)
+            self.names = {0: "airplane"}
+            return results
+
+    detector.model = MutatingModel()
+    with pytest.raises(RuntimeError, match="class-name mapping changed during inference"):
+        detector.detect(rgb)
+    detector.model = FakeModel()
 
     image_module = pytest.importorskip("PIL.Image")
     color_path = tmp_path / "colors.png"
@@ -2893,6 +3117,7 @@ def test_rfdetr_registry_maps_every_constructor_without_pretrained_weights(monke
         return fake_rfdetr
 
     monkeypatch.setattr(models, "require", require)
+    monkeypatch.setattr(models, "_verify_rfdetr_policy", lambda: None)
 
     actual = {name: models.build_model(name).class_name for name in expected}
 
@@ -2901,6 +3126,31 @@ def test_rfdetr_registry_maps_every_constructor_without_pretrained_weights(monke
     assert constructed == [
         (class_name, {"pretrain_weights": None}) for class_name in expected.values()
     ]
+
+
+def test_rfdetr_policy_requires_pinned_runtime_and_blocks_both_download_bindings(monkeypatch):
+    models = importlib.import_module("manwe.vision.models")
+    assets = SimpleNamespace(download_pretrain_weights=lambda *_args: None)
+    detr = SimpleNamespace(download_pretrain_weights=lambda *_args: None)
+    monkeypatch.setitem(sys.modules, "rfdetr.assets.model_weights", assets)
+    monkeypatch.setitem(sys.modules, "rfdetr.detr", detr)
+    monkeypatch.setattr(models.metadata, "version", lambda name: "1.8.3")
+
+    models._verify_rfdetr_policy()
+
+    assert assets.download_pretrain_weights is models._blocked_rfdetr_download
+    assert detr.download_pretrain_weights is models._blocked_rfdetr_download
+    assert os.environ["HF_HUB_OFFLINE"] == "1"
+    assert os.environ["TRANSFORMERS_OFFLINE"] == "1"
+    assert os.environ["WANDB_MODE"] == "disabled"
+
+
+def test_rfdetr_policy_rejects_an_unvetted_runtime(monkeypatch):
+    models = importlib.import_module("manwe.vision.models")
+    monkeypatch.setattr(models.metadata, "version", lambda name: "9.9.9")
+
+    with pytest.raises(RuntimeError, match="not the vetted 1.8.3"):
+        models._verify_rfdetr_policy()
 
 
 def test_training_config_rejects_nonfinite_and_ambiguous_values(tmp_path, monkeypatch):
@@ -2996,7 +3246,7 @@ def test_rfdetr_gradient_accumulation_misspelling_is_rejected(tmp_path):
 
 def test_rfdetr_training_forwards_exact_upstream_accumulation_field(tmp_path, monkeypatch):
     dataset = tmp_path / "coco"
-    dataset.mkdir()
+    _write_rfdetr_coco_dataset(dataset)
     train_module = importlib.import_module("manwe.vision.train")
     forwarded = []
     build_calls = []
@@ -3004,6 +3254,10 @@ def test_rfdetr_training_forwards_exact_upstream_accumulation_field(tmp_path, mo
 
     class FakeModel:
         def train(self, **kwargs):
+            private_dataset = Path(kwargs["dataset_dir"])
+            assert private_dataset != dataset
+            assert (private_dataset / "train" / "_annotations.coco.json").is_file()
+            assert private_dataset.stat().st_mode & 0o222 == 0
             forwarded.append(kwargs)
             return result
 
@@ -3034,9 +3288,11 @@ def test_rfdetr_training_forwards_exact_upstream_accumulation_field(tmp_path, mo
 
     assert actual is result
     assert build_calls == [("rfdetr-medium", False)]
+    private_dataset = Path(forwarded[0]["dataset_dir"])
+    assert not private_dataset.exists()
+    forwarded[0].pop("dataset_dir")
     assert forwarded == [
         {
-            "dataset_dir": str(dataset.absolute()),
             "epochs": 3,
             "batch_size": 2,
             "device": "cpu",
@@ -3049,6 +3305,340 @@ def test_rfdetr_training_forwards_exact_upstream_accumulation_field(tmp_path, mo
             "lr_drop": 2,
         }
     ]
+
+
+def test_rfdetr_snapshot_rejects_annotation_path_escape(tmp_path):
+    dataset = tmp_path / "coco"
+    _write_rfdetr_coco_dataset(dataset)
+    annotation = dataset / "train" / "_annotations.coco.json"
+    payload = json.loads(annotation.read_text(encoding="utf-8"))
+    payload["images"][0]["file_name"] = "../../outside.jpg"
+    annotation.write_text(json.dumps(payload), encoding="utf-8")
+    (tmp_path / "outside.jpg").write_bytes(b"outside")
+
+    with pytest.raises(ValueError, match="stay canonically inside"):
+        snapshot_local_training_directory(dataset)
+
+
+def test_rfdetr_snapshot_rejects_cross_split_hardlinks(tmp_path):
+    dataset = tmp_path / "coco"
+    _write_rfdetr_coco_dataset(dataset)
+    valid_image = dataset / "valid" / "frame.jpg"
+    valid_image.unlink()
+    os.link(dataset / "train" / "frame.jpg", valid_image)
+
+    with pytest.raises(ValueError, match="hardlink aliases"):
+        snapshot_local_training_directory(dataset)
+
+
+def test_rfdetr_snapshot_validates_hardlinks_on_the_exact_copied_inventory(tmp_path, monkeypatch):
+    from manwe.common import artifacts
+
+    dataset = tmp_path / "coco"
+    _write_rfdetr_coco_dataset(dataset)
+    train_image = dataset / "train" / "frame.jpg"
+    valid_image = dataset / "valid" / "frame.jpg"
+    # Keep the path/byte digest unchanged across the substitution so only the
+    # copier's exact inode-topology validator can detect this split alias.
+    valid_image.write_bytes(train_image.read_bytes())
+    original_snapshot = artifacts.ArtifactSnapshot.from_directory_fd.__func__
+    replaced = False
+
+    def alias_immediately_before_copy(cls, *args, **kwargs):
+        nonlocal replaced
+        if not replaced:
+            valid_image.unlink()
+            try:
+                os.link(train_image, valid_image)
+            except OSError as exc:  # pragma: no cover - filesystem capability boundary
+                pytest.skip(f"hard links are unavailable: {exc}")
+            replaced = True
+        return original_snapshot(cls, *args, **kwargs)
+
+    monkeypatch.setattr(
+        artifacts.ArtifactSnapshot,
+        "from_directory_fd",
+        classmethod(alias_immediately_before_copy),
+    )
+    with pytest.raises(ValueError, match="RF-DETR split files must not be hardlink aliases"):
+        snapshot_local_training_directory(dataset)
+    assert replaced
+
+
+def test_rfdetr_snapshot_binds_real_image_dimensions_and_box_extent(tmp_path):
+    dataset = tmp_path / "coco"
+    _write_rfdetr_coco_dataset(dataset)
+    annotation = dataset / "train" / "_annotations.coco.json"
+    payload = json.loads(annotation.read_text(encoding="utf-8"))
+    payload["images"][0]["width"] = 15
+    annotation.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="dimensions do not match annotation"):
+        snapshot_local_training_directory(dataset)
+
+    _write_rfdetr_coco_dataset(dataset := tmp_path / "coco-box")
+    annotation = dataset / "train" / "_annotations.coco.json"
+    payload = json.loads(annotation.read_text(encoding="utf-8"))
+    payload["annotations"][0]["bbox"] = [14, 1, 4, 3]
+    annotation.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="bbox is outside supported bounds"):
+        snapshot_local_training_directory(dataset)
+
+
+def test_rfdetr_snapshot_normalizes_huge_json_numbers(tmp_path):
+    dataset = tmp_path / "coco-huge-number"
+    _write_rfdetr_coco_dataset(dataset)
+    annotation = dataset / "train" / "_annotations.coco.json"
+    payload = json.loads(annotation.read_text(encoding="utf-8"))
+    payload["annotations"][0]["bbox"][0] = 10**400
+    annotation.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="bbox must be a finite number"):
+        snapshot_local_training_directory(dataset)
+
+
+def test_ultralytics_training_snapshot_rejects_unbounded_or_unreviewed_images(
+    tmp_path, monkeypatch
+):
+    from manwe.common import dataset_manifest
+
+    root = tmp_path / "dataset"
+    (root / "train").mkdir(parents=True)
+    (root / "val").mkdir()
+    _write_calibration_png(root / "train" / "frame.png", (1, 2, 3), size=(20, 20))
+    _write_calibration_png(root / "val" / "frame.png", (4, 5, 6), size=(20, 20))
+    manifest = root / "dataset.yaml"
+    manifest.write_text(
+        "path: .\ntrain: train\nval: val\nnames: [drone]\n",
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(dataset_manifest, "_MAX_TRAINING_IMAGE_PIXELS", 399)
+    with (
+        validate_local_detection_manifest(manifest) as admitted,
+        pytest.raises(ValueError, match="dimensions exceed"),
+    ):
+        admitted.snapshot_for_training()
+
+    monkeypatch.setattr(dataset_manifest, "_MAX_TRAINING_IMAGE_PIXELS", 400)
+    (root / "train" / "optional.heic").write_bytes(b"backend-visible but unreviewed")
+    with (
+        validate_local_detection_manifest(manifest) as admitted,
+        pytest.raises(ValueError, match="backend-recognized format outside"),
+    ):
+        admitted.snapshot_for_training()
+
+
+def test_ultralytics_training_snapshot_validates_the_backend_label_contract(tmp_path, monkeypatch):
+    from manwe.common import dataset_manifest
+
+    root = tmp_path / "dataset"
+    train = root / "train"
+    val = root / "val"
+    train.mkdir(parents=True)
+    val.mkdir()
+    _write_calibration_png(train / "frame.png", (1, 2, 3), size=(20, 20))
+    _write_calibration_png(val / "frame.png", (4, 5, 6), size=(20, 20))
+    label = train / "frame.txt"
+    label.write_text("0 0.5 0.5 0.25 0.25\n", encoding="utf-8")
+    manifest = root / "dataset.yaml"
+    manifest.write_text(
+        "path: .\ntrain: train\nval: val\nnames: [drone]\n",
+        encoding="utf-8",
+    )
+
+    with (
+        validate_local_detection_manifest(manifest) as admitted,
+        admitted.snapshot_for_training() as snapshot,
+    ):
+        assert (snapshot.root / "train" / "frame.txt").read_text(encoding="utf-8") == (
+            "0 0.5 0.5 0.25 0.25\n"
+        )
+
+    # Six-decimal YOLO serialization can put an exactly edge-touching box a
+    # fraction of one unit in the last decimal outside normalized space.
+    label.write_text("0 0.166667 0.5 0.333335 0.25\n", encoding="utf-8")
+    with (
+        validate_local_detection_manifest(manifest) as admitted,
+        admitted.snapshot_for_training() as snapshot,
+    ):
+        assert (snapshot.root / "train" / "frame.txt").is_file()
+
+    label.write_text("0 nan 0.5 0.25 0.25\n", encoding="utf-8")
+    with (
+        validate_local_detection_manifest(manifest) as admitted,
+        pytest.raises(ValueError, match="numbers must be finite"),
+    ):
+        admitted.snapshot_for_training()
+
+    label.write_text("0 0.05 0.5 0.2 0.25\n", encoding="utf-8")
+    with (
+        validate_local_detection_manifest(manifest) as admitted,
+        pytest.raises(ValueError, match="remain inside the normalized image bounds"),
+    ):
+        admitted.snapshot_for_training()
+
+    label.write_text("0 0.5 0.5 0.25 0.25\n", encoding="utf-8")
+    monkeypatch.setattr(dataset_manifest, "_MAX_TRAINING_LABEL_BYTES", 8)
+    with (
+        validate_local_detection_manifest(manifest) as admitted,
+        pytest.raises(ValueError, match="label exceeds the 8-byte safety limit"),
+    ):
+        admitted.snapshot_for_training()
+
+
+def test_ultralytics_training_snapshot_rejects_cross_split_label_hardlinks(tmp_path):
+    root = tmp_path / "dataset"
+    train_images = root / "images" / "train"
+    val_images = root / "images" / "val"
+    train_labels = root / "labels" / "train"
+    val_labels = root / "labels" / "val"
+    train_images.mkdir(parents=True)
+    val_images.mkdir(parents=True)
+    train_labels.mkdir(parents=True)
+    val_labels.mkdir(parents=True)
+    _write_calibration_png(train_images / "train.png", (1, 2, 3), size=(20, 20))
+    _write_calibration_png(val_images / "val.png", (4, 5, 6), size=(20, 20))
+    train_label = train_labels / "train.txt"
+    val_label = val_labels / "val.txt"
+    label_bytes = b"0 0.5 0.5 0.25 0.25\n"
+    train_label.write_bytes(label_bytes)
+    try:
+        os.link(train_label, val_label)
+    except OSError as exc:  # pragma: no cover - filesystem capability boundary
+        pytest.skip(f"hard links are unavailable: {exc}")
+    manifest = root / "dataset.yaml"
+    manifest.write_text(
+        "path: .\ntrain: images/train\nval: images/val\nnames: [drone]\n",
+        encoding="utf-8",
+    )
+
+    # Admission inventories the declared image trees; the exact consumption
+    # inventory additionally binds the sibling labels derived by Ultralytics.
+    with (
+        validate_local_detection_manifest(manifest) as admitted,
+        pytest.raises(ValueError, match="train and val paths identify the same"),
+    ):
+        admitted.snapshot_for_training()
+
+    val_label.unlink()
+    val_label.write_bytes(label_bytes)
+    with (
+        validate_local_detection_manifest(manifest) as admitted,
+        admitted.snapshot_for_training() as snapshot,
+    ):
+        assert (snapshot.root / "labels" / "train" / "train.txt").is_file()
+        assert (snapshot.root / "labels" / "val" / "val.txt").is_file()
+
+
+def test_ultralytics_training_snapshot_rejects_ambiguous_labels_and_truncated_jpeg(tmp_path):
+    root = tmp_path / "dataset"
+    train = root / "images" / "train"
+    val = root / "images" / "val"
+    train.mkdir(parents=True)
+    val.mkdir(parents=True)
+    _write_calibration_png(train / "frame.png", (1, 2, 3), size=(20, 20))
+    Image.new("RGB", (20, 20), (3, 2, 1)).save(train / "frame.jpg", format="JPEG")
+    _write_calibration_png(val / "frame.png", (4, 5, 6), size=(20, 20))
+    labels = root / "labels" / "train"
+    labels.mkdir(parents=True)
+    (labels / "frame.txt").write_text("0 0.5 0.5 0.25 0.25\n", encoding="utf-8")
+    manifest = root / "dataset.yaml"
+    manifest.write_text(
+        "path: .\ntrain: images/train\nval: images/val\nnames: [drone]\n",
+        encoding="utf-8",
+    )
+
+    with (
+        validate_local_detection_manifest(manifest) as admitted,
+        pytest.raises(ValueError, match="same backend label path"),
+    ):
+        admitted.snapshot_for_training()
+
+    (train / "frame.png").unlink()
+    jpeg = train / "frame.jpg"
+    jpeg.write_bytes(jpeg.read_bytes()[:-2])
+    with (
+        validate_local_detection_manifest(manifest) as admitted,
+        pytest.raises(ValueError, match="truncated|EOI|valid bounded still image"),
+    ):
+        admitted.snapshot_for_training()
+
+
+def test_ultralytics_training_consumes_a_private_immutable_dataset(tmp_path, monkeypatch):
+    yaml = pytest.importorskip("yaml")
+    root = tmp_path / "dataset"
+    train_dir = root / "train"
+    val_dir = root / "val"
+    train_dir.mkdir(parents=True)
+    val_dir.mkdir()
+    source_train = train_dir / "frame.png"
+    _write_calibration_png(source_train, (1, 2, 3), size=(16, 12))
+    source_bytes = source_train.read_bytes()
+    _write_calibration_png(val_dir / "frame.png", (4, 5, 6), size=(16, 12))
+    manifest = root / "dataset.yaml"
+    manifest.write_text(
+        "path: .\ntrain: train\nval: val\nnames: [drone]\n",
+        encoding="utf-8",
+    )
+    train_module = importlib.import_module("manwe.vision.train")
+    observed = {}
+    result = object()
+
+    class FakeModel:
+        def train(self, **kwargs):
+            private_manifest = Path(kwargs["data"])
+            payload = yaml.safe_load(private_manifest.read_text(encoding="utf-8"))
+            private_root = Path(payload["path"])
+            private_train = Path(payload["train"])
+            assert private_root != root
+            assert private_train == private_root / "train"
+            assert (private_train / "frame.png").read_bytes() == source_bytes
+            assert private_root.stat().st_mode & 0o222 == 0
+            source_train.write_bytes(b"mutated-after-snapshot")
+            assert (private_train / "frame.png").read_bytes() == source_bytes
+            observed.update(manifest=private_manifest, root=private_root)
+            return result
+
+    monkeypatch.setattr(train_module, "resolve_device", lambda _device: Device("cpu"))
+    monkeypatch.setattr(train_module, "seed_everything", lambda _seed: None)
+    monkeypatch.setattr(train_module, "build_model", lambda *_args, **_kwargs: FakeModel())
+
+    assert train(VisionTrainConfig(data=str(manifest), epochs=1, batch=1, device="cpu")) is result
+    assert not observed["manifest"].exists()
+    assert not observed["root"].exists()
+
+
+def test_ultralytics_training_detects_private_dataset_mutation(tmp_path, monkeypatch):
+    root = tmp_path / "dataset"
+    (root / "train").mkdir(parents=True)
+    (root / "val").mkdir()
+    _write_calibration_png(root / "train" / "frame.png", (1, 2, 3), size=(16, 12))
+    _write_calibration_png(root / "val" / "frame.png", (4, 5, 6), size=(16, 12))
+    manifest = root / "dataset.yaml"
+    manifest.write_text(
+        "path: .\ntrain: train\nval: val\nnames: [drone]\n",
+        encoding="utf-8",
+    )
+    train_module = importlib.import_module("manwe.vision.train")
+
+    class MutatingModel:
+        def train(self, **kwargs):
+            import yaml
+
+            payload = yaml.safe_load(Path(kwargs["data"]).read_text(encoding="utf-8"))
+            target = Path(payload["train"]) / "frame.png"
+            target.chmod(0o600)
+            target.write_bytes(b"backend-mutated")
+            return object()
+
+    monkeypatch.setattr(train_module, "resolve_device", lambda _device: Device("cpu"))
+    monkeypatch.setattr(train_module, "seed_everything", lambda _seed: None)
+    monkeypatch.setattr(train_module, "build_model", lambda *_args, **_kwargs: MutatingModel())
+
+    with pytest.raises(RuntimeError, match="private training dataset changed"):
+        train(VisionTrainConfig(data=str(manifest), epochs=1, batch=1, device="cpu"))
 
 
 def test_rfdetr_training_rejects_multiple_opencv_owners_before_side_effects(tmp_path, monkeypatch):
@@ -3094,7 +3684,7 @@ def test_rfdetr_training_rejects_missing_opencv_owner_before_side_effects(tmp_pa
 
 def test_training_resolves_device_before_rng_mutation(tmp_path, monkeypatch):
     dataset = tmp_path / "coco"
-    dataset.mkdir()
+    _write_rfdetr_coco_dataset(dataset)
     train_module = importlib.import_module("manwe.vision.train")
     monkeypatch.setattr(train_module, "_reject_ambiguous_opencv_install", lambda: None)
     monkeypatch.setattr(

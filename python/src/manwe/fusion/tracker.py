@@ -18,7 +18,7 @@ from dataclasses import dataclass, field, fields
 from fractions import Fraction
 from itertools import combinations, islice
 from types import FunctionType
-from typing import cast
+from typing import Any, cast
 
 import numpy as np
 
@@ -31,6 +31,7 @@ from .filters import (
     GaussianState,
     IMMEstimator,
     ParticleFilter,
+    _polar_horizontal_range,
 )
 
 Modality = str  # "visual" | "thermal" | "acoustic" | "radar" | "lidar" | "rf"
@@ -55,6 +56,7 @@ _TRACK_NAMESPACE_FIELDS = frozenset(
         "updated_this_cycle",
     }
 )
+_TRACKER_NAMESPACE_FIELDS = frozenset({"cfg", "rng", "tracks", "_next_id", "_last_t"})
 _GAUSSIAN_STATE_NAMESPACE_FIELDS = frozenset({"x", "P"})
 _LINEAR_FILTER_NAMESPACE_FIELDS = frozenset(
     {
@@ -584,7 +586,9 @@ def _as_probability_array(value: object, size: int, name: str) -> np.ndarray:
         total = float(probabilities.sum())
     if not math.isfinite(total) or not np.isclose(total, 1.0, rtol=1e-10, atol=1e-12):
         raise ValueError(f"{name} must sum to 1")
-    return probabilities.copy()
+    probabilities = probabilities.copy()
+    probabilities /= total
+    return probabilities
 
 
 def _validated_filter_state(filt: object) -> tuple[np.ndarray, np.ndarray]:
@@ -621,7 +625,7 @@ def _validated_filter_state(filt: object) -> tuple[np.ndarray, np.ndarray]:
 
     if type(filt) is IMMEstimator:
         models = getattr(filt, "models", None)
-        if not isinstance(models, list) or not 1 <= len(models) <= _MAX_IMM_MODES:
+        if type(models) is not list or not 1 <= len(models) <= _MAX_IMM_MODES:
             raise ValueError("IMM models must remain a bounded non-empty list")
         if len({id(model) for model in models}) != len(models):
             raise ValueError("IMM models must remain distinct")
@@ -786,11 +790,12 @@ def _optional_timestamp(value: object, name: str) -> float | None:
 def _probability_list(value: object, name: str) -> list[float] | None:
     if value is None:
         return None
-    if not isinstance(value, (list, tuple)):
+    if type(value) not in (list, tuple):
         raise ValueError(f"{name} must be a bounded probability sequence or None")
-    if not 1 <= len(value) <= _MAX_IMM_MODES:
+    values = cast(list[object] | tuple[object, ...], value)
+    if not 1 <= len(values) <= _MAX_IMM_MODES:
         raise ValueError(f"{name} must contain between 1 and {_MAX_IMM_MODES} probabilities")
-    return _as_probability_array(value, len(value), name).tolist()
+    return _as_probability_array(values, len(values), name).tolist()
 
 
 # ---------------------------------------------------------------------------
@@ -841,7 +846,10 @@ class Measurement:
             if not -math.pi / 2 <= self.position[2] <= math.pi / 2:
                 raise ValueError("radar elevation must be in [-pi/2, pi/2]")
             if (
-                self.position[0] * abs(math.cos(float(self.position[2])))
+                _polar_horizontal_range(
+                    float(self.position[0]),
+                    float(self.position[2]),
+                )
                 <= MIN_POLAR_HORIZONTAL_RANGE
             ):
                 raise ValueError("radar azimuth is singular on the sensor's vertical axis")
@@ -937,8 +945,7 @@ def _measurement_cartesian_validated(
             C = J @ validated.covariance @ J.T
         if not np.isfinite(C).all():
             raise ValueError("Cartesian radar covariance projection must remain finite")
-        C = 0.5 * C + 0.5 * C.T
-        return p, C
+        return p, _as_covariance(C, "Cartesian radar covariance")
     return validated.position.copy(), validated.covariance.copy()
 
 
@@ -1279,6 +1286,15 @@ class MultiSensorTracker:
 
     def _validate_runtime_state(self) -> None:
         """Validate mutable tracker state before it is copied or consumed."""
+        if type(self) is not MultiSensorTracker:
+            raise TypeError("tracker must remain a MultiSensorTracker")
+        _validate_exact_namespace(
+            self,
+            "tracker",
+            _TRACKER_NAMESPACE_FIELDS,
+            optional_function_fields=frozenset({"step"}),
+        )
+        _reject_namespace_ndarray_subclasses(self, "tracker")
         _validate_tracker_config_runtime(self.cfg)
         _validate_builtin_generator(self.rng, "tracker RNG")
         if type(self.tracks) is not list:
@@ -1353,6 +1369,8 @@ class MultiSensorTracker:
                 )
                 if sigma_a != self.cfg.sigma_a:
                     raise ValueError(f"tracks[{index}] filter sigma_a was corrupted")
+                if type(track.filt) is _TRACKER_FILTER_TYPES["ukf"]:
+                    cast(Any, track.filt)._runtime(canonicalize_state=False)
             particle_filter = cast(ParticleFilter, track.filt)
             if type(track.filt) is ParticleFilter:
                 if (
@@ -1439,6 +1457,9 @@ class MultiSensorTracker:
                     atol=1e-12,
                 ):
                     raise ValueError("IMM transition rows must sum to 1")
+                expected_transition = np.array([[0.95, 0.05], [0.05, 0.95]])
+                if not np.array_equal(transition64, expected_transition):
+                    raise ValueError("IMM transition no longer matches the tracker configuration")
                 _as_probability_array(track.filt._cbar, 2, "IMM predicted probabilities")
 
             _, covariance = _validated_filter_state(track.filt)
@@ -1562,27 +1583,68 @@ class MultiSensorTracker:
         P0[POS_DIM:, POS_DIM:] = self.cfg.init_vel_var * np.eye(POS_DIM)
         track = Track(self._next_id, self._make_filter(x0, P0), self.cfg, m.class_label)
         track.record(hit=True, timestamp=m.timestamp)
+        if track.state == "lost":
+            return
         self.tracks.append(track)
         self._next_id += 1
 
     @staticmethod
     def _stabilize_covariance(covariance: np.ndarray) -> np.ndarray:
-        """Return a numerically positive-definite version of a validated PSD matrix."""
-        covariance = _as_covariance(covariance)
-        normalizer = max(1.0, float(np.max(np.abs(covariance))))
-        with np.errstate(under="ignore"):
-            normalized = covariance / normalizer
-        values, vectors = np.linalg.eigh(normalized)
-        floor = max(
-            1e-12 / normalizer,
-            100.0 * np.finfo(float).eps,
-        )
-        with np.errstate(over="ignore", under="ignore", invalid="ignore"):
-            stabilized = (vectors @ np.diag(np.maximum(values, floor)) @ vectors.T) * normalizer
-        stabilized = 0.5 * stabilized + 0.5 * stabilized.T
-        if not np.isfinite(stabilized).all():
-            raise ValueError("stabilized covariance must remain finite")
-        return stabilized
+        """Make a validated PSD covariance positive definite per coordinate.
+
+        A global eigenvalue floor is dimensionally wrong here: one poorly known
+        axis can otherwise inflate an unrelated, well-observed variance.  Work
+        in correlation coordinates instead.  Positive variances are preserved
+        exactly, singular correlations are moved minimally toward independence,
+        and only an exactly zero variance receives the explicit 1e-12 m² birth
+        floor used by the historical implementation.
+        """
+        admitted = _as_covariance(covariance)
+        diagonal = np.diag(admitted).copy()
+        zero = diagonal == 0.0
+        if np.any(zero):
+            admitted[zero, :] = 0.0
+            admitted[:, zero] = 0.0
+            diagonal[zero] = 1e-12
+            np.fill_diagonal(admitted, diagonal)
+
+        # Admission above certifies exact positive semidefiniteness of the
+        # binary64 matrix. For a 3x3 PSD matrix, a positive exact determinant is
+        # equivalent to positive definiteness, without relying on a floating
+        # Cholesky routine that can occasionally accept an exactly singular
+        # matrix after roundoff.
+        if _exact_determinant_3x3(admitted) > 0:
+            return admitted
+
+        tolerance = 100.0 * np.finfo(float).eps * POS_DIM
+        for multiplier in (1.0, 2.0, 4.0, 8.0, 16.0):
+            shrink = 1.0 / (1.0 + multiplier * tolerance)
+            stabilized = admitted.copy()
+            with np.errstate(under="ignore", invalid="ignore"):
+                stabilized *= shrink
+            np.fill_diagonal(stabilized, diagonal)
+            stabilized = _symmetrize_finite(stabilized)
+            # At subnormal scales multiplication can round a nonzero
+            # correlation back to the original float. Move such an entry by
+            # the smallest representable step toward independence so this loop
+            # makes progress on the actual stored matrix, not only in reals.
+            unchanged = (stabilized == admitted) & ~np.eye(POS_DIM, dtype=bool)
+            if np.any(unchanged & (stabilized != 0.0)):
+                stabilized[unchanged] = np.nextafter(stabilized[unchanged], 0.0)
+                stabilized = _symmetrize_finite(stabilized)
+            if not np.isfinite(stabilized).all():
+                raise ValueError("stabilized covariance must remain finite")
+            if (
+                _is_exactly_positive_semidefinite(stabilized)
+                and _exact_determinant_3x3(stabilized) > 0
+            ):
+                return stabilized
+
+        # Independence is the only universally representable PD covariance
+        # with these exact variances (notably when a variance is the smallest
+        # subnormal). It is a bounded, explicit fallback after the minimal
+        # correlation steps above fail exact certification.
+        return np.diag(diagonal)
 
     def _cluster_estimate(
         self,
@@ -1599,8 +1661,12 @@ class MultiSensorTracker:
             precisions = []
             with np.errstate(over="ignore", invalid="ignore"):
                 for covariance in group_covariances:
-                    # Cholesky distinguishes invertible covariances from valid but
-                    # singular PSD inputs, for which information fusion is undefined.
+                    # LAPACK can accept an exactly singular dyadic matrix after
+                    # factorization roundoff. Certify invertibility exactly before
+                    # using ordinary information fusion; singular PSD inputs use
+                    # the arithmetic-mean fallback below.
+                    if _exact_determinant_3x3(covariance) <= 0:
+                        raise np.linalg.LinAlgError
                     np.linalg.cholesky(covariance)
                     precisions.append(np.linalg.solve(covariance, identity))
                 total_precision = np.sum(precisions, axis=0)
@@ -1694,6 +1760,7 @@ class MultiSensorTracker:
                 velocity,
                 measurement.modality,
                 measurement.class_label or "",
+                measurement.sensor_id or "",
             )
 
         ordered = sorted(idxs, key=order_key)
@@ -1768,11 +1835,14 @@ class MultiSensorTracker:
         """
         labels = [track.class_label for track in self.tracks]
         unknown_tracks = [index for index, label in enumerate(labels) if label is None]
-        concrete_measurements = [
-            index
-            for index, measurement in enumerate(measurements)
-            if measurement.class_label is not None
-        ]
+        concrete_measurements = sorted(
+            (
+                index
+                for index, measurement in enumerate(measurements)
+                if measurement.class_label is not None
+            ),
+            key=lambda index: self._measurement_order_key(index, measurements[index]),
+        )
         if not unknown_tracks or not concrete_measurements:
             return labels
 
@@ -1862,10 +1932,16 @@ class MultiSensorTracker:
         int,
         float | None,
         dict,
+        dict[str, FunctionType],
     ]:
         self._validate_runtime_state()
         _preflight_snapshot_graph(self.tracks)
         canonical_config = _validate_tracker_config_runtime(self.cfg)
+        owner_functions = {
+            name: cast(FunctionType, value)
+            for name, value in vars(self).items()
+            if name not in _TRACKER_NAMESPACE_FIELDS
+        }
         return (
             canonical_config,
             self.rng,
@@ -1873,6 +1949,7 @@ class MultiSensorTracker:
             self._next_id,
             self._last_t,
             copy.deepcopy(dict(self.rng.bit_generator.state)),
+            owner_functions,
         )
 
     def _restore(
@@ -1884,13 +1961,30 @@ class MultiSensorTracker:
             int,
             float | None,
             dict,
+            dict[str, FunctionType],
         ],
     ) -> None:
-        self.cfg, self.rng, tracks, self._next_id, self._last_t, rng_state = snapshot
-        self.rng.bit_generator.state = rng_state
-        self.tracks = tracks
-        for track in self.tracks:
-            track.cfg = self.cfg
+        cfg, rng, tracks, next_id, last_t, rng_state, owner_functions = snapshot
+        rng.bit_generator.state = rng_state
+        for track in tracks:
+            track.cfg = cfg
+        restored_namespace: dict[str, object] = {
+            "cfg": cfg,
+            "rng": rng,
+            "tracks": tracks,
+            "_next_id": next_id,
+            "_last_t": last_t,
+            **owner_functions,
+        }
+        namespace = vars(self)
+        quarantine = list(namespace.values())
+        namespace.clear()
+        namespace.update(restored_namespace)
+        quarantine.clear()
+        # A callback-injected finalizer released above may itself have mutated
+        # the tracker. Reapply the already-authenticated namespace once more.
+        namespace.clear()
+        namespace.update(restored_namespace)
 
     @staticmethod
     def _measurement_order_key(index: int, measurement: Measurement) -> tuple:
@@ -2011,6 +2105,27 @@ class MultiSensorTracker:
             # 4. LIFECYCLE RECORD — one hit/miss opportunity per complete cycle.
             for track_index, track in enumerate(self.tracks):
                 track.record(hit=track_index in matched_tracks, timestamp=timestamp)
+
+            # Lost tracks no longer own capacity or observations. In particular,
+            # recycle hits assigned to a track whose lifecycle closes in this
+            # cycle so a valid measurement is not silently consumed by an object
+            # that will never be emitted again.
+            lost_track_indices = {
+                track_index
+                for track_index, track in enumerate(self.tracks)
+                if track.state == "lost"
+            }
+            unmatched_m.extend(
+                measurement_index
+                for track_index, measurement_index in planned_updates
+                if track_index in lost_track_indices
+            )
+            if lost_track_indices:
+                self.tracks = [
+                    track
+                    for track_index, track in enumerate(self.tracks)
+                    if track_index not in lost_track_indices
+                ]
 
             # 5. INITIATE — class-compatible simultaneous hits may seed one track.
             for group in self._cluster_unmatched(unmatched_m, measurements, positions):

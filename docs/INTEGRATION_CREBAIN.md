@@ -34,13 +34,14 @@ checkout of its selected commit or immutable tag, repeat the source audit, and r
 its fixtures against those exact bytes. Newer local files do not silently update
 these conclusions.
 
-## Status: no drop-in integration
+## Status: no downstream drop-in integration
 
-No reviewed consumer imports Manwe or consumes a Manwe artifact/measurement
-contract directly. `manwe.common.contracts` is a useful **producer-side manifest**,
-not a negotiated wire protocol and not evidence that a consumer can execute the
-artifact. All integration paths below need a versioned adapter plus consumer-owned
-fixtures.
+No reviewed downstream consumer imports Manwe or consumes a Manwe artifact or
+measurement contract directly. Manwe's own Rust CLI and viewer now consume
+schema-2 Candle contracts through the shared native runtime; that makes the JSON
+an executable **Manwe package contract**, not a negotiated downstream wire
+protocol. Every integration path below still needs a versioned adapter plus
+consumer-owned fixtures.
 
 Status terms used here:
 
@@ -54,10 +55,10 @@ Status terms used here:
 
 | Consumer | Consumer requires | What Manwe has now | Blocking gap | Status |
 |---|---|---|---|---|
-| **crebain: native ONNX / CUDA / TensorRT EP** | Ultralytics YOLOv8 tensors with exactly 84 features (`4 + 80 COCO`), known layout, native preprocessing and NMS | Rust COCO model path can produce an 80-class YOLO head; Python aerial contracts target five classes and typically produce `4 + 5` features | The five-class head is rejected by the fixed 84-feature parser. The COCO path still needs identical resize/padding, tensor names, score semantics, NMS, and fixture parity. TensorRT runtime discovers `.onnx`; a standalone `.engine` is not the same runtime input. | **blocked** for five-class models; **candidate** for a pinned COCO ONNX adapter |
+| **crebain: native ONNX / CUDA / TensorRT EP** | Ultralytics YOLOv8 tensors with exactly 84 features (`4 + 80 COCO`), known layout, native preprocessing and NMS | Python can emit raw ONNX evidence contracts; Manwe's separate Candle runtime accepts a contract-defined class head rather than proving the ONNX consumer path | A five-class head is rejected by the fixed 84-feature parser. A COCO ONNX candidate still needs identical resize/padding, tensor names, score semantics, NMS, and fixture parity. TensorRT runtime discovery of `.onnx` is not acceptance of a standalone `.engine`. | **blocked** for five-class models; **candidate** for a pinned COCO ONNX adapter |
 | **crebain: native CoreML** | Compiled `.mlmodelc`, Vision/CoreML feature names and output type, accepted labels and coordinate conversion | Raw export normally produces `.mlpackage`; contract allows both bundle suffixes | Compilation is an extra step. The native path maps labels through its current COCO table and can drop custom labels. Manwe does not emit or test the exact Vision result contract. | **blocked** |
 | **crebain: browser “CoreML” path** | An ONNX file loaded by ONNX Runtime Web, configured preprocessing, output format/tensor names, and class mapping | ONNX conversion plus a five-class manifest | The path is not a native CoreML consumer and does not ingest Manwe's manifest. A config adapter and golden browser fixtures are required. | **candidate** |
-| **crebain: MLX** | A bespoke YOLOv8-style Candle graph, exact safetensor keys/shapes, and an 80-class COCO head | No implemented Manwe MLX converter; a generic `.safetensors` suffix is allowed by the manifest type | File format alone is insufficient. The consumer architecture is fixed and is not a generic Ultralytics/Manwe loader. | **blocked** |
+| **crebain: MLX** | A bespoke safetensors-backed graph with exact keys/shapes and an 80-class COCO head | No implemented Manwe MLX converter. Manwe's schema distinguishes the `mlx` and `candle` backends; its native Candle adapter is not an MLX adapter. | File format alone is insufficient. The consumer architecture is fixed and is not a generic Ultralytics/Manwe loader. | **blocked** |
 | **crebain: RF-DETR / DETR-style models** | Consumer-specific boxes/logits tensor names, layout, preprocessing and postprocessing | Model registry/training experiments and backend conversion utilities | DETR's separate logits/boxes are not the combined YOLO tensor contract. No end-to-end exported fixture is pinned. | **blocked** |
 | **crebain: sensor fusion** | `SensorMeasurement` with sensor ID, modality, epoch milliseconds, confidence, class, optional velocity and metadata; modality-dependent frames; consumer-specific tracker behavior | `Measurement` with modality, bounded float timestamp, position/covariance, optional velocity/origin/class/sensor ID; independent KF/EKF/UKF/PF/IMM tracker | Field names, clock unit/epoch, source/track identity, confidence, metadata, modality tag (`rf` vs `radiofrequency`), defaults and output schemas differ. Filter/association/process-noise/initialization behavior is not identical. | **blocked**; numerical reference only |
 | **Galadriel** | Per-track, per-sequence `PidObservation`: modality, timestamp-ms, NIS/dof and optionally innovation plus covariance; scientific use additionally needs exact sequence alignment, one common residual frame and a common frozen pre-update prior | Manwe exposes measurements and final track states, not per-update innovation records | No observation serializer, stable track/sequence/session contract, explicit miss/lifecycle event, or frozen-prior/common-frame instrumented update exists. Sequentially updated and mixed polar/Cartesian residuals are not valid cross-channel PID columns. | **blocked**; scalar NIS smoke work would still need an adapter |
@@ -81,19 +82,19 @@ boundaries, not project names or README aspirations:
 These are local-checkout observations, not stable claims about future upstream
 versions. Pin the consumer commit in every real adapter record.
 
-## Internal taxonomy split
+## Source and airspace taxonomies
 
-Manwe itself has two distinct label regimes that must not be conflated:
+Manwe no longer hard-codes a separate COCO taxonomy in its native entry points.
+Each schema-2 package declares a unique source-class table and a complete optional
+mapping into Manwe's five airspace classes:
+`drone`, `bird`, `aircraft`, `helicopter`, and `unknown`.
 
-| Path | Current taxonomy | Consequence |
-|---|---|---|
-| Root Rust/Candle CLI and benchmark checkpoint | 80 COCO classes | Shape can match an 84-feature YOLO consumer, but most COCO labels are irrelevant to the airspace contract. |
-| Python candidate consumer contract | `drone`, `bird`, `aircraft`, `helicopter`, `unknown` in indices 0–4 | A raw YOLO head normally has 9 features (`4 + 5`) and cannot be parsed by a fixed 84-feature consumer. |
-
-The fallback COCO mapping only maps `airplane → aircraft` and `bird → bird`; it
-drops other COCO labels. It cannot create drone or helicopter capability. An
-adapter must reject unknown head widths and carry a complete index-to-class table;
-it must never guess a taxonomy from a file name.
+Native structured output preserves both: source index/name plus a mapped
+`airspace_class` or `null`. The fallback COCO producer mapping only maps
+`airplane → aircraft` and `bird → bird`; it cannot create drone or helicopter
+capability. A downstream adapter must still reject unknown head widths and carry
+its own complete index table. It must never guess taxonomy from a file name or
+from Manwe's optional mapping.
 
 ## Artifact and tensor requirements
 

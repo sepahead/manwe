@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import hashlib
 import io
 import os
@@ -15,9 +16,12 @@ import tempfile
 from typing import IO
 
 _MAX_MEMBERS = 100_000
+_MAX_ARCHIVE_BYTES = 256 << 20
 _MAX_UNCOMPRESSED_BYTES = 1 << 30
+_MAX_GENERATED_METADATA_BYTES = 2 << 20
+_SAFE_ARCHIVE_MODES = frozenset({0o644, 0o755})
 _PROJECT_INPUTS = frozenset({"LICENSE", "README.md", "pyproject.toml", "uv.lock"})
-_PROJECT_TREES = frozenset({"src", "tests"})
+_PROJECT_TREES = frozenset({"configs", "src", "tests"})
 
 
 def _sha256_stream(stream: IO[bytes]) -> str:
@@ -73,6 +77,9 @@ def verify_sdist(
     archive_path = archive_path.resolve(strict=True)
     repo_root = repo_root.resolve(strict=True)
     project_root = project_root.resolve(strict=True)
+    archive_size = archive_path.stat().st_size
+    if not 1 <= archive_size <= _MAX_ARCHIVE_BYTES:
+        raise ValueError(f"sdist archive must contain 1..={_MAX_ARCHIVE_BYTES} compressed bytes")
     expected = _tracked_inputs(repo_root, project_root)
     expected_root = archive_path.name.removesuffix(".tar.gz")
     if not expected_root or expected_root == archive_path.name:
@@ -97,6 +104,16 @@ def verify_sdist(
                 raise ValueError(f"sdist contains an unsafe member path: {member.name!r}")
             if not member.isfile():
                 raise ValueError(f"sdist contains a non-regular member: {member.name!r}")
+            if member.size < 0:
+                raise ValueError(f"sdist contains a negative-size member: {member.name!r}")
+            if member.mode not in _SAFE_ARCHIVE_MODES:
+                raise ValueError(
+                    f"sdist contains unsafe regular-file mode {member.mode:#o}: {member.name!r}"
+                )
+            if member.uid != 0 or member.gid != 0 or member.uname or member.gname:
+                raise ValueError(f"sdist contains non-canonical ownership: {member.name!r}")
+            if member.pax_headers:
+                raise ValueError(f"sdist contains unmodeled PAX metadata: {member.name!r}")
             relative = pathlib.PurePosixPath(*raw_parts[1:]).as_posix()
             if relative in observed:
                 raise ValueError(f"sdist contains a duplicate member: {relative!r}")
@@ -110,6 +127,8 @@ def verify_sdist(
                 )
 
             if relative == "PKG-INFO":
+                if member.size > _MAX_GENERATED_METADATA_BYTES:
+                    raise ValueError("sdist PKG-INFO exceeds the generated-metadata safety limit")
                 continue
             source_path = (
                 repo_root / ".gitignore"
@@ -141,7 +160,7 @@ def _write_mutant(
     source_path: pathlib.Path,
     destination_path: pathlib.Path,
     *,
-    special: bool,
+    mutation: str,
 ) -> None:
     with tarfile.open(source_path, mode="r:gz") as source:
         members = source.getmembers()
@@ -153,15 +172,25 @@ def _write_mutant(
                     raise ValueError(f"verified source member cannot be read: {member.name!r}")
                 with archived_payload:
                     destination.addfile(member, archived_payload)
-            if special:
+            if mutation == "special":
                 probe = tarfile.TarInfo(f"{root}/tests/UNTRACKED_FIFO")
                 probe.type = tarfile.FIFOTYPE
                 destination.addfile(probe)
-            else:
+            elif mutation == "untracked":
                 probe_payload = b"untracked workstation state"
                 probe = tarfile.TarInfo(f"{root}/tests/UNTRACKED_SENTINEL")
                 probe.size = len(probe_payload)
                 destination.addfile(probe, io.BytesIO(probe_payload))
+            elif mutation == "mode":
+                probe = copy.copy(members[0])
+                probe.mode = 0o666
+                archived_payload = source.extractfile(members[0])
+                if archived_payload is None:
+                    raise ValueError(f"verified source member cannot be read: {members[0].name!r}")
+                with archived_payload:
+                    destination.addfile(probe, archived_payload)
+            else:  # pragma: no cover - internal caller invariant
+                raise ValueError(f"unknown sdist mutation: {mutation}")
 
 
 def _adversarial_self_test(
@@ -172,14 +201,15 @@ def _adversarial_self_test(
 ) -> None:
     with tempfile.TemporaryDirectory(prefix="manwe-sdist-verifier-") as temporary:
         temporary_root = pathlib.Path(temporary)
-        for label, special, expected_message in (
-            ("untracked", False, "untracked release input"),
-            ("special", True, "non-regular member"),
+        for label, expected_message in (
+            ("untracked", "untracked release input"),
+            ("special", "non-regular member"),
+            ("mode", "unsafe regular-file mode"),
         ):
             destination_dir = temporary_root / label
             destination_dir.mkdir()
             mutant = destination_dir / archive_path.name
-            _write_mutant(archive_path, mutant, special=special)
+            _write_mutant(archive_path, mutant, mutation=label)
             try:
                 verify_sdist(mutant, repo_root=repo_root, project_root=project_root)
             except ValueError as exc:

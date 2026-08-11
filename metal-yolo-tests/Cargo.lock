@@ -1235,13 +1235,17 @@ dependencies = [
  "candle-nn",
  "candle-transformers",
  "clap",
+ "getrandom 0.3.4",
  "image",
  "imageproc",
  "libc",
+ "serde",
+ "serde_json",
  "sha2",
  "tracing",
  "tracing-chrome",
  "tracing-subscriber",
+ "unicode_categories",
 ]
 
 [[package]]
@@ -1251,10 +1255,8 @@ dependencies = [
  "anyhow",
  "candle-core",
  "candle-nn",
- "candle-transformers",
  "clap",
  "image",
- "imageproc",
  "libc",
  "manwe",
  "serde_json",

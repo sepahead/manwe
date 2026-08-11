@@ -11,15 +11,21 @@ import stat
 from contextlib import suppress
 from dataclasses import dataclass
 
-from ..common.artifacts import sha256_artifact, sha256_artifact_at
-from ..common.config_io import open_directory_nofollow
+from ..common.artifacts import (
+    DEFAULT_MAX_ARTIFACT_BYTES,
+    sha256_artifact,
+    sha256_artifact_at,
+)
+from ..common.config_io import open_directory_nofollow, require_safe_publication_directory
 from ..common.contracts import (
-    CREBAIN_CLASSES,
+    AIRSPACE_CLASSES,
     MAX_CONTRACT_CLASSES,
+    MAX_NATIVE_MODEL_BYTES,
     MAX_TENSOR_RANK,
+    AirspaceClass,
     Backend,
-    CrebainClass,
     ModelContract,
+    RuntimeSpec,
     TensorSpec,
 )
 from ..common.fd_io import attach_cleanup_failure, owned_binary_reader, owned_binary_writer
@@ -53,6 +59,8 @@ class _ContractCommitBoundary:
     parent_identity: tuple[int, int]
     artifact_name: str
     artifact_sha256: str
+    artifact_is_directory: bool
+    artifact_max_bytes: int
     final_publications: dict[str, _SidecarPublication]
 
 
@@ -67,14 +75,21 @@ def _assert_directory_path(
     path: pathlib.Path, parent_fd: int, expected_identity: tuple[int, int]
 ) -> None:
     try:
-        metadata = os.stat(path, follow_symlinks=False)
+        path_metadata = os.stat(path, follow_symlinks=False)
+        descriptor_metadata = os.fstat(parent_fd)
     except OSError as exc:
         raise RuntimeError("contract parent was replaced during publication") from exc
     if (
-        not stat.S_ISDIR(metadata.st_mode)
+        not stat.S_ISDIR(path_metadata.st_mode)
+        or not stat.S_ISDIR(descriptor_metadata.st_mode)
         or (
-            metadata.st_dev,
-            metadata.st_ino,
+            path_metadata.st_dev,
+            path_metadata.st_ino,
+        )
+        != expected_identity
+        or (
+            descriptor_metadata.st_dev,
+            descriptor_metadata.st_ino,
         )
         != expected_identity
     ):
@@ -288,7 +303,15 @@ def _commit_boundary_matches(parent_fd: int, boundary: _ContractCommitBoundary) 
             parent_fd,
             boundary.parent_identity,
         )
-        if sha256_artifact_at(parent_fd, boundary.artifact_name) != boundary.artifact_sha256:
+        if (
+            sha256_artifact_at(
+                parent_fd,
+                boundary.artifact_name,
+                max_bytes=boundary.artifact_max_bytes,
+                expect_directory=boundary.artifact_is_directory,
+            )
+            != boundary.artifact_sha256
+        ):
             return False
     except (OSError, RuntimeError, ValueError):
         return False
@@ -320,14 +343,43 @@ def _sync_parent_after_marker_removal(parent_fd: int) -> bool:
 
 
 def _link_staged_sidecar(stage_fd: int, stage_name: str, parent_fd: int, final_name: str) -> None:
-    """Publish one hard link atomically without following or replacing paths."""
-    os.link(
-        stage_name,
-        final_name,
-        src_dir_fd=stage_fd,
-        dst_dir_fd=parent_fd,
-        follow_symlinks=False,
-    )
+    """Publish one hard link atomically and reconcile a lost success reply.
+
+    Network filesystems may commit ``link`` and then report an error. The only
+    conclusive retry test is descriptor-relative filesystem identity: if the
+    visible final name identifies the staged inode, publication already
+    succeeded; if ``EEXIST`` names a different inode, it is genuinely occupied.
+    Every other failed outcome remains explicitly indeterminate.
+    """
+    try:
+        os.link(
+            stage_name,
+            final_name,
+            src_dir_fd=stage_fd,
+            dst_dir_fd=parent_fd,
+            follow_symlinks=False,
+        )
+        return
+    except OSError as error:
+        try:
+            staged_identity = _entry_identity(stage_fd, stage_name)
+            final_identity = _entry_identity(parent_fd, final_name)
+        except OSError as inspection:
+            attach_cleanup_failure(
+                error,
+                inspection,
+                "hard-link publication outcome inspection failed",
+            )
+            raise RuntimeError(
+                f"hard-link publication outcome is indeterminate for {final_name!r}"
+            ) from error
+        if staged_identity is not None and final_identity == staged_identity:
+            return
+        if isinstance(error, FileExistsError) and final_identity is not None:
+            raise
+        raise RuntimeError(
+            f"hard-link publication outcome is indeterminate for {final_name!r}"
+        ) from error
 
 
 def sha256_file(path: str | pathlib.Path) -> str:
@@ -346,6 +398,7 @@ class VerifiedArtifactSignature:
     source_classes: tuple[str, ...]
     inputs: tuple[TensorSpec, ...]
     outputs: tuple[TensorSpec, ...]
+    runtime: RuntimeSpec
     preprocess: str
     postprocess: str
     failure_behavior: str
@@ -394,10 +447,18 @@ class VerifiedArtifactSignature:
             self.inputs,
             self.outputs,
         )
+        if type(self.runtime) is not RuntimeSpec:
+            raise TypeError("signature runtime must be a RuntimeSpec")
         for name in ("preprocess", "postprocess", "failure_behavior", "evidence"):
             value = getattr(self, name)
-            if type(value) is not str or not value.strip() or "\0" in value or len(value) > 4096:
-                raise ValueError(f"signature {name} must be a nonempty string")
+            if (
+                type(value) is not str
+                or not value
+                or value != value.strip()
+                or not value.isprintable()
+                or len(value.encode("utf-8")) > 4096
+            ):
+                raise ValueError(f"signature {name} must be bounded printable text")
         object.__setattr__(self, "inputs", copied_inputs)
         object.__setattr__(self, "outputs", copied_outputs)
 
@@ -457,21 +518,21 @@ def _copy_validated_signature_tensors(
 
 
 def _copy_bounded_class_map(
-    class_map: dict[int, CrebainClass | None],
-) -> dict[int, CrebainClass | None]:
+    class_map: dict[int, AirspaceClass | None],
+) -> dict[int, AirspaceClass | None]:
     """Copy one ordinary dictionary only after its public cardinality bound."""
     if type(class_map) is not dict:
         raise TypeError("class_map must be a dictionary or None")
     if len(class_map) > MAX_CONTRACT_CLASSES:
         raise ValueError(f"class_map must contain at most {MAX_CONTRACT_CLASSES} entries")
-    result: dict[int, CrebainClass | None] = {}
+    result: dict[int, AirspaceClass | None] = {}
     try:
         for index, (key, value) in enumerate(dict.items(class_map)):
             if index >= MAX_CONTRACT_CLASSES:
                 raise ValueError(f"class_map must contain at most {MAX_CONTRACT_CLASSES} entries")
             if type(key) is not int or key < 0:
                 raise ValueError("class_map keys must be nonnegative built-in integers")
-            if value is not None and (type(value) is not str or value not in CREBAIN_CLASSES):
+            if value is not None and (type(value) is not str or value not in AIRSPACE_CLASSES):
                 raise ValueError("class_map values must be canonical class strings or None")
             result[key] = value
     except RuntimeError as exc:
@@ -515,8 +576,8 @@ def _validate_raw_detect_signature(
             f"raw detect image input shape must be {expected_image_shape} for "
             f"image_size={receipt.image_size}, got {image.shape}"
         )
-    if image.dtype not in {"float16", "float32", "uint8"}:
-        raise ValueError("raw detect image input dtype must be float16, float32, or uint8")
+    if image.dtype not in {"float16", "float32"}:
+        raise ValueError("raw detect image input dtype must be float16 or float32")
 
     prediction = outputs[0]
     expected_features = 4 + receipt.class_count
@@ -548,7 +609,7 @@ def build_export_contract(
     rights: str,
     receipt: ExportReceipt,
     signature: VerifiedArtifactSignature,
-    class_map: dict[int, CrebainClass | None] | None = None,
+    class_map: dict[int, AirspaceClass | None] | None = None,
     validation_data: str = "",
     benchmark_context: str = "",
 ) -> ModelContract:
@@ -574,14 +635,26 @@ def build_export_contract(
     )
     _validate_raw_detect_signature(receipt, signature_inputs, signature_outputs)
 
-    backend: Backend = EXPORT_FORMATS[receipt.format].crebain_backend  # type: ignore[assignment]
+    backend: Backend = EXPORT_FORMATS[receipt.format].contract_backend  # type: ignore[assignment]
     artifact = pathlib.Path(receipt.artifact_path)
+    runtime_errors = signature.runtime.validation_errors(
+        backend=backend,
+        num_classes=receipt.class_count,
+        inputs=list(signature_inputs),
+        outputs=list(signature_outputs),
+    )
+    if runtime_errors:
+        raise ValueError(
+            "signature runtime does not match the artifact interface: " + "; ".join(runtime_errors)
+        )
     if class_map is None:
-        if receipt.source_classes != tuple(CREBAIN_CLASSES):
+        if receipt.source_classes != tuple(AIRSPACE_CLASSES):
             raise ValueError(
                 "class_map is required unless source_classes exactly match the candidate taxonomy"
             )
-        cmap: dict[int, CrebainClass | None] = {i: value for i, value in enumerate(CREBAIN_CLASSES)}
+        cmap: dict[int, AirspaceClass | None] = {
+            index: value for index, value in enumerate(AIRSPACE_CLASSES)
+        }
     else:
         cmap = _copy_bounded_class_map(class_map)
     export_options = json.dumps(
@@ -607,7 +680,7 @@ def build_export_contract(
         source=source,
         rights=rights,
         backend=backend,
-        file_path=str(artifact),
+        file_path=artifact.name,
         num_classes=receipt.class_count,
         source_classes=list(receipt.source_classes),
         file_sha256=receipt.artifact_sha256.lower(),
@@ -622,32 +695,33 @@ def build_export_contract(
         validation_data=validation_data,
         benchmark_context=benchmark_context,
         failure_behavior=signature.failure_behavior,
+        runtime=signature.runtime,
     )
     # Reject malformed metadata, tensor signatures, class maps, and backend
     # suffixes before performing a potentially large artifact read.
     contract.validate(check_artifact=False)
-    if backend == "coreml":
-        if not artifact.is_dir():
-            raise ValueError("CoreML receipt artifact must be a directory bundle")
-    elif not artifact.is_file():
-        raise ValueError("receipt artifact must be a regular file")
-    actual_sha = sha256_file(artifact)
-    if actual_sha != receipt.artifact_sha256.lower():
-        raise ValueError("artifact bytes no longer match the export receipt")
+    # Bind type, identity, bytes, and final pathname visibility to one retained
+    # parent descriptor; separate path predicates and hashing would leave a
+    # swap window between the type decision and the authenticated read.
+    contract.verify_artifact(artifact)
     return contract
 
 
 def save_contract(
     contract: ModelContract, path: str | pathlib.Path
 ) -> tuple[pathlib.Path, pathlib.Path]:
-    """Stage, verify, and no-replace publish JSON + Markdown contract sidecars."""
-    contract.validate(check_artifact=False)
+    """Publish sidecars beside the artifact identified by ``path`` without replacement."""
+    if type(contract) is not ModelContract:
+        raise TypeError("contract must be a ModelContract")
+    # Detach every nested list/dict from caller-owned mutable state, then use
+    # this one reparsed snapshot for paths, JSON, Markdown, and commit checks.
+    contract = ModelContract.from_json(contract.to_json())
     cwd = pathlib.Path.cwd()
     path = _absolute_from_cwd(path, cwd)
-    artifact = _absolute_from_cwd(contract.file_path, cwd)
-    if path != artifact:
+    if path.name != contract.file_path:
         raise ValueError(
-            f"contract output path {path} does not identify its signed artifact {artifact}"
+            f"artifact path {path} does not identify declared artifact filename "
+            f"{contract.file_path!r}"
         )
     json_path = path.with_suffix(".contract.json")
     md_path = path.with_suffix(".contract.md")
@@ -656,15 +730,34 @@ def save_contract(
     absolute_parent = path.parent
     artifact_name = path.name
     parent_fd = open_directory_nofollow(absolute_parent, "contract parent")
+    artifact_max_bytes = (
+        MAX_NATIVE_MODEL_BYTES if contract.backend == "candle" else DEFAULT_MAX_ARTIFACT_BYTES
+    )
+    artifact_is_directory = contract.backend == "coreml"
     stage_fd: int | None = None
     stage_name: str | None = None
     stage_identity: tuple[int, int] | None = None
     publications: dict[str, _SidecarPublication] = {}
+    attempted_finals: list[pathlib.Path] = []
+    created_finals: list[pathlib.Path] = []
+    authenticated_finals: list[pathlib.Path] = []
+    finals_synced = False
     try:
         parent_metadata = os.fstat(parent_fd)
         parent_identity = (parent_metadata.st_dev, parent_metadata.st_ino)
         _assert_directory_path(absolute_parent, parent_fd, parent_identity)
-        actual_sha = sha256_artifact_at(parent_fd, artifact_name)
+        require_safe_publication_directory(
+            parent_fd,
+            parent_metadata,
+            absolute_parent,
+            "contract parent",
+        )
+        actual_sha = sha256_artifact_at(
+            parent_fd,
+            artifact_name,
+            max_bytes=artifact_max_bytes,
+            expect_directory=artifact_is_directory,
+        )
         if actual_sha != contract.file_sha256.lower():
             raise ValueError(
                 "artifact SHA-256 no longer matches contract: "
@@ -687,20 +780,34 @@ def save_contract(
             stage_fd, _STAGE_MARKDOWN, md_publication
         ):
             raise RuntimeError("staged contract sidecars were replaced or modified")
-        if sha256_artifact_at(parent_fd, artifact_name) != contract.file_sha256.lower():
+        if (
+            sha256_artifact_at(
+                parent_fd,
+                artifact_name,
+                max_bytes=artifact_max_bytes,
+                expect_directory=artifact_is_directory,
+            )
+            != contract.file_sha256.lower()
+        ):
             raise RuntimeError("artifact changed while contract sidecars were being published")
         _assert_directory_path(absolute_parent, parent_fd, parent_identity)
 
+        attempted_finals.append(json_path)
         _link_staged_sidecar(stage_fd, _STAGE_JSON, parent_fd, json_path.name)
+        created_finals.append(json_path)
         if not _sidecar_matches(parent_fd, json_path.name, json_publication):
             raise RuntimeError("published JSON sidecar was replaced or modified")
+        authenticated_finals.append(json_path)
         _assert_directory_path(absolute_parent, parent_fd, parent_identity)
         if not _stage_is_bound(parent_fd, stage_fd, stage_name, stage_identity):
             raise RuntimeError("contract staging directory was replaced during publication")
 
+        attempted_finals.append(md_path)
         _link_staged_sidecar(stage_fd, _STAGE_MARKDOWN, parent_fd, md_path.name)
+        created_finals.append(md_path)
         if not _sidecar_matches(parent_fd, md_path.name, md_publication):
             raise RuntimeError("published Markdown sidecar was replaced or modified")
+        authenticated_finals.append(md_path)
         if not _sidecar_matches(stage_fd, _STAGE_JSON, json_publication) or not _sidecar_matches(
             stage_fd, _STAGE_MARKDOWN, md_publication
         ):
@@ -709,10 +816,19 @@ def save_contract(
             parent_fd, json_path.name, json_publication
         ) or not _sidecar_matches(parent_fd, md_path.name, md_publication):
             raise RuntimeError("published contract sidecars changed before commit")
-        if sha256_artifact_at(parent_fd, artifact_name) != contract.file_sha256.lower():
+        if (
+            sha256_artifact_at(
+                parent_fd,
+                artifact_name,
+                max_bytes=artifact_max_bytes,
+                expect_directory=artifact_is_directory,
+            )
+            != contract.file_sha256.lower()
+        ):
             raise RuntimeError("artifact changed while contract sidecars were being published")
         _assert_directory_path(absolute_parent, parent_fd, parent_identity)
         os.fsync(parent_fd)
+        finals_synced = True
         cleanup = _cleanup_private_stage(
             parent_fd,
             stage_fd,
@@ -724,6 +840,8 @@ def save_contract(
                 parent_identity=parent_identity,
                 artifact_name=artifact_name,
                 artifact_sha256=contract.file_sha256.lower(),
+                artifact_is_directory=artifact_is_directory,
+                artifact_max_bytes=artifact_max_bytes,
                 final_publications={
                     json_path.name: json_publication,
                     md_path.name: md_publication,
@@ -750,12 +868,49 @@ def save_contract(
             os.close(parent_fd)
         except BaseException as cleanup:
             attach_cleanup_failure(error, cleanup, "contract parent descriptor cleanup failed")
+        if attempted_finals:
+            attempted_paths = ", ".join(str(item) for item in attempted_finals)
+            created_paths = ", ".join(str(item) for item in created_finals)
+            authenticated_paths = (
+                ", ".join(str(item) for item in authenticated_finals)
+                if authenticated_finals
+                else "none"
+            )
+            durability = "durable" if finals_synced else "visibility known; durability unknown"
+            marker = str(absolute_parent / stage_name) if stage_name is not None else "not acquired"
+            message = (
+                "contract publication failed after attempting a final sidecar; "
+                f"attempted paths: {attempted_paths}; visible or reconciled paths: "
+                f"{created_paths or 'none'}; authenticated before failure: "
+                f"{authenticated_paths}; state: {durability}; "
+                f"recovery marker: {marker}; cause: {error}"
+            )
+            if isinstance(error, FileExistsError):
+                raise FileExistsError(message) from error
+            raise RuntimeError(message) from error
         raise
+    close_error: BaseException | None = None
     if stage_fd is not None:
-        with suppress(OSError):
+        try:
             os.close(stage_fd)
-    with suppress(OSError):
+        except BaseException as error:
+            close_error = error
+    try:
         os.close(parent_fd)
+    except BaseException as error:
+        if close_error is None:
+            close_error = error
+        else:
+            attach_cleanup_failure(
+                close_error,
+                error,
+                "contract parent descriptor cleanup also failed",
+            )
+    if close_error is not None:
+        raise RuntimeError(
+            "contract sidecars are committed, but publication descriptor cleanup failed: "
+            f"{json_path}, {md_path}"
+        ) from close_error
     return json_path, md_path
 
 

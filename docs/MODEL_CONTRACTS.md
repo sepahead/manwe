@@ -1,181 +1,233 @@
 # Model contracts
 
-Manwe does not commit model weights. Raw conversion first emits an immutable
-`ExportReceipt` containing source/artifact digests and exact conversion options.
-A candidate `ModelContract` can then be built only with that receipt plus a
-separate `VerifiedArtifactSignature` populated from backend inspection and golden
-fixture evidence. `save_contract` writes the resulting sidecars exclusively.
+Manwe schema 2.0 is an executable model-package contract, not a descriptive model
+card. It binds one portable sibling artifact name and digest to a closed tensor,
+preprocessing, decoding, taxonomy, and postprocessing policy.
 
-The record is a **manifest and local validation boundary**. It does not alter a
-model graph, compile an artifact, install a consumer adapter, or prove that
-crebain (or another consumer) can execute it. No reviewed consumer automatically
-negotiates or enforces this JSON today; see the
-[compatibility matrix](INTEGRATION_CREBAIN.md).
+The native Rust CLI and viewer consume schema 2 directly for the reviewed Candle
+adapters. Other backends use the same record as producer evidence, but still need
+an implemented runtime or downstream adapter.
 
-## Required record
+## What a contract proves
 
-| Field | What it captures |
+A validated contract proves internal consistency. When loaded with artifact
+verification, it also proves that the sibling artifact bytes match the declared
+SHA-256. For a supported native adapter, validation checks the exact model variant,
+input geometry, YOLOv8 output grid, class head, dtype, resource bounds, and
+postprocessing policy before inference.
+
+It does not prove:
+
+- who authored or approved the contract;
+- model accuracy, calibration, fairness, rights, or fitness for a domain;
+- that an ONNX/CoreML/TensorRT artifact works in an unimplemented consumer;
+- numerical parity across CPU, Metal, CUDA, or another framework; or
+- compatibility with a downstream wire, clock, frame, or lifecycle contract.
+
+The `signature_evidence` field records backend tensor-interface inspection. It is
+not a digital signature. Establish contract provenance through a trusted release,
+digest registry, signature/attestation system, or another operator-controlled
+channel.
+
+## Production sequence
+
+```text
+exact checkpoint
+      │ raw conversion
+      ▼
+ExportReceipt
+  source/artifact digests + options
+      │ independent backend inspection and golden tensor fixture
+      ▼
+VerifiedArtifactSignature
+  tensors + RuntimeSpec + evidence reference
+      │ build_export_contract
+      ▼
+ModelContract 2.0
+      │ save_contract (exclusive, durable sidecars)
+      ▼
+artifact + .contract.json + .contract.md
+```
+
+Raw conversion deliberately stops at `ExportReceipt`. The builder never guesses
+an interface from “YOLO,” a suffix, or a model name. Python checkpoint inference
+is a separate research wrapper with its own digest and pickle-admission boundary;
+it does not pretend to execute the native schema-2 adapter.
+
+## Schema 2.0 record
+
+| Area | Required fields and invariant |
 |---|---|
-| Schema version | Contract parser/version boundary |
-| Model name/version | Family, checkpoint and export version |
-| Source and source SHA-256 | Training/checkpoint provenance and exact source identity |
-| Rights | Intended use/redistribution review for code, base weights and derived weights |
-| Backend and artifact path | Declared runtime plus exact file/bundle path |
-| SHA-256 | Digest of a file or deterministic directory tree |
-| Export options and signature evidence | Precision, opset, NMS/calibration choices plus the inspection/fixture reference |
-| Number of classes and class map | Complete source-index coverage mapped to an allowed candidate label or explicit `DROP` |
-| Input tensors | Names, shapes, dtypes, layouts, channel order and dynamic bounds |
-| Output tensors | Names, shapes, dtypes, box/score semantics and coordinate convention |
-| Preprocess/postprocess | Decode, resize, normalize, NMS, thresholds, scaling and max detections |
-| Validation data | Immutable fixture manifest/digest and its rights |
-| Benchmark context | Hardware, OS, runtime/provider, command, precision, thresholds and timed scope |
-| Failure behavior | Missing, malformed, wrong-digest, wrong-extension and resource-limit behavior |
+| Identity | `schema_version`, model name/version, source, rights |
+| Artifact | backend, portable sibling `file_path`, lowercase SHA-256 |
+| Provenance | source SHA-256, exact export options, interface-evidence reference |
+| Taxonomy | class count, unique source classes, complete index-keyed `class_map` |
+| Tensors | bounded unique input/output names, concrete or canonical dimensions, dtype/layout |
+| Runtime | closed adapter ID plus typed image-input and detection-output policy |
+| Evidence | validation data, benchmark context, failure behavior |
+| Human context | matching preprocess/postprocess summaries; machine behavior comes from `runtime` |
 
-Schema 1.2 validation rejects missing values, incomplete class maps, invalid tensor
-descriptions, wrong artifact suffix/type, empty or oversized artifacts, missing
-artifacts, digest mismatches, and symlinks. CoreML bundles use a bounded,
-deterministic directory-tree digest. Sidecars are first written, synced, and
-verified inside an adjacent private `.manwe-contract-*.in-progress` directory,
-then published with descriptor-relative no-replace hard links. An occupied path
-is rejected before staging, while the link operations remain the authoritative
-no-replace check. Once either final link exists, any failure preserves every final
-pathname; failures detected before marker removal also preserve the staging marker
-for manual recovery. Cleanup never check-then-unlinks a possibly replaced final
-path. It proceeds only after revalidating the parent pathname identity,
-signed-artifact digest, and original staged/final inode/content identities,
-including one complete commit-boundary check immediately before marker removal.
-`save_contract` returns success only after both durable final links are verified,
-the marker is removed, and that removal is synced. If cleanup cannot be
-authenticated, it raises and preserves the marker. If marker removal succeeds but
-its parent fsync fails, it raises an **indeterminate commit** error: the current
-namespace has no marker, but a crash may make it reappear.
+`file_path` is one ASCII basename, resolved beside the JSON contract. Absolute
+paths, traversal, nested paths, Unicode lookalikes, wrong backend suffixes, links,
+empty files, and digest mismatches are rejected.
 
-POSIX provides no conditional unlink-by-inode operation. The absolute guarantee is
-that Manwe never removes either final pathname; private-stage cleanup relies on its
-high-entropy mode-0700 name plus immediate identity/content checks. A hostile
-same-UID process actively racing those checks remains outside this boundary.
+Every source class index appears exactly once in `class_map`. Its value is one of
+`drone`, `bird`, `aircraft`, `helicopter`, `unknown`, or `null`. Native structured
+results always retain the source index/name and add the mapped `airspace_class`;
+`null` remains explicit rather than silently inventing or deleting a source
+result.
 
-Manual recovery is intentionally conservative:
+### Typed image input
 
-1. Stop concurrent writers and retain every final path and in-progress directory.
-2. Compare any staged files still present, the final files, recorded digests, and
-   signed artifact; a late failure may leave an empty marker, so never infer
-   completeness from names alone.
-3. Quarantine mismatches. Remove the marker and sync its parent only after both
-   sidecars are verified, or re-sync and re-inspect the parent after an indeterminate
-   marker-removal error.
+`runtime.input` pins tensor name, width/height, dtype, `NCHW/RGB`, RGB order,
+letterbox policy, interpolation, stride alignment, pad value, scale, mean, and
+standard deviation. The Candle v1 adapters require square 32-aligned FP32 input,
+Catmull–Rom resize, pad 114, and exactly `1/255` scaling with zero mean/unit
+standard deviation.
 
-The builder does not infer tensors from `family="yolo"` or a file extension. Raw
-export receipts deliberately set `tensor_signature_verified=false`; a caller must
-inspect the exact graph/runtime, record its real inputs/outputs and preprocessing,
-and cite the fixture or inspection evidence before a candidate contract exists.
+### Typed detection output
 
-These checks establish manifest integrity, not semantic compatibility. A valid
-five-class ONNX contract remains incompatible with a consumer hard-coded for an
-80-class head.
+`runtime.output` pins tensor name, `cxcywh`, input-pixel coordinates, probability
+scores, confidence threshold, class-aware NMS IoU, maximum detections, and—only
+for pose—the keypoint threshold. The tensor record pins the exact raw shape and
+dtype. Native adapters apply the three probability/IoU thresholds after
+round-to-nearest conversion to IEEE-754 binary32, matching their FP32 model
+outputs; the JSON number is not an independent higher-precision decision rule.
+
+### Implemented adapters
+
+| Adapter | Native status | Closed constraints |
+|---|---|---|
+| `manwe-candle-yolov8-detect-v1` | Implemented by shared Rust runtime | variants n/s/m/l/x; 1–1,000 classes; FP32 `[1, 4+C, N]`; `N` equals stride 8/16/32 grid sum |
+| `manwe-candle-yolov8-pose-v1` | Implemented by shared Rust runtime | one source class; canonical COCO-17 `(x,y,confidence)` order; FP32 `[1, 5+51, N]` |
+| `ultralytics-raw-detect-v1` | Python export evidence adapter | static raw detect tensor; no native Rust execution claim |
+
+All adapters have bounded JSON, tensor rank/dimensions, predictions, output
+elements, classes, detections, model bytes, and text. Unknown fields and duplicate
+JSON keys fail closed in both Python and Rust.
+
+## Using a contract
+
+Validate a sidecar and its sibling artifact from Python:
+
+```bash
+manwe contract /models/model.contract.json
+manwe contract /models/model.contract.json --json
+```
+
+Metadata-only inspection is explicit and weaker:
+
+```bash
+manwe contract /models/model.contract.json --no-verify-artifact
+```
+
+Execute a supported Candle package:
+
+```bash
+manwe --contract /models/model.contract.json --output-dir /outputs image.jpg
+camera_view --contract /models/model.contract.json --url rtsp://camera.example/live
+```
+
+The packaged file
+`manwe/schemas/model-contract-v2.candle-detect.example.json` is a schema fixture
+with placeholder digests and evidence. It is intentionally non-executable. Replace
+every model-specific and evidence field from actual artifact inspection; do not
+treat the fixture as an attestation or a converter.
+
+No checked-in converter currently produces the repository’s Candle YOLOv8 key
+layout. A generic safetensors file—including an Ultralytics checkpoint—does not
+become compatible because its extension matches.
+
+## Native inference receipt
+
+The Rust batch CLI writes one JSON object per input image after the annotated JPEG
+is durably published. The receipt includes:
+
+- result schema, detect/pose task, and selected device;
+- model name/version;
+- contract path and digest;
+- artifact path and digest;
+- input path and digest;
+- output path and digest; and
+- one `objects` payload tagged as `detections` or `poses` with its typed items.
+
+Contract and artifact paths are the last-authenticated package paths; input paths
+are canonical display labels resolved before the bounded read. A later rename can
+make any of them stale. Their digests—not a subsequent lookup by pathname—identify
+the bytes used by the run.
+
+Objects are ordered deterministically by descending confidence with stable source
+prediction tie-breaking. Coordinates are finite source-image-pixel `xyxy`; pose
+keypoints use contract names and source pixels. Publication never replaces an
+existing path. The recommended `--output-dir` boundary lets input storage remain
+untrusted or read-only; it must already exist and be owner-controlled. Without the
+option, output is published beside each input under the same ownership rule.
+Publication is atomic per image, not across the entire argument list: a failure
+on a later input does not invalidate or remove earlier outputs and receipts.
+
+## Sidecar publication and recovery
+
+`save_contract` snapshots mutable Python objects through canonical JSON, verifies
+the exact sibling artifact again, stages JSON and Markdown in an adjacent private
+directory, and publishes both with no-replace hard links. Success means both
+finals are verified and durable and marker removal is synced.
+
+The artifact parent must already exist and permit a mode/ACL trust proof. A
+group/world-writable parent is accepted only when it is sticky and owned by the
+effective account or root; an unmodeled access-control ACL is rejected before a
+stage is created. This excludes replacement by a different ordinary account.
+Same-UID and privileged mutation remain outside the POSIX pathname boundary.
+
+Once a final link exists, an error preserves final paths and available staging
+evidence. Recovery is conservative:
+
+1. stop concurrent writers;
+2. retain every final and `.manwe-contract-*.in-progress` entry;
+3. compare artifact, JSON, Markdown, and recorded digests;
+4. quarantine any mismatch; and
+5. remove an authenticated marker only after the final state is understood and
+   its parent can be synced.
+
+Names alone never establish commit state.
 
 ## Backend status
 
-| Backend | Manwe output/status | Consumer work still required |
+| Backend | Manwe status | Remaining promotion work |
 |---|---|---|
-| ONNX | Raw conversion is available into a caller-owned, previously absent destination | Inspect opset/providers, tensor names/layout, class count, dynamic shapes, preprocessing and NMS; run consumer fixtures. |
-| CoreML | Raw conversion normally yields `.mlpackage` | Compile to `.mlmodelc` where required; pin feature names, compute units, image transform, labels and Vision output contract. |
-| TensorRT | Ultralytics can produce an engine on a supported NVIDIA environment | Pin GPU/driver/TensorRT compatibility and calibration. A consumer that loads ONNX through the TensorRT execution provider does not thereby accept `.engine`. |
-| MLX | The manifest type recognizes `.safetensors`, but Manwe has no implemented MLX converter | A generic safetensors file is not executable; graph architecture, key names/shapes, class head and preprocessing must match a specific loader. |
+| Candle safetensors | Contract-bound detect/pose reference runtime | exact compatible weights, golden forward, CPU/accelerator parity, domain evaluation |
+| ONNX | Raw conversion and schema-2 evidence | provider/opset fixture, exact tensors/preprocess/NMS, consumer adapter |
+| CoreML | Raw `.mlpackage` conversion and evidence | compile where required; feature names, compute units, Vision output fixture |
+| TensorRT | Raw engine conversion on supported NVIDIA systems | GPU/driver/runtime compatibility, calibration inspection, fidelity, consumer path |
+| MLX | Contract type recognizes `.safetensors`; no converter/runtime | implement and validate a concrete graph; suffix alone is insufficient |
 
-Export conversion must be treated as untrusted output until every selected backend
-passes the same semantic fixture set. Never infer support from a successful file
-write or extension.
+## Fidelity gate
 
-## Fidelity gate: AP50 plus deployed-output agreement
+`manwe.export.fidelity_report` compares exported detections with an FP32 reference
+in source-image-pixel `xyxy`, aligned by unique image ID. It gates:
 
-`manwe.export.fidelity_report` compares exported detections with the FP32 reference
-against shared ground truth. `Detections.boxes` and `GroundTruth.boxes` are
-positive-area `xyxy` coordinates in **source-image pixels**, after each backend's
-inverse resize/letterbox transform. Model-canvas or normalized boxes must be
-converted before evaluation.
+- macro AP50 and a documented simplified AP50-small view;
+- per-class AP drops;
+- deployed-threshold precision, recall, and FPPI; and
+- direct one-to-one same-class box/score agreement for every frame.
 
-The report includes:
+By default, paired boxes require IoU at least 0.95, score delta at most 0.05, and
+no missing or extra detections. `passed` requires all configured gates and required
+class/small-class coverage. Historical `ref_map`/`exp_map` names are retained for
+compatibility, but they are not COCO `mAP@[.50:.95]`; use a pinned pycocotools
+protocol for publishable COCO metrics.
 
-- macro **AP50** at one IoU threshold (`0.50`);
-- a simplified **AP50-small** view based on pixel area;
-- per-class AP drops, with an absolute default tolerance of `0.005` (0.5
-  percentage points);
-- precision, recall, and false positives per image (**FPPI**) at the detections'
-  deployed confidence threshold;
-- direct one-to-one, same-class reference/export agreement for every frame: by
-  default paired boxes need IoU ≥ `0.95`, no reference detection may be missing,
-  no exported detection may be extra, and each paired score delta must be ≤ `0.05`.
+## Minimum promotion gates
 
-`passed` requires all of those gates. The operating-point precision/recall drop
-tolerance defaults to the AP tolerance; added FPPI defaults to zero tolerance.
-Callers may configure them explicitly. This closes an AP interpolation blind spot:
-false positives after full recall can leave AP unchanged but will increase FPPI
-and appear as extra exported detections.
+1. Verify artifact type, exact digest, contract provenance, and rights.
+2. Reject wrong graph, tensor names/ranks/shapes/dtypes, class count, and resource bounds.
+3. Match golden preprocessing pixels and raw tensors on the actual runtime.
+4. Exercise every class plus no-target and irrelevant-target fixtures.
+5. Match inverse letterbox, clipping, threshold boundaries, class-aware NMS, and maximum detections.
+6. Pass aligned AP50/AP50-small, operating-point, and direct agreement gates.
+7. Measure latency only after fidelity, with warm-up, synchronization, timing scope, hardware, and variance recorded.
+8. Prove malformed/missing/oversized inputs fail without partial trust or uncontrolled work.
+9. Pin adapter and consumer versions and retain a rollback package.
+10. Re-review exact checkpoint, dataset, derived-weight, and runtime rights before redistribution or production use.
 
-The historical `ref_map`/`exp_map` field names are retained for API compatibility,
-but the values are not COCO `mAP@[.50:.95]`. The small-object calculation filters by
-area and does not implement all COCO ignore/crowd/max-detection rules. Use
-`pycocotools` with a pinned dataset protocol for publishable or comparable COCO
-metrics.
-
-Frame order must not be an implicit assumption. The fidelity gate requires a
-unique, non-empty `image_id` on every reference, exported and ground-truth frame;
-it rejects duplicates and misaligned sequences. The lower-level
-`mean_average_precision` helper retains positional alignment only when callers
-omit every ID, so it must not be used as a promotion boundary without a separate
-identity contract.
-
-Use `required_classes` and `required_small_classes` to name the operational
-coverage that must exist in ground truth. The report always rejects an evaluation
-with no measured classes or no small-object classes, but it cannot infer which
-classes the deployment promises; omit those arguments only for a deliberately
-bounded experiment.
-
-The fidelity report is necessary but not sufficient. It still needs representative
-positive and negative frames, the exact deployed confidence threshold and consumer
-pre/postprocess. Add a full COCO-style sweep, calibration, boundary cases and
-consumer end-to-end fixtures before promotion.
-
-## Minimum acceptance before trusting detections
-
-1. Artifact path, type, digest and directory-tree rules validate.
-2. Consumer load fails closed on the wrong graph, tensor names, rank, class count,
-   precision and dynamic dimensions.
-3. Golden preprocessing pixels and raw tensors match the consumer path; all metric
-   boxes have been transformed back to source-image-pixel `xyxy`.
-4. Every class and no-target/irrelevant-target fixtures produce the expected raw
-   and postprocessed outputs within documented tolerance.
-5. Box conversion, threshold boundaries, class-aware NMS and maximum detections
-   match on extreme aspect ratios and overlapping boxes.
-6. Unique frame IDs align reference/export/ground truth, required class and
-   small-class coverage exists, and per-class AP50/AP50-small drops pass.
-7. Deployed-threshold precision/recall/FPPI and direct same-class box/score
-   agreement pass; trailing false positives cannot hide behind interpolated AP.
-8. Latency is measured only after accuracy parity and records exact timing scope,
-   warm-up, synchronization, hardware/runtime and repeated-run variance.
-9. Missing/malformed/oversized artifacts and tensors fail without partial trust,
-   path traversal, uncontrolled allocation or secret leakage.
-10. The adapter/consumer versions and rollback artifact are pinned; rights review
-    covers the exact base checkpoint, training data, generated artifact and
-    runtime—not just this repository's source license.
-
-## Licensing boundary
-
-The Manwe source is MIT. That does not relicense any model checkpoint, fine-tuned
-derivative, dataset or optional dependency. Licenses can vary by model family,
-checkpoint tier, release date, use case and commercial agreement. Dataset terms
-may also restrict redistribution of learned weights or validation fixtures.
-
-Do not write `rights="weights self-produced; MIT"` merely because training ran
-locally. Instead record verifiable facts, for example:
-
-```text
-base checkpoint: <name, version, source URL, digest, upstream license snapshot>
-training datasets: <names, versions, terms, access/redistribution review>
-derived artifact: <intended use and legal-review reference>
-export toolchain: <versions and relevant licenses>
-```
-
-Treat the `rights` field as an auditable record, not a legal conclusion. Re-check
-upstream terms before each redistribution or production use.
+The source license does not relicense weights or data. Treat `rights` as an
+auditable factual record, not a legal conclusion.

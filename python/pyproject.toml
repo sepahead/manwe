@@ -123,10 +123,10 @@ Repository = "https://github.com/sepahead/manwe"
 packages = ["src/manwe"]
 
 [tool.hatch.build.targets.sdist]
-# A source release is an explicit, reviewable input set. In particular, do not
-# let ignored version-specific virtual environments or other workstation state
-# leak into an archive when the package is built from this repository subdir.
-only-include = ["src", "tests", "uv.lock"]
+# Narrow Hatch's traversal to release roots. Hatch can still include untracked
+# entries below those roots, so scripts/verify_python_sdist.py separately proves
+# the built archive is exactly the tracked, regular-file release set.
+only-include = ["configs", "src", "tests", "uv.lock"]
 
 # ----------------------------------------------------------------------------
 [tool.pytest.ini_options]

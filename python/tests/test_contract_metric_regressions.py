@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+import errno
 import os
 
 import numpy as np
 import pytest
 
-from manwe.common.contracts import CREBAIN_CLASSES, TensorSpec
+from manwe.common.contracts import CREBAIN_CLASSES, TensorSpec, detection_runtime
 from manwe.eval.detection import (
     Detections,
     GroundTruth,
@@ -57,6 +58,11 @@ def _build_contract(artifact, **overrides):
         source_classes=receipt.source_classes,
         inputs=(TensorSpec("images", [1, 3, 640, 640], "float32", "NCHW/RGB"),),
         outputs=(TensorSpec("output", [1, 4 + num_classes, 8400], "float32"),),
+        runtime=detection_runtime(
+            input_tensor="images",
+            output_tensor="output",
+            image_size=640,
+        ),
         preprocess="inspected fixture preprocessing",
         postprocess="inspected fixture postprocessing",
         failure_behavior="fixture-backed shape mismatch raises",
@@ -120,6 +126,7 @@ def test_identity_class_map_requires_exact_ordered_source_taxonomy(tmp_path):
         source_classes=reordered,
         inputs=tuple(baseline.inputs),
         outputs=tuple(baseline.outputs),
+        runtime=baseline.runtime,
         preprocess="inspected fixture preprocessing",
         postprocess="inspected fixture postprocessing",
         failure_behavior="fixture-backed shape mismatch raises",
@@ -163,7 +170,7 @@ def test_contract_rejects_bad_schema_backend_and_class_map_coverage(tmp_path):
         contract.validate_class_map()
 
     contract.class_map = {0: "drone", 1: "car"}  # type: ignore[dict-item]
-    with pytest.raises(ValueError, match="must be a crebain class"):
+    with pytest.raises(ValueError, match="must be a Manwe airspace class"):
         contract.validate_class_map()
 
 
@@ -208,9 +215,7 @@ def test_coreml_directory_contract_and_save_digest_gate(tmp_path):
         save_contract(contract, package)
 
 
-def test_save_contract_success_is_not_reclassified_by_descriptor_close_errors(
-    tmp_path, monkeypatch
-):
+def test_save_contract_reports_committed_state_after_descriptor_close_errors(tmp_path, monkeypatch):
     from manwe.export import contract as contract_module
 
     artifact = tmp_path / "model.onnx"
@@ -235,10 +240,39 @@ def test_save_contract_success_is_not_reclassified_by_descriptor_close_errors(
 
     monkeypatch.setattr(contract_module, "_cleanup_private_stage", enable_close_failures)
     monkeypatch.setattr(contract_module.os, "close", close_after_release)
-    json_path, markdown_path = save_contract(contract, artifact)
+    with pytest.raises(RuntimeError, match="sidecars are committed") as captured:
+        save_contract(contract, artifact)
+    json_path = artifact.with_suffix(".contract.json")
+    markdown_path = artifact.with_suffix(".contract.md")
     assert json_path.is_file()
     assert markdown_path.is_file()
     assert close_calls
+    assert isinstance(captured.value.__cause__, OSError)
+    if hasattr(captured.value.__cause__, "__notes__"):
+        assert any(
+            "contract parent descriptor cleanup also failed" in note
+            for note in captured.value.__cause__.__notes__
+        )
+
+
+def test_save_contract_reconciles_lost_hard_link_success_replies(tmp_path, monkeypatch):
+    from manwe.export import contract as contract_module
+
+    artifact = tmp_path / "model.onnx"
+    artifact.write_bytes(b"model")
+    contract = _build_contract(artifact)
+    real_link = contract_module.os.link
+
+    def link_then_report_failure(*args, **kwargs):
+        real_link(*args, **kwargs)
+        raise OSError(errno.EIO, "simulated lost remote-filesystem link reply")
+
+    monkeypatch.setattr(contract_module.os, "link", link_then_report_failure)
+    json_path, markdown_path = save_contract(contract, artifact)
+
+    assert json_path.read_text(encoding="utf-8") == contract.to_json()
+    assert markdown_path.read_text(encoding="utf-8") == contract.to_markdown(check_artifact=False)
+    assert not list(tmp_path.glob(".manwe-contract-*.in-progress"))
 
 
 def test_save_contract_anchors_relative_paths_to_one_cwd_snapshot(tmp_path, monkeypatch):
@@ -309,9 +343,9 @@ def test_contract_rejects_root_symlinks_and_artifact_tampering(tmp_path):
 
     contract = _build_contract(artifact)
     artifact.write_bytes(b"tampered")
-    assert not contract.is_complete()
+    assert contract.is_complete()
     with pytest.raises(ValueError, match="SHA-256"):
-        contract.validate()
+        contract.verify_artifact(artifact)
 
 
 def test_save_contract_never_replaces_preoccupied_paths(tmp_path):
@@ -752,8 +786,9 @@ def test_metric_rejects_out_of_range_or_mutated_nonfinite_arrays():
     with pytest.raises(ValueError, match="outside"):
         mean_average_precision(preds, gts, num_classes=5)
 
-    preds[0].labels[0] = 0
-    preds[0].scores[0] = np.nan
+    with pytest.raises(ValueError, match="read-only"):
+        preds[0].scores[0] = np.nan
+    object.__setattr__(preds[0], "scores", np.array([np.nan]))
     with pytest.raises(ValueError, match="finite"):
         mean_average_precision(preds, gts, num_classes=5)
 
@@ -919,7 +954,7 @@ def test_full_class_map_is_required(tmp_path):
     contract = _build_contract(artifact, class_map=sparse, num_classes=80)
     assert contract.is_complete()
     assert contract.class_map[1] is None
-    assert "| 1 | DROP |" in contract.to_markdown()
+    assert "| 1 | UNMAPPED |" in contract.to_markdown()
 
 
 def test_fidelity_rejects_trailing_false_positives_that_ap_does_not_penalize():

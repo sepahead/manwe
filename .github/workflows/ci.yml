@@ -315,7 +315,17 @@ jobs:
           import pkgutil
           import manwe
 
-          expected = {"audio", "common", "data", "eval", "export", "fusion", "multicam", "vision"}
+          expected = {
+              "audio",
+              "common",
+              "data",
+              "eval",
+              "export",
+              "fusion",
+              "multicam",
+              "schemas",
+              "vision",
+          }
           packaged = {module.name for module in pkgutil.iter_modules(manwe.__path__)}
           missing = expected - packaged
           if missing:
@@ -333,9 +343,22 @@ jobs:
               raise SystemExit("wheel does not contain the declared license file")
           if not any(str(path).endswith("manwe/py.typed") for path in files):
               raise SystemExit("wheel does not contain the PEP 561 marker")
+          schema_member = "manwe/schemas/model-contract-v2.candle-detect.example.json"
+          if not any(str(path).endswith(schema_member) for path in files):
+              raise SystemExit(f"wheel does not contain {schema_member}")
 
           for package in sorted(expected):
               __import__(f"manwe.{package}")
+
+          from manwe.common.contracts import ModelContract
+          from manwe.schemas import candle_detect_example_bytes
+
+          example = ModelContract.from_json(candle_detect_example_bytes())
+          if (
+              example.schema_version != "2.0"
+              or example.runtime.adapter != "manwe-candle-yolov8-detect-v1"
+          ):
+              raise SystemExit("packaged Candle contract example is not the reviewed schema-2 fixture")
           PY
           .wheel-venv/bin/manwe --version
 

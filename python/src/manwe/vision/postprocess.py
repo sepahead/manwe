@@ -9,7 +9,8 @@ from __future__ import annotations
 
 import numpy as np
 
-from ..common.contracts import CREBAIN_CLASSES, coco_to_crebain, crebain_class_index
+from ..common.contracts import AIRSPACE_CLASSES, airspace_class_index, coco_to_airspace
+from ..common.numeric import finite_float64_scalar
 
 _MAX_COORDINATE_MAGNITUDE = np.sqrt(np.finfo(np.float64).max) / 4.0
 _MAX_EXACT_IMAGE_DIMENSION = 2**53
@@ -62,12 +63,9 @@ def _float_numeric_array(raw: np.ndarray, error_message: str) -> np.ndarray:
 
 
 def _real_numeric_scalar(value: object, error_message: str) -> float:
-    if isinstance(value, bool) or not isinstance(value, (int, float, np.integer, np.floating)):
-        raise ValueError(error_message)
     try:
-        with np.errstate(over="ignore", invalid="ignore"):
-            return float(value)
-    except (TypeError, ValueError, OverflowError) as exc:
+        return finite_float64_scalar(value, "value")
+    except ValueError as exc:
         raise ValueError(error_message) from exc
 
 
@@ -303,14 +301,14 @@ def nms(
     return keep
 
 
-def crebain_class_map(model_names: dict[int, str]) -> dict[int, int]:
-    """Map a model's own class ids to crebain class indices.
+def airspace_class_map(model_names: dict[int, str]) -> dict[int, int]:
+    """Map a model's own class ids to Manwe airspace class indices.
 
-    If a model is already trained on the crebain taxonomy, its names map straight
-    through. A COCO model routes through :func:`coco_to_crebain`. Names with no
+    If a model is already trained on the Manwe taxonomy, its names map straight
+    through. A COCO model routes through :func:`coco_to_airspace`. Names with no
     aerial counterpart are dropped (absent from the returned dict).
     """
-    if not isinstance(model_names, dict) or not model_names:
+    if type(model_names) is not dict or not model_names:
         raise ValueError("model_names must be a nonempty integer-keyed class mapping")
     if len(model_names) > _MAX_MODEL_CLASSES:
         raise ValueError(f"model_names exceeds the {_MAX_MODEL_CLASSES}-class safety limit")
@@ -318,9 +316,9 @@ def crebain_class_map(model_names: dict[int, str]) -> dict[int, int]:
         raise ValueError(f"model class ids must be integers in [0, {_MAX_MODEL_CLASSES})")
     out: dict[int, int] = {}
     normalized_names: list[str] = []
-    for mid, name in model_names.items():
+    for mid, name in dict.items(model_names):
         if (
-            not isinstance(name, str)
+            type(name) is not str
             or not name.strip()
             or not name.strip().isprintable()
             or len(name.strip().encode("utf-8")) > 256
@@ -329,15 +327,19 @@ def crebain_class_map(model_names: dict[int, str]) -> dict[int, int]:
         normalized_name = name.strip()
         normalized_names.append(normalized_name)
         name_l = normalized_name.lower()
-        if name_l in CREBAIN_CLASSES:
-            out[mid] = crebain_class_index(name_l)
+        if name_l in AIRSPACE_CLASSES:
+            out[mid] = airspace_class_index(name_l)
             continue
-        mapped = coco_to_crebain(name_l)
+        mapped = coco_to_airspace(name_l)
         if mapped is not None:
-            out[mid] = crebain_class_index(mapped)
+            out[mid] = airspace_class_index(mapped)
     if len(set(normalized_names)) != len(normalized_names):
         raise ValueError("model class names must be unique")
     return out
+
+
+# Pre-2.0 compatibility alias. New code should use the Manwe-owned name.
+crebain_class_map = airspace_class_map
 
 
 __all__ = [
@@ -345,5 +347,6 @@ __all__ = [
     "xywh2xyxy",
     "scale_boxes",
     "nms",
+    "airspace_class_map",
     "crebain_class_map",
 ]

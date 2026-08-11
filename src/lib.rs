@@ -1,26 +1,39 @@
-// pub mod audio;
-// pub mod bs1770;
 pub mod coco_classes;
 pub mod model;
+pub mod native_runtime;
+pub mod runtime_contract;
 pub mod secure_io;
 pub mod stream_url;
-// pub mod imagenet;
-// pub mod token_output_stream;
-// pub mod wav;
 
 use candle::utils::{cuda_is_available, metal_is_available};
 use candle::{Device, Result, Tensor};
 use image::DynamicImage;
+use std::io::Write;
+use unicode_categories::UnicodeCategories;
 
 const MAX_SOURCE_DIMENSION: usize = 32_768;
 const MAX_SOURCE_PIXELS: usize = 64 * 1024 * 1024;
-const MAX_INFERENCE_DIMENSION: usize = 4_096;
+pub(crate) const MAX_INFERENCE_DIMENSION: usize = 4_096;
 const COCO_CLASS_COUNT: usize = 80;
-const MAX_REPORT_PREDICTIONS: usize = 100_000;
+const MAX_MODEL_CLASSES: usize = 4_096;
+pub(crate) const MAX_NATIVE_MODEL_CLASSES: usize = 1_000;
+pub(crate) const MAX_REPORT_PREDICTIONS: usize = 100_000;
 const MAX_COCO_OUTPUT_ELEMENTS: usize = (4 + COCO_CLASS_COUNT) * MAX_REPORT_PREDICTIONS;
-const MAX_NMS_BOXES: usize = 2_000;
+pub(crate) const MAX_MODEL_OUTPUT_ELEMENTS: usize = 16_000_000;
+pub(crate) const MAX_NMS_BOXES: usize = 2_000;
 const MAX_NMS_PAIR_WORK: usize = MAX_NMS_BOXES * (MAX_NMS_BOXES - 1) / 2;
 const MAX_REPORT_CANDIDATES: usize = MAX_NMS_BOXES;
+
+pub(crate) fn is_contract_printable(value: &str) -> bool {
+    value.chars().all(|character| {
+        character == ' '
+            || character.is_letter()
+            || character.is_mark()
+            || character.is_number()
+            || character.is_punctuation()
+            || character.is_symbol()
+    })
+}
 
 pub fn device(cpu: bool) -> Result<Device> {
     if cpu {
@@ -30,16 +43,6 @@ pub fn device(cpu: bool) -> Result<Device> {
     } else if metal_is_available() {
         Ok(Device::new_metal(0)?)
     } else {
-        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-        {
-            println!(
-                "Running on CPU, to run on GPU(metal), build this example with `--features metal`"
-            );
-        }
-        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
-        {
-            println!("Running on CPU, to run on GPU, build this example with `--features cuda`");
-        }
         Ok(Device::Cpu)
     }
 }
@@ -116,6 +119,19 @@ pub struct ImageTransform {
 
 impl ImageTransform {
     fn validate_for_image(&self, image: &DynamicImage) -> Result<()> {
+        let expected_resized = if self.canvas_width == self.canvas_height
+            && self.canvas_width > 0
+            && self.canvas_width <= MAX_INFERENCE_DIMENSION
+        {
+            Some(resize_dimensions(
+                image.width() as usize,
+                image.height() as usize,
+                self.canvas_width,
+                1,
+            )?)
+        } else {
+            None
+        };
         if self.original_width == 0
             || self.original_height == 0
             || self.resized_width == 0
@@ -129,6 +145,7 @@ impl ImageTransform {
             || self.resized_width > self.canvas_width
             || self.resized_height > self.canvas_height
             || self.canvas_width != self.canvas_height
+            || expected_resized != Some((self.resized_width, self.resized_height))
             || self.pad_left != (self.canvas_width - self.resized_width) / 2
             || self.pad_top != (self.canvas_height - self.resized_height) / 2
         {
@@ -137,12 +154,14 @@ impl ImageTransform {
         Ok(())
     }
 
-    fn source_x(&self, value: f32) -> f32 {
-        (value - self.pad_left as f32) * self.original_width as f32 / self.resized_width as f32
+    fn source_x(&self, value: f32) -> f64 {
+        (f64::from(value) - self.pad_left as f64) * self.original_width as f64
+            / self.resized_width as f64
     }
 
-    fn source_y(&self, value: f32) -> f32 {
-        (value - self.pad_top as f32) * self.original_height as f32 / self.resized_height as f32
+    fn source_y(&self, value: f32) -> f64 {
+        (f64::from(value) - self.pad_top as f64) * self.original_height as f64
+            / self.resized_height as f64
     }
 }
 
@@ -189,24 +208,28 @@ pub fn prepare_image(
     ))
 }
 
-// Keypoints as reported by ChatGPT :)
-// Nose
-// Left Eye
-// Right Eye
-// Left Ear
-// Right Ear
-// Left Shoulder
-// Right Shoulder
-// Left Elbow
-// Right Elbow
-// Left Wrist
-// Right Wrist
-// Left Hip
-// Right Hip
-// Left Knee
-// Right Knee
-// Left Ankle
-// Right Ankle
+/// Canonical COCO-17 keypoint order used by the native pose adapter.
+pub const COCO_KEYPOINT_NAMES: [&str; 17] = [
+    "nose",
+    "left_eye",
+    "right_eye",
+    "left_ear",
+    "right_ear",
+    "left_shoulder",
+    "right_shoulder",
+    "left_elbow",
+    "right_elbow",
+    "left_wrist",
+    "right_wrist",
+    "left_hip",
+    "right_hip",
+    "left_knee",
+    "right_knee",
+    "left_ankle",
+    "right_ankle",
+];
+
+/// Skeleton edges for [`COCO_KEYPOINT_NAMES`].
 pub const KP_CONNECTIONS: [(usize, usize); 16] = [
     (0, 1),
     (0, 2),
@@ -226,8 +249,90 @@ pub const KP_CONNECTIONS: [(usize, usize); 16] = [
     (14, 16),
 ];
 
-use candle::IndexOp;
 use candle_transformers::object_detection::{Bbox, KeyPoint};
+
+/// Validate a contract-defined, unsqueezed detector output without copying it.
+pub fn validate_detection_output_schema(
+    output: &Tensor,
+    class_count: usize,
+    expected_predictions: usize,
+) -> Result<()> {
+    if !(1..=MAX_MODEL_CLASSES).contains(&class_count) {
+        candle::bail!("detector class count must be between 1 and {MAX_MODEL_CLASSES}")
+    }
+    if !(1..=MAX_REPORT_PREDICTIONS).contains(&expected_predictions) {
+        candle::bail!(
+            "expected detector prediction count must be between 1 and {MAX_REPORT_PREDICTIONS}"
+        )
+    }
+    if output.rank() != 3 {
+        candle::bail!("detection model output must have rank 3")
+    }
+    let (batch, rows, predictions) = output.dims3()?;
+    if batch != 1 || rows != 4 + class_count {
+        candle::bail!(
+            "detection model output must have shape [1, {}, predictions]",
+            4 + class_count
+        )
+    }
+    if predictions != expected_predictions {
+        candle::bail!(
+            "detection model output has {predictions} predictions, expected {expected_predictions}"
+        )
+    }
+    let elements = rows
+        .checked_mul(predictions)
+        .ok_or_else(|| candle::Error::Msg("detection output element count overflowed".into()))?;
+    if elements > MAX_MODEL_OUTPUT_ELEMENTS {
+        candle::bail!("detection model output exceeds the bounded element-count limit")
+    }
+    if output.dtype() != candle::DType::F32 {
+        candle::bail!("detection model output must use the FP32 data type")
+    }
+    Ok(())
+}
+
+/// Validate a contract-defined, unsqueezed single-class pose output.
+pub fn validate_pose_output_schema(
+    output: &Tensor,
+    keypoint_count: usize,
+    expected_predictions: usize,
+) -> Result<()> {
+    if keypoint_count == 0 || keypoint_count > MAX_MODEL_CLASSES {
+        candle::bail!("pose keypoint count must be between 1 and {MAX_MODEL_CLASSES}")
+    }
+    if !(1..=MAX_REPORT_PREDICTIONS).contains(&expected_predictions) {
+        candle::bail!(
+            "expected pose prediction count must be between 1 and {MAX_REPORT_PREDICTIONS}"
+        )
+    }
+    let feature_count = keypoint_count
+        .checked_mul(3)
+        .and_then(|count| count.checked_add(5))
+        .ok_or_else(|| candle::Error::Msg("pose feature count overflowed".into()))?;
+    if output.rank() != 3 {
+        candle::bail!("pose model output must have rank 3")
+    }
+    let (batch, features, predictions) = output.dims3()?;
+    if batch != 1 || features != feature_count {
+        candle::bail!("pose model output must have shape [1, {feature_count}, predictions]")
+    }
+    if predictions != expected_predictions {
+        candle::bail!(
+            "pose model output has {predictions} predictions, expected {expected_predictions}"
+        )
+    }
+    let elements = features
+        .checked_mul(predictions)
+        .ok_or_else(|| candle::Error::Msg("pose output element count overflowed".into()))?;
+    if elements > MAX_MODEL_OUTPUT_ELEMENTS {
+        candle::bail!("pose model output exceeds the bounded element-count limit")
+    }
+    if output.dtype() != candle::DType::F32 {
+        candle::bail!("pose model output must use the FP32 data type")
+    }
+    Ok(())
+}
 
 /// Validates the fixed, unsqueezed COCO-80 detection output schema.
 ///
@@ -317,6 +422,32 @@ pub fn validate_coco_model_output(output: &Tensor) -> Result<Tensor> {
         candle::bail!("model output must contain only finite values")
     }
     Ok(output)
+}
+
+fn copy_validated_model_output(output: &Tensor, max_elements: usize) -> Result<Vec<f32>> {
+    let element_count = output.dims().iter().try_fold(1_usize, |count, dimension| {
+        count
+            .checked_mul(*dimension)
+            .ok_or_else(|| candle::Error::Msg("model output element count overflowed".to_string()))
+    })?;
+    if max_elements == 0
+        || output
+            .dims()
+            .iter()
+            .any(|dimension| *dimension > max_elements)
+        || element_count > max_elements
+    {
+        candle::bail!("model output exceeds the bounded element-count limit")
+    }
+    if output.dtype() != candle::DType::F32 {
+        candle::bail!("model output must use the FP32 data type")
+    }
+    let output = output.force_contiguous()?.to_device(&Device::Cpu)?;
+    let values = Vec::<f32>::try_from(output.flatten_all()?)?;
+    if values.iter().any(|value| !value.is_finite()) {
+        candle::bail!("model output must contain only finite values")
+    }
+    Ok(values)
 }
 
 fn validate_probability(name: &str, value: f32) -> Result<()> {
@@ -427,13 +558,6 @@ fn validate_legend_size(value: u32) -> Result<()> {
     Ok(())
 }
 
-fn class_name(class_index: usize) -> &'static str {
-    crate::coco_classes::NAMES
-        .get(class_index)
-        .copied()
-        .unwrap_or("unknown")
-}
-
 /// Controls whether annotation helpers emit per-object details.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum ReportOutput {
@@ -442,6 +566,259 @@ pub enum ReportOutput {
     Quiet,
     /// Write each retained detection to standard output while rendering.
     Stdout,
+}
+
+/// One retained detector result in original-image pixel coordinates.
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
+pub struct DetectionRecord {
+    pub prediction_index: usize,
+    /// Index in the contract-declared source taxonomy.
+    pub class_index: usize,
+    /// Name in the contract-declared source taxonomy.
+    pub class_name: String,
+    /// Optional mapping into Manwe's five-class airspace taxonomy.
+    pub airspace_class: Option<String>,
+    pub confidence: f32,
+    pub bbox_xyxy: [f32; 4],
+}
+
+/// Structured detections and the corresponding annotated image.
+#[derive(Debug)]
+pub struct DetectionReport {
+    pub detections: Vec<DetectionRecord>,
+    pub annotated_image: DynamicImage,
+}
+
+/// One contract-named pose keypoint in original-image pixel coordinates.
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
+pub struct PoseKeypointRecord {
+    pub index: usize,
+    pub name: String,
+    pub xy: [f32; 2],
+    pub confidence: f32,
+}
+
+/// One retained pose result in original-image pixel coordinates.
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
+pub struct PoseRecord {
+    pub prediction_index: usize,
+    /// Index in the contract-declared source taxonomy.
+    pub class_index: usize,
+    /// Name in the contract-declared source taxonomy.
+    pub class_name: String,
+    /// Optional mapping into Manwe's five-class airspace taxonomy.
+    pub airspace_class: Option<String>,
+    pub confidence: f32,
+    pub bbox_xyxy: [f32; 4],
+    pub keypoints: Vec<PoseKeypointRecord>,
+}
+
+/// Structured poses and the corresponding annotated image.
+#[derive(Debug)]
+pub struct PoseReport {
+    pub poses: Vec<PoseRecord>,
+    pub annotated_image: DynamicImage,
+}
+
+fn validate_names(names: &[String], kind: &str) -> Result<()> {
+    if names.is_empty() || names.len() > MAX_MODEL_CLASSES {
+        candle::bail!("{kind} must contain 1..={MAX_MODEL_CLASSES} entries")
+    }
+    let mut unique = std::collections::HashSet::with_capacity(names.len());
+    for name in names {
+        if name.is_empty()
+            || name.trim() != name
+            || name.len() > 256
+            || !is_contract_printable(name)
+        {
+            candle::bail!("{kind} must be bounded, nonempty, printable strings")
+        }
+        if !unique.insert(name.as_str()) {
+            candle::bail!("{kind} must be unique")
+        }
+    }
+    Ok(())
+}
+
+fn validate_class_names(class_names: &[String]) -> Result<()> {
+    validate_names(class_names, "class names")
+}
+
+/// Decode, suppress, structure, and render one contract-defined detector output.
+#[allow(clippy::too_many_arguments)]
+pub fn report_detect_with_names(
+    pred: &Tensor,
+    img: DynamicImage,
+    transform: &ImageTransform,
+    class_names: &[String],
+    expected_predictions: usize,
+    confidence_threshold: f32,
+    nms_threshold: f32,
+    max_detections: usize,
+    legend_size: u32,
+) -> Result<DetectionReport> {
+    validate_source_dimensions(img.width() as usize, img.height() as usize)?;
+    transform.validate_for_image(&img)?;
+    validate_class_names(class_names)?;
+    validate_probability("confidence threshold", confidence_threshold)?;
+    validate_probability("NMS threshold", nms_threshold)?;
+    validate_legend_size(legend_size)?;
+    if !(1..=MAX_REPORT_PREDICTIONS).contains(&expected_predictions) {
+        candle::bail!(
+            "expected detector prediction count must be between 1 and {MAX_REPORT_PREDICTIONS}"
+        )
+    }
+    if !(1..=MAX_NMS_BOXES).contains(&max_detections) {
+        candle::bail!("max detections must be between 1 and {MAX_NMS_BOXES}")
+    }
+    let (rows, predictions) = pred.dims2()?;
+    if rows != 4 + class_names.len() || predictions != expected_predictions {
+        candle::bail!(
+            "detection reporter expected [{}, {expected_predictions}], got [{rows}, {predictions}]",
+            4 + class_names.len()
+        )
+    }
+    let element_count = rows
+        .checked_mul(predictions)
+        .ok_or_else(|| candle::Error::Msg("detection output element count overflowed".into()))?;
+    if element_count > MAX_MODEL_OUTPUT_ELEMENTS {
+        candle::bail!("detection model output exceeds the bounded element-count limit")
+    }
+    let values = copy_validated_model_output(pred, MAX_MODEL_OUTPUT_ELEMENTS)?;
+
+    let mut candidates: Vec<Vec<Bbox<usize>>> =
+        (0..class_names.len()).map(|_| Vec::new()).collect();
+    let mut candidate_count = 0_usize;
+    for prediction_index in 0..predictions {
+        let width = values[2 * predictions + prediction_index];
+        let height = values[3 * predictions + prediction_index];
+        if width <= 0.0 || height <= 0.0 {
+            candle::bail!("detection output must contain positive box widths and heights")
+        }
+        let mut class_index = 0_usize;
+        let mut confidence = values[4 * predictions + prediction_index];
+        for index in 0..class_names.len() {
+            let score = values[(4 + index) * predictions + prediction_index];
+            validate_probability("model class score", score)?;
+            if score > confidence {
+                confidence = score;
+                class_index = index;
+            }
+        }
+        if confidence <= confidence_threshold {
+            continue;
+        }
+        if candidate_count >= MAX_REPORT_CANDIDATES {
+            candle::bail!("detection candidate count must not exceed {MAX_REPORT_CANDIDATES}")
+        }
+        let center_x = values[prediction_index];
+        let center_y = values[predictions + prediction_index];
+        candidates[class_index].push(Bbox {
+            xmin: center_x - width / 2.0,
+            ymin: center_y - height / 2.0,
+            xmax: center_x + width / 2.0,
+            ymax: center_y + height / 2.0,
+            confidence,
+            data: prediction_index,
+        });
+        candidate_count += 1;
+    }
+    class_aware_non_maximum_suppression(&mut candidates, nms_threshold)?;
+
+    let mut retained: Vec<(usize, usize, Bbox<usize>)> = candidates
+        .into_iter()
+        .enumerate()
+        .flat_map(|(class_index, boxes)| {
+            boxes
+                .into_iter()
+                .map(move |bbox| (class_index, bbox.data, bbox))
+        })
+        .collect();
+    retained.sort_by(|left, right| {
+        right
+            .2
+            .confidence
+            .total_cmp(&left.2.confidence)
+            .then_with(|| left.1.cmp(&right.1))
+            .then_with(|| left.0.cmp(&right.0))
+    });
+
+    let image_height = img.height();
+    let image_width = img.width();
+    let mut detections = Vec::with_capacity(max_detections.min(retained.len()));
+    for (class_index, prediction_index, bbox) in retained {
+        let xmin = transform
+            .source_x(bbox.xmin)
+            .clamp(0.0, image_width.saturating_sub(1) as f64) as f32;
+        let ymin = transform
+            .source_y(bbox.ymin)
+            .clamp(0.0, image_height.saturating_sub(1) as f64) as f32;
+        let xmax = transform.source_x(bbox.xmax).clamp(0.0, image_width as f64) as f32;
+        let ymax = transform
+            .source_y(bbox.ymax)
+            .clamp(0.0, image_height as f64) as f32;
+        if xmax <= xmin || ymax <= ymin {
+            continue;
+        }
+        detections.push(DetectionRecord {
+            prediction_index,
+            class_index,
+            class_name: class_names[class_index].clone(),
+            airspace_class: None,
+            confidence: bbox.confidence,
+            bbox_xyxy: [xmin, ymin, xmax, ymax],
+        });
+        if detections.len() == max_detections {
+            break;
+        }
+    }
+
+    let mut rendered = img.to_rgb8();
+    let font = if legend_size == 0 {
+        None
+    } else {
+        Some(
+            ab_glyph::FontRef::try_from_slice(include_bytes!("roboto-mono-stripped.ttf"))
+                .map_err(candle::Error::wrap)?,
+        )
+    };
+    for detection in &detections {
+        let [xmin, ymin, xmax, ymax] = detection.bbox_xyxy;
+        let x = xmin as i32;
+        let y = ymin as i32;
+        let width = ((xmax - xmin).ceil() as u32).max(1);
+        let height = ((ymax - ymin).ceil() as u32).max(1);
+        imageproc::drawing::draw_hollow_rect_mut(
+            &mut rendered,
+            imageproc::rect::Rect::at(x, y).of_size(width, height),
+            image::Rgb([255, 0, 0]),
+        );
+        if let Some(font) = &font {
+            imageproc::drawing::draw_filled_rect_mut(
+                &mut rendered,
+                imageproc::rect::Rect::at(x, y).of_size(width, legend_size.min(height)),
+                image::Rgb([170, 0, 0]),
+            );
+            let legend = format!(
+                "{}   {:.0}%",
+                detection.class_name,
+                100.0 * detection.confidence
+            );
+            imageproc::drawing::draw_text_mut(
+                &mut rendered,
+                image::Rgb([255, 255, 255]),
+                x,
+                y,
+                ab_glyph::PxScale::from(legend_size as f32),
+                font,
+                &legend,
+            );
+        }
+    }
+    Ok(DetectionReport {
+        detections,
+        annotated_image: DynamicImage::ImageRgb8(rendered),
+    })
 }
 
 /// Renders COCO detections without emitting per-object output.
@@ -474,116 +851,274 @@ pub fn report_detect_with_output(
     legend_size: u32,
     output: ReportOutput,
 ) -> Result<DynamicImage> {
-    validate_source_dimensions(img.width() as usize, img.height() as usize)?;
-    transform.validate_for_image(&img)?;
-    validate_probability("confidence threshold", confidence_threshold)?;
-    validate_probability("NMS threshold", nms_threshold)?;
-    validate_legend_size(legend_size)?;
-    let (pred_size, npreds) = pred.dims2()?;
-    if pred_size != 4 + COCO_CLASS_COUNT {
+    let (rows, predictions) = pred.dims2()?;
+    if rows != 4 + COCO_CLASS_COUNT {
         candle::bail!(
             "COCO detection reporter requires 4 box rows and {COCO_CLASS_COUNT} class rows"
         )
     }
-    if npreds > MAX_REPORT_PREDICTIONS {
+    if predictions > MAX_REPORT_PREDICTIONS {
         candle::bail!("prediction count must not exceed {MAX_REPORT_PREDICTIONS}")
     }
-    let pred = validate_coco_model_output(pred)?;
-    let nclasses = COCO_CLASS_COUNT;
-    // The bounding boxes grouped by (maximum) class index.
-    let mut bboxes: Vec<Vec<Bbox<Vec<KeyPoint>>>> = (0..nclasses).map(|_| vec![]).collect();
-    // Extract the bounding boxes for which confidence is above the threshold.
-    let mut candidate_count = 0_usize;
-    for index in 0..npreds {
-        let pred = Vec::<f32>::try_from(pred.i((.., index))?)?;
-        if pred.iter().any(|value| !value.is_finite()) {
-            candle::bail!("model output must contain only finite values")
+    let class_names = crate::coco_classes::NAMES
+        .iter()
+        .map(|name| (*name).to_owned())
+        .collect::<Vec<_>>();
+    let report = report_detect_with_names(
+        pred,
+        img,
+        transform,
+        &class_names,
+        predictions,
+        confidence_threshold,
+        nms_threshold,
+        MAX_REPORT_CANDIDATES,
+        legend_size,
+    )?;
+    if output == ReportOutput::Stdout {
+        let stdout = std::io::stdout();
+        let mut stdout = stdout.lock();
+        for detection in &report.detections {
+            writeln!(stdout, "{}: {detection:?}", detection.class_name)
+                .map_err(candle::Error::wrap)?;
         }
-        let Some(confidence) = pred[4..].iter().copied().max_by(f32::total_cmp) else {
-            candle::bail!("prediction contains no class scores")
-        };
-        if confidence > confidence_threshold {
-            let mut class_index = 0;
-            for i in 0..nclasses {
-                if pred[4 + i] > pred[4 + class_index] {
-                    class_index = i
+        stdout.flush().map_err(candle::Error::wrap)?;
+    }
+    Ok(report.annotated_image)
+}
+
+/// Decode, suppress, structure, and render one contract-defined pose output.
+#[allow(clippy::too_many_arguments)]
+pub fn report_pose_with_names(
+    pred: &Tensor,
+    img: DynamicImage,
+    transform: &ImageTransform,
+    class_names: &[String],
+    keypoint_names: &[String],
+    expected_predictions: usize,
+    confidence_threshold: f32,
+    nms_threshold: f32,
+    keypoint_confidence_threshold: f32,
+    max_detections: usize,
+    legend_size: u32,
+) -> Result<PoseReport> {
+    validate_source_dimensions(img.width() as usize, img.height() as usize)?;
+    transform.validate_for_image(&img)?;
+    validate_class_names(class_names)?;
+    if class_names.len() != 1 {
+        candle::bail!("pose reporter requires exactly one class name")
+    }
+    validate_names(keypoint_names, "keypoint names")?;
+    validate_probability("confidence threshold", confidence_threshold)?;
+    validate_probability("NMS threshold", nms_threshold)?;
+    validate_probability(
+        "keypoint confidence threshold",
+        keypoint_confidence_threshold,
+    )?;
+    validate_legend_size(legend_size)?;
+    if !(1..=MAX_REPORT_PREDICTIONS).contains(&expected_predictions) {
+        candle::bail!(
+            "expected pose prediction count must be between 1 and {MAX_REPORT_PREDICTIONS}"
+        )
+    }
+    if !(1..=MAX_NMS_BOXES).contains(&max_detections) {
+        candle::bail!("max detections must be between 1 and {MAX_NMS_BOXES}")
+    }
+    let (features, predictions) = pred.dims2()?;
+    let expected_features = keypoint_names
+        .len()
+        .checked_mul(3)
+        .and_then(|count| count.checked_add(5))
+        .ok_or_else(|| candle::Error::Msg("pose feature count overflowed".into()))?;
+    if features != expected_features || predictions != expected_predictions {
+        candle::bail!(
+            "pose reporter expected [{expected_features}, {expected_predictions}], got [{features}, {predictions}]"
+        )
+    }
+    let element_count = features
+        .checked_mul(predictions)
+        .ok_or_else(|| candle::Error::Msg("pose output element count overflowed".into()))?;
+    if element_count > MAX_MODEL_OUTPUT_ELEMENTS {
+        candle::bail!("pose model output exceeds the bounded element-count limit")
+    }
+    let values = copy_validated_model_output(pred, MAX_MODEL_OUTPUT_ELEMENTS)?;
+
+    let mut candidates = Vec::new();
+    for prediction_index in 0..predictions {
+        let width = values[2 * predictions + prediction_index];
+        let height = values[3 * predictions + prediction_index];
+        if width <= 0.0 || height <= 0.0 {
+            candle::bail!("pose output must contain positive box widths and heights")
+        }
+        let confidence = values[4 * predictions + prediction_index];
+        validate_probability("model class score", confidence)?;
+        for keypoint_index in 0..keypoint_names.len() {
+            let mask_row = 5 + 3 * keypoint_index + 2;
+            validate_probability(
+                "model keypoint confidence",
+                values[mask_row * predictions + prediction_index],
+            )?;
+        }
+        if confidence <= confidence_threshold {
+            continue;
+        }
+        if candidates.len() >= MAX_REPORT_CANDIDATES {
+            candle::bail!("pose candidate count must not exceed {MAX_REPORT_CANDIDATES}")
+        }
+        let keypoints: Vec<KeyPoint> = (0..keypoint_names.len())
+            .map(|keypoint_index| {
+                let base = 5 + 3 * keypoint_index;
+                KeyPoint {
+                    x: values[base * predictions + prediction_index],
+                    y: values[(base + 1) * predictions + prediction_index],
+                    mask: values[(base + 2) * predictions + prediction_index],
                 }
-            }
-            if pred[class_index + 4] > 0. {
-                if candidate_count >= MAX_REPORT_CANDIDATES {
-                    candle::bail!(
-                        "detection candidate count must not exceed {MAX_REPORT_CANDIDATES}"
-                    )
-                }
-                let bbox = Bbox {
-                    xmin: pred[0] - pred[2] / 2.,
-                    ymin: pred[1] - pred[3] / 2.,
-                    xmax: pred[0] + pred[2] / 2.,
-                    ymax: pred[1] + pred[3] / 2.,
-                    confidence,
-                    data: vec![],
-                };
-                bboxes[class_index].push(bbox);
-                candidate_count += 1;
-            }
+            })
+            .collect();
+        let center_x = values[prediction_index];
+        let center_y = values[predictions + prediction_index];
+        candidates.push(Bbox {
+            xmin: center_x - width / 2.0,
+            ymin: center_y - height / 2.0,
+            xmax: center_x + width / 2.0,
+            ymax: center_y + height / 2.0,
+            confidence,
+            data: (prediction_index, keypoints),
+        });
+    }
+
+    let mut classes = vec![candidates];
+    class_aware_non_maximum_suppression(&mut classes, nms_threshold)?;
+    let mut retained = classes.pop().unwrap_or_default();
+    retained.sort_by(|left, right| {
+        right
+            .confidence
+            .total_cmp(&left.confidence)
+            .then_with(|| left.data.0.cmp(&right.data.0))
+    });
+
+    let image_width = img.width();
+    let image_height = img.height();
+    let mut poses = Vec::with_capacity(max_detections.min(retained.len()));
+    for bbox in retained {
+        let xmin = transform
+            .source_x(bbox.xmin)
+            .clamp(0.0, image_width.saturating_sub(1) as f64) as f32;
+        let ymin = transform
+            .source_y(bbox.ymin)
+            .clamp(0.0, image_height.saturating_sub(1) as f64) as f32;
+        let xmax = transform.source_x(bbox.xmax).clamp(0.0, image_width as f64) as f32;
+        let ymax = transform
+            .source_y(bbox.ymax)
+            .clamp(0.0, image_height as f64) as f32;
+        if xmax <= xmin || ymax <= ymin {
+            continue;
+        }
+        let keypoints = bbox
+            .data
+            .1
+            .iter()
+            .enumerate()
+            .map(|(index, keypoint)| PoseKeypointRecord {
+                index,
+                name: keypoint_names[index].clone(),
+                xy: [
+                    transform
+                        .source_x(keypoint.x)
+                        .clamp(0.0, image_width.saturating_sub(1) as f64)
+                        as f32,
+                    transform
+                        .source_y(keypoint.y)
+                        .clamp(0.0, image_height.saturating_sub(1) as f64)
+                        as f32,
+                ],
+                confidence: keypoint.mask,
+            })
+            .collect();
+        poses.push(PoseRecord {
+            prediction_index: bbox.data.0,
+            class_index: 0,
+            class_name: class_names[0].clone(),
+            airspace_class: None,
+            confidence: bbox.confidence,
+            bbox_xyxy: [xmin, ymin, xmax, ymax],
+            keypoints,
+        });
+        if poses.len() == max_detections {
+            break;
         }
     }
 
-    class_aware_non_maximum_suppression(&mut bboxes, nms_threshold)?;
-
-    // Annotate the original image and optionally print box information.
-    let (initial_h, initial_w) = (img.height(), img.width());
-    let mut img = img.to_rgb8();
-    let font = Vec::from(include_bytes!("roboto-mono-stripped.ttf") as &[u8]);
-    let font = ab_glyph::FontRef::try_from_slice(&font).map_err(candle::Error::wrap)?;
-    for (class_index, bboxes_for_class) in bboxes.iter().enumerate() {
-        for b in bboxes_for_class.iter() {
-            if output == ReportOutput::Stdout {
-                println!("{}: {:?}", class_name(class_index), b);
-            }
-            let xmin = transform
-                .source_x(b.xmin)
-                .clamp(0.0, initial_w.saturating_sub(1) as f32);
-            let ymin = transform
-                .source_y(b.ymin)
-                .clamp(0.0, initial_h.saturating_sub(1) as f32);
-            let xmax = transform.source_x(b.xmax).clamp(0.0, initial_w as f32);
-            let ymax = transform.source_y(b.ymax).clamp(0.0, initial_h as f32);
-            if xmax <= xmin || ymax <= ymin {
+    let canonical_coco_order = keypoint_names.len() == COCO_KEYPOINT_NAMES.len()
+        && keypoint_names
+            .iter()
+            .zip(COCO_KEYPOINT_NAMES)
+            .all(|(actual, expected)| actual == expected);
+    let font = if legend_size == 0 {
+        None
+    } else {
+        Some(
+            ab_glyph::FontRef::try_from_slice(include_bytes!("roboto-mono-stripped.ttf"))
+                .map_err(candle::Error::wrap)?,
+        )
+    };
+    let mut rendered = img.to_rgb8();
+    for pose in &poses {
+        let [xmin, ymin, xmax, ymax] = pose.bbox_xyxy;
+        let x = xmin as i32;
+        let y = ymin as i32;
+        let width = ((xmax - xmin).ceil() as u32).max(1);
+        let height = ((ymax - ymin).ceil() as u32).max(1);
+        imageproc::drawing::draw_hollow_rect_mut(
+            &mut rendered,
+            imageproc::rect::Rect::at(x, y).of_size(width, height),
+            image::Rgb([255, 0, 0]),
+        );
+        if let Some(font) = &font {
+            let legend = format!("{}   {:.0}%", pose.class_name, 100.0 * pose.confidence);
+            imageproc::drawing::draw_text_mut(
+                &mut rendered,
+                image::Rgb([255, 255, 255]),
+                x,
+                y,
+                ab_glyph::PxScale::from(legend_size as f32),
+                font,
+                &legend,
+            );
+        }
+        for keypoint in &pose.keypoints {
+            if keypoint.confidence < keypoint_confidence_threshold {
                 continue;
             }
-            let xmin = xmin as i32;
-            let ymin = ymin as i32;
-            let dx = ((xmax - xmin as f32).ceil() as u32).max(1);
-            let dy = ((ymax - ymin as f32).ceil() as u32).max(1);
-            imageproc::drawing::draw_hollow_rect_mut(
-                &mut img,
-                imageproc::rect::Rect::at(xmin, ymin).of_size(dx, dy),
-                image::Rgb([255, 0, 0]),
+            imageproc::drawing::draw_filled_circle_mut(
+                &mut rendered,
+                (keypoint.xy[0] as i32, keypoint.xy[1] as i32),
+                2,
+                image::Rgb([0, 255, 0]),
             );
-            if legend_size > 0 {
-                imageproc::drawing::draw_filled_rect_mut(
-                    &mut img,
-                    imageproc::rect::Rect::at(xmin, ymin).of_size(dx, legend_size.min(dy)),
-                    image::Rgb([170, 0, 0]),
+        }
+        if canonical_coco_order {
+            for &(left, right) in &KP_CONNECTIONS {
+                let left = &pose.keypoints[left];
+                let right = &pose.keypoints[right];
+                if left.confidence < keypoint_confidence_threshold
+                    || right.confidence < keypoint_confidence_threshold
+                {
+                    continue;
+                }
+                imageproc::drawing::draw_line_segment_mut(
+                    &mut rendered,
+                    (left.xy[0], left.xy[1]),
+                    (right.xy[0], right.xy[1]),
+                    image::Rgb([255, 255, 0]),
                 );
-                let legend = format!("{}   {:.0}%", class_name(class_index), 100. * b.confidence);
-                imageproc::drawing::draw_text_mut(
-                    &mut img,
-                    image::Rgb([255, 255, 255]),
-                    xmin,
-                    ymin,
-                    ab_glyph::PxScale {
-                        x: legend_size as f32 - 1.,
-                        y: legend_size as f32 - 1.,
-                    },
-                    &font,
-                    &legend,
-                )
             }
         }
     }
-    Ok(DynamicImage::ImageRgb8(img))
+    Ok(PoseReport {
+        poses,
+        annotated_image: DynamicImage::ImageRgb8(rendered),
+    })
 }
 
 /// Renders COCO-17 poses without emitting per-object output.
@@ -616,135 +1151,40 @@ pub fn report_pose_with_output(
     legend_size: u32,
     output: ReportOutput,
 ) -> Result<DynamicImage> {
-    validate_source_dimensions(img.width() as usize, img.height() as usize)?;
-    transform.validate_for_image(&img)?;
-    validate_probability("confidence threshold", confidence_threshold)?;
-    validate_probability("NMS threshold", nms_threshold)?;
-    validate_legend_size(legend_size)?;
-    let (pred_size, npreds) = pred.dims2()?;
-    if pred_size != 17 * 3 + 4 + 1 {
-        candle::bail!("pose reporter requires one class and 17 keypoints with x/y/visibility");
+    let (features, predictions) = pred.dims2()?;
+    if features != 17 * 3 + 5 {
+        candle::bail!("pose reporter requires one class and 17 keypoints with x/y/visibility")
     }
-    if npreds > MAX_REPORT_PREDICTIONS {
-        candle::bail!("prediction count must not exceed {MAX_REPORT_PREDICTIONS}")
+    if predictions == 0 || predictions > MAX_REPORT_PREDICTIONS {
+        candle::bail!("prediction count must be between 1 and {MAX_REPORT_PREDICTIONS}")
     }
-    let pred = validate_coco_model_output(pred)?;
-    let mut bboxes = vec![];
-    // Extract the bounding boxes for which confidence is above the threshold.
-    for index in 0..npreds {
-        let pred = Vec::<f32>::try_from(pred.i((.., index))?)?;
-        if pred.iter().any(|value| !value.is_finite()) {
-            candle::bail!("model output must contain only finite values")
+    let class_names = vec!["person".to_owned()];
+    let keypoint_names = COCO_KEYPOINT_NAMES
+        .iter()
+        .map(|name| (*name).to_owned())
+        .collect::<Vec<_>>();
+    let report = report_pose_with_names(
+        pred,
+        img,
+        transform,
+        &class_names,
+        &keypoint_names,
+        predictions,
+        confidence_threshold,
+        nms_threshold,
+        0.6,
+        MAX_REPORT_CANDIDATES,
+        legend_size,
+    )?;
+    if output == ReportOutput::Stdout {
+        let stdout = std::io::stdout();
+        let mut stdout = stdout.lock();
+        for pose in &report.poses {
+            writeln!(stdout, "{}: {pose:?}", pose.class_name).map_err(candle::Error::wrap)?;
         }
-        let confidence = pred[4];
-        if confidence > confidence_threshold {
-            if bboxes.len() >= MAX_REPORT_CANDIDATES {
-                candle::bail!("pose candidate count must not exceed {MAX_REPORT_CANDIDATES}")
-            }
-            let keypoints = (0..17)
-                .map(|i| KeyPoint {
-                    x: pred[3 * i + 5],
-                    y: pred[3 * i + 6],
-                    mask: pred[3 * i + 7],
-                })
-                .collect::<Vec<_>>();
-            let bbox = Bbox {
-                xmin: pred[0] - pred[2] / 2.,
-                ymin: pred[1] - pred[3] / 2.,
-                xmax: pred[0] + pred[2] / 2.,
-                ymax: pred[1] + pred[3] / 2.,
-                confidence,
-                data: keypoints,
-            };
-            bboxes.push(bbox)
-        }
+        stdout.flush().map_err(candle::Error::wrap)?;
     }
-
-    let mut bboxes = vec![bboxes];
-    class_aware_non_maximum_suppression(&mut bboxes, nms_threshold)?;
-    let bboxes = &bboxes[0];
-    let font = Vec::from(include_bytes!("roboto-mono-stripped.ttf") as &[u8]);
-    let font: ab_glyph::FontRef =
-        ab_glyph::FontRef::try_from_slice(&font).map_err(candle::Error::wrap)?;
-
-    // Annotate the original image and optionally print box information.
-    let (initial_h, initial_w) = (img.height(), img.width());
-    let mut img = img.to_rgb8();
-    for b in bboxes.iter() {
-        if output == ReportOutput::Stdout {
-            println!("{b:?}");
-        }
-        let xmin_f = transform
-            .source_x(b.xmin)
-            .clamp(0.0, initial_w.saturating_sub(1) as f32);
-        let ymin_f = transform
-            .source_y(b.ymin)
-            .clamp(0.0, initial_h.saturating_sub(1) as f32);
-        let xmax = transform.source_x(b.xmax).clamp(0.0, initial_w as f32);
-        let ymax = transform.source_y(b.ymax).clamp(0.0, initial_h as f32);
-        if xmax > xmin_f && ymax > ymin_f {
-            let xmin = xmin_f as i32;
-            let ymin = ymin_f as i32;
-            let dx = ((xmax - xmin_f).ceil() as u32).max(1);
-            let dy = ((ymax - ymin_f).ceil() as u32).max(1);
-            imageproc::drawing::draw_hollow_rect_mut(
-                &mut img,
-                imageproc::rect::Rect::at(xmin, ymin).of_size(dx, dy),
-                image::Rgb([255, 0, 0]),
-            );
-
-            if legend_size > 0 {
-                let legend = format!("{}:{:.2}%", class_name(0), 100. * b.confidence);
-                imageproc::drawing::draw_text_mut(
-                    &mut img,
-                    image::Rgb([255, 255, 255]),
-                    xmin,
-                    ymin,
-                    ab_glyph::PxScale::from(legend_size as f32),
-                    &font,
-                    &legend,
-                )
-            }
-        }
-        for kp in b.data.iter() {
-            if kp.mask < 0.6 {
-                continue;
-            }
-            let x = transform
-                .source_x(kp.x)
-                .clamp(0.0, initial_w.saturating_sub(1) as f32) as i32;
-            let y = transform
-                .source_y(kp.y)
-                .clamp(0.0, initial_h.saturating_sub(1) as f32) as i32;
-            imageproc::drawing::draw_filled_circle_mut(
-                &mut img,
-                (x, y),
-                2,
-                image::Rgb([0, 255, 0]),
-            );
-        }
-
-        for &(idx1, idx2) in KP_CONNECTIONS.iter() {
-            let kp1 = &b.data[idx1];
-            let kp2 = &b.data[idx2];
-            if kp1.mask < 0.6 || kp2.mask < 0.6 {
-                continue;
-            }
-            imageproc::drawing::draw_line_segment_mut(
-                &mut img,
-                (
-                    transform.source_x(kp1.x).clamp(0.0, initial_w as f32),
-                    transform.source_y(kp1.y).clamp(0.0, initial_h as f32),
-                ),
-                (
-                    transform.source_x(kp2.x).clamp(0.0, initial_w as f32),
-                    transform.source_y(kp2.y).clamp(0.0, initial_h as f32),
-                ),
-                image::Rgb([255, 255, 0]),
-            );
-        }
-    }
-    Ok(DynamicImage::ImageRgb8(img))
+    Ok(report.annotated_image)
 }
 
 #[cfg(test)]
@@ -965,6 +1405,23 @@ mod tests {
         assert_eq!(transform.pad_top, 0);
         assert_eq!(transform.canvas_height - transform.resized_height, 1);
         assert_eq!(transform.source_y(transform.pad_top as f32), 0.0);
+    }
+
+    #[test]
+    fn inverse_transform_keeps_extreme_f32_coordinates_finite() {
+        let transform = ImageTransform {
+            original_width: MAX_SOURCE_DIMENSION,
+            original_height: MAX_SOURCE_DIMENSION,
+            resized_width: 1,
+            resized_height: 1,
+            canvas_width: 1,
+            canvas_height: 1,
+            pad_left: 0,
+            pad_top: 0,
+        };
+
+        assert!(transform.source_x(f32::MAX).is_finite());
+        assert!(transform.source_y(-f32::MAX).is_finite());
     }
 
     #[test]
@@ -1391,6 +1848,26 @@ mod tests {
     }
 
     #[test]
+    fn report_rejects_anisotropic_transform_geometry() {
+        let pred = Tensor::zeros((84, 1), candle::DType::F32, &Device::Cpu).unwrap();
+        let image = DynamicImage::ImageRgb8(image::RgbImage::new(16, 8));
+        let transform = ImageTransform {
+            original_width: 16,
+            original_height: 8,
+            resized_width: 8,
+            resized_height: 8,
+            canvas_width: 8,
+            canvas_height: 8,
+            pad_left: 0,
+            pad_top: 0,
+        };
+
+        let error = report_detect(&pred, image, &transform, 0.25, 0.45, 0).unwrap_err();
+
+        assert!(error.to_string().contains("image transform"));
+    }
+
+    #[test]
     fn report_detect_requires_the_coco_80_schema() {
         let pred = Tensor::zeros((85, 1), candle::DType::F32, &Device::Cpu).unwrap();
         let image = DynamicImage::ImageRgb8(image::RgbImage::new(8, 8));
@@ -1477,6 +1954,184 @@ mod tests {
         let error =
             report_detect(&too_many_candidates, image, &transform, 0.25, 0.45, 0).unwrap_err();
         assert!(error.to_string().contains("candidate count"));
+    }
+
+    #[test]
+    fn contract_defined_detection_reporting_is_generic_structured_and_bounded() {
+        let values = vec![
+            4.0_f32, 4.2, // cx
+            4.0, 4.0, // cy
+            2.0, 2.0, // width
+            2.0, 2.0, // height
+            0.9, 0.8, // class alpha
+            0.1, 0.95, // class beta
+        ];
+        let pred = Tensor::from_vec(values, (6, 2), &Device::Cpu).unwrap();
+        let image = DynamicImage::ImageRgb8(image::RgbImage::new(8, 8));
+        let transform = ImageTransform {
+            original_width: 8,
+            original_height: 8,
+            resized_width: 8,
+            resized_height: 8,
+            canvas_width: 8,
+            canvas_height: 8,
+            pad_left: 0,
+            pad_top: 0,
+        };
+        let class_names = vec!["alpha".to_string(), "beta".to_string()];
+
+        let report =
+            report_detect_with_names(&pred, image, &transform, &class_names, 2, 0.25, 0.45, 1, 0)
+                .unwrap();
+        assert_eq!(report.detections.len(), 1);
+        assert_eq!(report.detections[0].prediction_index, 1);
+        assert_eq!(report.detections[0].class_index, 1);
+        assert_eq!(report.detections[0].class_name, "beta");
+        assert_eq!(report.detections[0].airspace_class, None);
+        assert_eq!(report.detections[0].confidence, 0.95);
+        for (actual, expected) in report.detections[0]
+            .bbox_xyxy
+            .iter()
+            .zip([3.2, 3.0, 5.2, 5.0])
+        {
+            assert!((actual - expected).abs() <= 1e-6);
+        }
+    }
+
+    #[test]
+    fn generic_detection_schema_and_decoder_reject_interface_or_probability_drift() {
+        let output = Tensor::zeros((1, 9, 8400), candle::DType::F32, &Device::Cpu).unwrap();
+        validate_detection_output_schema(&output, 5, 8400).unwrap();
+        assert!(validate_detection_output_schema(&output, 80, 8400).is_err());
+
+        let mut values = vec![0.0_f32; 6];
+        values[2] = 1.0;
+        values[3] = 1.0;
+        values[4] = 1.01;
+        let pred = Tensor::from_vec(values, (6, 1), &Device::Cpu).unwrap();
+        let image = DynamicImage::ImageRgb8(image::RgbImage::new(8, 8));
+        let transform = ImageTransform {
+            original_width: 8,
+            original_height: 8,
+            resized_width: 8,
+            resized_height: 8,
+            canvas_width: 8,
+            canvas_height: 8,
+            pad_left: 0,
+            pad_top: 0,
+        };
+        let error = report_detect_with_names(
+            &pred,
+            image,
+            &transform,
+            &["alpha".to_string(), "beta".to_string()],
+            1,
+            0.25,
+            0.45,
+            1,
+            0,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("model class score"));
+
+        for invalid_count in [0, MAX_REPORT_PREDICTIONS + 1] {
+            let pred = Tensor::zeros((6, 1), candle::DType::F32, &Device::Cpu).unwrap();
+            let image = DynamicImage::ImageRgb8(image::RgbImage::new(8, 8));
+            let error = report_detect_with_names(
+                &pred,
+                image,
+                &transform,
+                &["alpha".to_string(), "beta".to_string()],
+                invalid_count,
+                0.25,
+                0.45,
+                1,
+                0,
+            )
+            .unwrap_err();
+            assert!(error.to_string().contains("prediction count"));
+        }
+    }
+
+    #[test]
+    fn contract_defined_pose_reporting_is_structured_and_validates_every_keypoint() {
+        let output = Tensor::zeros((1, 11, 1), candle::DType::F32, &Device::Cpu).unwrap();
+        validate_pose_output_schema(&output, 2, 1).unwrap();
+        assert!(validate_pose_output_schema(&output, 17, 1).is_err());
+
+        let values = vec![4.0_f32, 4.0, 2.0, 2.0, 0.9, 1.0, 2.0, 0.8, 7.0, 6.0, 0.4];
+        let pred = Tensor::from_vec(values, (11, 1), &Device::Cpu).unwrap();
+        let image = DynamicImage::ImageRgb8(image::RgbImage::new(8, 8));
+        let transform = ImageTransform {
+            original_width: 8,
+            original_height: 8,
+            resized_width: 8,
+            resized_height: 8,
+            canvas_width: 8,
+            canvas_height: 8,
+            pad_left: 0,
+            pad_top: 0,
+        };
+        let report = report_pose_with_names(
+            &pred,
+            image.clone(),
+            &transform,
+            &["person".to_owned()],
+            &["left".to_owned(), "right".to_owned()],
+            1,
+            0.25,
+            0.45,
+            0.6,
+            1,
+            0,
+        )
+        .unwrap();
+        assert_eq!(report.poses.len(), 1);
+        assert_eq!(report.poses[0].prediction_index, 0);
+        assert_eq!(report.poses[0].bbox_xyxy, [3.0, 3.0, 5.0, 5.0]);
+        assert_eq!(report.poses[0].keypoints[0].name, "left");
+        assert_eq!(report.poses[0].keypoints[0].xy, [1.0, 2.0]);
+
+        let mut invalid = vec![0.0_f32; 11];
+        invalid[2] = 1.0;
+        invalid[3] = 1.0;
+        invalid[7] = 1.01;
+        let invalid = Tensor::from_vec(invalid, (11, 1), &Device::Cpu).unwrap();
+        let error = report_pose_with_names(
+            &invalid,
+            image,
+            &transform,
+            &["person".to_owned()],
+            &["left".to_owned(), "right".to_owned()],
+            1,
+            0.25,
+            0.45,
+            0.6,
+            1,
+            0,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("keypoint confidence"));
+
+        for invalid_count in [0, MAX_REPORT_PREDICTIONS + 1] {
+            let pred = Tensor::zeros((11, 1), candle::DType::F32, &Device::Cpu).unwrap();
+            let image = DynamicImage::ImageRgb8(image::RgbImage::new(8, 8));
+            let error = report_pose_with_names(
+                &pred,
+                image,
+                &transform,
+                &["person".to_owned()],
+                &["left".to_owned(), "right".to_owned()],
+                invalid_count,
+                0.25,
+                0.45,
+                0.6,
+                1,
+                0,
+            )
+            .unwrap_err();
+            assert!(error.to_string().contains("prediction count"));
+        }
     }
 
     #[test]

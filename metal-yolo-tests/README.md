@@ -53,6 +53,7 @@ From this directory on Apple Silicon:
 
 ```bash
 cargo build --release --locked --bin performance_test
+install -d -m 700 /absolute/path/to/new-results
 
 RUN_DIR=/absolute/path/to/new-results \
   ./target/release/performance_test \
@@ -78,20 +79,28 @@ records that scope explicitly. Every output is still fully validated before
 evidence is published.
 
 The owner-controlled run directory and run identifier are validated before model
-work begins. Results are written, synced, and verified inside a private
+work begins. The directory must already exist: the harness never follows and
+recursively creates unauthenticated `RUN_DIR` components. Results are written,
+synced, and verified inside a private
 `.manwe-static-benchmark-<run-id>.in-progress` directory, then atomically published
 with a no-replace hard link. Pre-link failures remove only the known `result.json`
 entry and the now-empty directory; unexpected content is preserved. The verified
 final hard link plus successful run-directory sync commits the result. Earlier
 post-link failures preserve the link and staging directory. A subsequent cleanup
 failure returns nonzero without removing the committed final JSON; staging may be
-present, partial, or absent if the final sync failed. The final JSON is therefore
-the authoritative commit marker.
+present, partial, or absent if the final sync failed. A final-looking JSON name is
+therefore not sufficient evidence of commit after an interrupted or failing run:
+retain the exact error, inspect any staging marker, and authenticate the staged and
+published identities/digests before deciding whether to retry or clean up.
 
 ## Video profile
 
+As with the static profile, `RUN_DIR` must already exist and pass the
+owner-controlled mutation-boundary checks.
+
 ```bash
 cargo build --release --locked --bin benchmark_video
+install -d -m 700 /absolute/path/to/new-results
 
 RUN_DIR=/absolute/path/to/new-results \
   ./target/release/benchmark_video \
@@ -125,11 +134,12 @@ Failures before the first final link clean only known staging entries; unexpecte
 content is never traversed and keeps the staging directory in place. Once either
 the optional video or result link may exist, pre-commit failures preserve all links
 and the `.manwe-benchmark-*.in-progress` marker. The verified result hard link plus
-successful result-directory sync is the commit point and the final JSON is the
-authoritative commit marker. A later staging-cleanup failure returns nonzero, does
-not remove final links, and may leave staging present, partially cleaned, or absent
-when its final directory sync has uncertain durability. Inspect any staging marker
-or video without its final JSON before intentionally retrying the run ID.
+successful result-directory sync is the commit point. A later staging-cleanup
+failure returns nonzero, does not remove final links, and may leave staging present,
+partially cleaned, or absent when its final directory sync has uncertain durability.
+Because a pre-commit failure can also leave a final-looking result link, names alone
+do not prove the commit point was crossed. Preserve the exact error and inspect any
+staging marker, result, or video before intentionally retrying the run ID.
 The optional video's staged inode and SHA-256 are authenticated before publication;
 the digest is rechecked on both staged and published hard links before JSON commit.
 

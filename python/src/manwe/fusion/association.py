@@ -14,7 +14,12 @@ from itertools import combinations, permutations
 
 import numpy as np
 
-from ..common.numeric import validate_exact_float64_integers, widen_to_float64
+from ..common.numeric import (
+    finite_float64_scalar,
+    validate_exact_float64_integers,
+    validated_psd_covariance,
+    widen_to_float64,
+)
 
 # Chi-square 0.99 quantiles by degrees of freedom (gating thresholds).
 CHI2_99 = {1: 6.635, 2: 9.210, 3: 11.345, 4: 13.277, 6: 16.812}
@@ -30,8 +35,7 @@ MAX_ASSOCIATION_ARRAY_CELLS = 4_000_000
 # Batched eigendecomposition costs O(N D^3), independently of assignment work.
 MAX_COVARIANCE_VALIDATION_WORK = 100_000_000
 MAX_ASSOCIATION_DIMENSION = 64
-_REAL_NUMERIC_KINDS = frozenset("biuf")
-_FLOAT64_DTYPE = np.dtype(np.float64)
+_REAL_NUMERIC_KINDS = frozenset("iuf")
 
 
 def _raw_real_array(value: object, name: str) -> np.ndarray:
@@ -56,27 +60,11 @@ def _float64_array(array: np.ndarray, name: str) -> np.ndarray:
 
 
 def _float64_scalar(value: object, name: str) -> float:
-    """Convert a real scalar without invoking ``__float__`` on object values."""
+    """Convert an exact supported scalar without invoking user coercion hooks."""
     try:
-        array = np.asarray(value)
-    except (TypeError, ValueError, OverflowError) as exc:
+        return finite_float64_scalar(value, name)
+    except ValueError as exc:
         raise ValueError(f"{name} must be a real numeric scalar") from exc
-    if array.ndim != 0 or array.dtype.kind not in _REAL_NUMERIC_KINDS:
-        raise ValueError(f"{name} must be a real numeric scalar")
-    if array.dtype.kind == "b":
-        raise ValueError(f"{name} must be a real numeric scalar")
-    _validate_exact_float64_integers(array, name)
-    result = float(array)
-    if array.dtype.kind == "f" and np.isfinite(array) and not math.isfinite(result):
-        raise ValueError(f"{name} is outside the finite float64 range")
-    if (
-        array.dtype.kind == "f"
-        and array.dtype.itemsize > _FLOAT64_DTYPE.itemsize
-        and np.isfinite(array)
-        and np.asarray(result, dtype=array.dtype) != array
-    ):
-        raise ValueError(f"{name} loses numeric precision when converted to float64")
-    return result
 
 
 def _assignment_work(shape: tuple[int, int]) -> int:
@@ -331,8 +319,11 @@ def _validated_association_arrays(
     if not np.all(np.isfinite(raw_positions)) or not np.all(np.isfinite(raw_covariances)):
         raise ValueError("positions and covariances must contain only finite values")
 
-    positions = _float64_array(raw_positions, "positions")
-    covariance_values = _float64_array(raw_covariances, "covariances")
+    # Detach even when the public input is already float64. Full covariance
+    # validation writes each repaired/symmetrized matrix into this batch; an
+    # alias here would mutate caller-owned arrays or fail on a read-only view.
+    positions = _float64_array(raw_positions, "positions").copy()
+    covariance_values = _float64_array(raw_covariances, "covariances").copy()
     if raw_covariances.shape == diagonal_shape:
         covariances = np.zeros(full_shape, dtype=np.float64)
         diagonal = np.arange(dimension)
@@ -340,11 +331,15 @@ def _validated_association_arrays(
     else:
         covariances = covariance_values
 
+    # Association is a public numerical boundary, not a weaker copy of the
+    # filter boundary. Validate in per-coordinate correlation units so a large
+    # variance cannot hide a broken smaller principal block and a physically
+    # tiny covariance does not inherit an absolute 1e-10 PSD tolerance.
     for index, covariance in enumerate(covariances):
-        if not np.allclose(covariance, covariance.T, rtol=1e-9, atol=1e-12):
-            raise ValueError(f"covariances[{index}] must be symmetric")
-        if float(np.min(np.linalg.eigvalsh(covariance))) < -1e-10:
-            raise ValueError(f"covariances[{index}] must be positive semidefinite")
+        covariances[index] = validated_psd_covariance(
+            covariance,
+            f"covariances[{index}]",
+        )
     return positions, covariances
 
 

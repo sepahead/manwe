@@ -376,6 +376,20 @@ def test_benchmark_validates_iteration_contract_and_runs_sync():
         benchmark(operation, warmup=1, iters=1_000_000)
 
 
+def test_benchmark_rejects_a_nonadvancing_clock(monkeypatch):
+    benchmark_module = __import__("manwe.eval.benchmark", fromlist=["benchmark"])
+    monkeypatch.setattr(benchmark_module.time, "perf_counter_ns", lambda: 17)
+    with pytest.raises(RuntimeError, match="clock did not advance"):
+        benchmark(lambda: None, warmup=0, iters=1)
+
+
+def test_tracking_metrics_reject_boolean_coordinates():
+    with pytest.raises(ValueError, match="real numeric"):
+        ospa(np.ones((1, 3), dtype=bool), np.zeros((1, 3)))
+    with pytest.raises(ValueError, match="real numeric"):
+        rmse(np.zeros((1, 3)), np.ones((1, 3), dtype=bool))
+
+
 def test_radar_covariance_transform_is_psd():
     # 45° azimuth, some elevation, range 150 → cartesian cov must be PSD
     m = Measurement("radar", [150.0, np.pi / 4, 0.2], [9.0, 1e-4, 1e-4], 0.0)

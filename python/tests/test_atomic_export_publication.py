@@ -11,6 +11,7 @@ from pathlib import Path
 
 import pytest
 
+from manwe.common import config_io
 from manwe.common.artifacts import sha256_artifact
 from manwe.export import backends
 
@@ -170,8 +171,8 @@ def test_darwin_parent_with_extended_acl_is_rejected(monkeypatch, tmp_path):
             self.acl_free = acl_free
 
     fake_libc = FakeLibc()
-    monkeypatch.setattr(backends.sys, "platform", "darwin")
-    monkeypatch.setattr(backends.ctypes, "CDLL", lambda *_args, **_kwargs: fake_libc)
+    monkeypatch.setattr(config_io.sys, "platform", "darwin")
+    monkeypatch.setattr(config_io.ctypes, "CDLL", lambda *_args, **_kwargs: fake_libc)
     parent = tmp_path.resolve()
     parent_fd = os.open(
         parent,
@@ -209,8 +210,8 @@ def test_darwin_parent_without_extended_acl_uses_mode_bit_proof(monkeypatch, tmp
             self.acl_free = FakeFunction(0)
 
     fake_libc = FakeLibc()
-    monkeypatch.setattr(backends.sys, "platform", "darwin")
-    monkeypatch.setattr(backends.ctypes, "CDLL", lambda *_args, **_kwargs: fake_libc)
+    monkeypatch.setattr(config_io.sys, "platform", "darwin")
+    monkeypatch.setattr(config_io.ctypes, "CDLL", lambda *_args, **_kwargs: fake_libc)
     parent = tmp_path.resolve()
     parent_fd = os.open(
         parent,
@@ -222,6 +223,24 @@ def test_darwin_parent_without_extended_acl_uses_mode_bit_proof(monkeypatch, tmp
             os.fstat(parent_fd),
             parent,
         )
+    finally:
+        os.close(parent_fd)
+
+
+def test_unmodeled_platform_acl_policy_fails_closed(monkeypatch, tmp_path):
+    monkeypatch.setattr(config_io.sys, "platform", "freebsd-test")
+    parent = tmp_path.resolve()
+    parent_fd = os.open(
+        parent,
+        os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_CLOEXEC", 0),
+    )
+    try:
+        with pytest.raises(RuntimeError, match="ACL policy is unsupported"):
+            backends._assert_publication_parent_trust(
+                parent_fd,
+                os.fstat(parent_fd),
+                parent,
+            )
     finally:
         os.close(parent_fd)
 
@@ -376,6 +395,24 @@ def test_sticky_shared_parent_owned_by_effective_user_is_accepted(tmp_path):
     assert _stage_entries(parent) == []
 
 
+def test_publication_rejects_a_foreign_owned_directory_even_without_shared_write_bits(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(config_io, "reject_unmodeled_directory_acl", lambda *_args: None)
+    foreign_uid = os.geteuid() + 1
+    metadata = os.stat_result(
+        (stat.S_IFDIR | 0o755, 1, 1, 1, foreign_uid, os.getegid(), 0, 0, 0, 0)
+    )
+
+    with pytest.raises(PermissionError, match="owned by the effective user or root"):
+        config_io.require_safe_publication_directory(
+            -1,
+            metadata,
+            tmp_path / "foreign",
+            "output parent",
+        )
+
+
 def test_parent_that_becomes_untrusted_after_preparation_is_rejected(tmp_path):
     parent = tmp_path.resolve() / "output"
     parent.mkdir(mode=0o700)
@@ -457,7 +494,7 @@ def test_unsupported_filesystem_preserves_verified_stage(tmp_path, monkeypatch, 
         assert any("outcome is indeterminate" in note for note in _notes(captured.value))
 
 
-def test_reported_rename_failure_can_have_committed_on_network_filesystem(
+def test_reported_rename_failure_is_reconciled_when_the_exact_stage_was_committed(
     tmp_path,
     monkeypatch,
     caplog,
@@ -478,18 +515,12 @@ def test_reported_rename_failure_can_have_committed_on_network_filesystem(
         raise OSError(errno.EIO, "simulated lost NFS rename reply")
 
     monkeypatch.setattr(backends, "_rename_noreplace_at", commit_then_report_failure)
-    with pytest.raises(OSError, match="lost NFS rename reply") as captured:
-        backends._publish_exclusive(source, destination, digest)
+    backends._publish_exclusive(source, destination, digest)
 
     assert _stage_entries(parent) == []
     assert sha256_artifact(destination) == digest
-    assert stat.S_IMODE(destination.stat().st_mode) == 0o600
-    assert "outcome is indeterminate" in caplog.text
-    assert "No automatic deletion was attempted" in caplog.text
-    if hasattr(captured.value, "add_note"):
-        notes = _notes(captured.value)
-        assert any("outcome is indeterminate" in note for note in notes)
-        assert any("No automatic deletion was attempted" in note for note in notes)
+    assert stat.S_IMODE(destination.stat().st_mode) == 0o644
+    assert "outcome is indeterminate" not in caplog.text
 
 
 def test_post_rename_permission_failure_preserves_private_final(

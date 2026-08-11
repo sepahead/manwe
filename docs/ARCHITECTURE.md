@@ -1,111 +1,190 @@
-# manwe architecture
+# Manwe architecture
 
-Manwe is a research workbench for detector training, acoustic processing,
-multi-camera geometry, fusion, evaluation, and Rust/Candle inference. Crebain is
-one intended consumer, but the repositories do not currently share a complete
-wire or model-runtime contract. Manwe produces candidate artifacts and reference
-results; an explicit consumer adapter and validation campaign are still required.
+Manwe is a perception research and validation workbench, not a monolithic
+deployment service. Its architecture deliberately separates four boundaries that
+fail for different reasons:
 
-## Design principles
+1. the Python research plane trains, evaluates, exports, and simulates;
+2. a schema-2 model package binds one artifact to an executable interface;
+3. the Rust native plane executes only the Candle adapters it implements; and
+4. downstream systems require their own versioned adapters and fixtures.
 
-1. **Pure-numpy core, lazy heavy deps.** The fusion, geometry, DOA, metrics and
-   contract layers depend only on numpy, so they run without ML runtimes on the
-   tested Linux and macOS hosts. Windows is not an alpha release target: several
-   trust-boundary helpers intentionally rely on POSIX descriptor-relative I/O.
-   Training and raw conversion dependencies are isolated behind explicit extras.
-   TensorRT remains a platform installation, and MLX conversion is not implemented.
-2. **One device-selection helper.** `manwe.common.resolve_device` represents CUDA,
-   MPS, and CPU choices. It does not prove that a model supports the selected
-   device or that outputs are numerically equivalent.
-3. **Candidate contracts are evidence-bound.** Raw conversion returns an immutable
-   source/artifact/options receipt. A model manifest additionally requires an
-   explicit backend-inspected tensor signature and evidence reference; it is never
-   inferred from a family name or extension. Consumers do not yet ingest that
-   manifest automatically, so downstream drift still requires adapter fixtures.
-4. **Claims are narrower than tools.** The package provides threshold-specific
-   AP, operating-point precision/recall/FPPI, direct export-agreement checks,
-   OSPA/GOSPA, and latency utilities. A promotion gate must add representative
-   data, per-consumer fixtures, and operational failure tests.
+Keeping those boundaries explicit prevents a successful conversion, a familiar
+file suffix, or a similar class name from becoming an accidental compatibility
+claim.
+
+## Architectural invariants
+
+### One authority per native model
+
+The native CLI and camera viewer accept one `--contract` path. They do not accept
+independent model-family, task, class-count, image-size, threshold, or digest
+flags. The validated schema-2 contract is the sole authority for:
+
+- the sibling artifact filename and SHA-256;
+- Candle model variant and detect/pose adapter;
+- exact input and output tensor shapes and dtypes;
+- image color, letterbox, interpolation, padding, scale, and alignment;
+- source classes and their optional Manwe airspace mapping;
+- confidence, NMS, keypoint, and maximum-result policy.
+
+`src/native_runtime.rs` is the only native load/inference pipeline. Both entry
+points reuse it, so model construction and postprocessing cannot drift between
+batch and live execution. An accepted native contract also proves the YOLOv8
+three-grid prediction count implied by its input size and stays within the model,
+tensor, and postprocessing work bounds.
+
+The live viewer separates capture from inference. One worker owns the runtime and
+selects fairly from one replaceable latest-frame slot per stream. Capture never
+waits behind model execution and queued work cannot grow. Raw frames are displayed
+during warm-up; after the first result, each view holds the newest completed exact
+annotated sample and advances monotonically as later inferences finish. Superseded
+queued samples are dropped, but a completed sample is not relabeled as current:
+viewer latency still depends on inference time and the number of streams. This is
+an annotated inference view, not an independent zero-latency raw monitor.
+Frame-producing sessions reset reconnect backoff; worker panics become a failing
+application exit and coordinated shutdown rather than a silent loss of inference
+or capture.
+
+The contract integrity-binds bytes; it does not authenticate who authored the
+contract. Operators must establish contract provenance separately.
+
+### Admission is not consumption
+
+Dataset validation is an admission-time observation of caller-owned storage. It
+rejects remote directives, escape paths, nested links, special entries, overlap,
+and within/across-split hardlink aliases under aggregate work limits. It cannot
+make a mutable filesystem immutable after return.
+
+Training therefore revalidates at the consumption boundary and gives the backend
+a private read-only copy plus a normalized manifest. Split identity is checked
+against the exact descriptor inventory from which that copy is made, then the
+copier proves the inventory stayed unchanged. The private copy's backend-visible
+images must then pass bounded single-frame header, suffix/content, mode, and EXIF
+checks before a trainer is constructed. Ultralytics label selection is mirrored
+and admitted as bounded UTF-8 detection rows with finite classes and image-contained normalized
+positive boxes; label aliases are rejected. RF-DETR additionally binds COCO image
+dimensions and box extents to those real headers. TensorRT calibration goes
+further: it validates complete decoded tensor semantics and exposes the exact
+hash-ranked backend set through a private loader view. The source tree is never
+treated as a stable long-running backend input merely because its YAML once
+passed validation.
+
+### Raw export is not a model package
+
+Python conversion produces an immutable `ExportReceipt`: source digest, artifact
+digest, and exact conversion options. A schema-2 `ModelContract` requires a
+separate `VerifiedArtifactSignature` produced from backend inspection. Here,
+“signature” means tensor-interface evidence, not a cryptographic signature.
+
+The builder refuses to infer tensors or runtime semantics from a family name or
+extension. The native Rust plane consumes only the two reviewed Candle adapters;
+ONNX, CoreML, and TensorRT contracts remain evidence records until a corresponding
+runtime or downstream adapter validates them.
+
+### Structured results preserve both taxonomies
+
+Native inference emits one JSON object per input image. Each retained object keeps
+its source class index/name and, when declared, an `airspace_class` mapping. A
+missing mapping is `null`, not an inferred class and not a silently dropped source
+result. Detect and pose payloads are tagged, so a consumer cannot confuse their
+shapes.
+
+Python checkpoint inference applies the same ownership principle at its smaller
+research boundary. Direct and sliced paths admit one bounded image, authenticate
+the checkpoint digest and detection metadata around the backend call, and convert
+all accepted output into immutable Manwe `Detection` records before releasing the
+private artifact snapshot. Evaluation frames likewise own immutable array copies,
+so later caller or backend mutation cannot rewrite measured evidence.
+
+### Claims stop at measured boundaries
+
+Device selection is capability routing, not numerical-equivalence evidence.
+Export success is file production, not fidelity. A valid package is native-runtime
+compatibility for its declared adapter, not downstream compatibility. Promotion
+still requires representative fixtures, accuracy/agreement gates, operational
+failure tests, and a consumer-owned adapter.
+
+## System flow
+
+```text
+caller-owned dataset
+        │ validate + revalidate
+        ▼
+private training snapshot ──▶ Python trainer ──▶ backend-owned candidate checkpoint
+                                                     │ hash exact bytes explicitly
+                                            raw backend conversion
+                                                     ▼
+                                              ExportReceipt
+                                                     │
+                                      backend tensor inspection
+                                                     ▼
+                              schema-2 contract + sibling artifact
+                                      │                    │
+                           Candle adapter only      other backends
+                                      ▼                    ▼
+                           shared NativeRuntime     evidence candidate
+                              │            │                │
+                         JSONL CLI    live viewer     downstream adapter
+                              └────────────┴───────────────┘
+                                             │
+                                fixtures + fidelity + failure gates
+                                             ▼
+                                       consumer input
+```
+
+Audio, multi-camera geometry, and fusion are independent reference paths. They
+produce local typed objects, not an implicit downstream wire protocol:
+
+```text
+microphones ─▶ DOA/ranging boundary ─┐
+cameras ─────▶ calibrated geometry ──┼─▶ local measurements ─▶ fusion reference
+radar/events ────────────────────────┘
+```
+
+An adapter must still define frames, units, clocks, identity, missingness, and
+covariance semantics. Similar array shapes are not a contract.
 
 ## Repository layout
 
-```
+```text
 manwe/
-├── python/                       # the training ground (primary)
-│   ├── src/manwe/
-│   │   ├── common/               # contracts, device (Metal/CUDA/CPU), seed, logging, deps
-│   │   ├── vision/               # zoo, from-scratch training, sliced inference, postprocess
-│   │   ├── audio/                # log-mel/SPL features, GCC-PHAT/SRP-PHAT DOA, acoustic→fusion
-│   │   ├── multicam/             # pinhole camera, DLT/midpoint triangulation, cross-cam correlation
-│   │   ├── fusion/               # KF/EKF/UKF/PF/IMM, association, M-of-N tracker, metrics, scenarios
-│   │   ├── export/               # raw backend conversion, model manifest, fidelity comparison
-│   │   ├── data/                 # dataset registry + offline synthetic generator
-│   │   ├── eval/                 # source-pixel detection metrics + benchmark utilities
-│   │   └── cli.py                # `manwe` CLI (doctor/models/data/synth/fusion-sim/vision-train/export)
-│   ├── configs/                  # per-pillar YAML configs
-│   ├── tests/                    # pytest suite (numpy-only core runs with zero heavy deps)
-│   └── pyproject.toml
-├── src/, metal-yolo-tests/       # Rust/Candle reference CLI + Candle/Metal profiling harness
+├── python/src/manwe/
+│   ├── common/          # contracts, artifact/dataset boundaries, devices
+│   ├── schemas/         # packaged, non-executable schema-2 examples
+│   ├── vision/          # model registry, private-snapshot training, inference
+│   ├── export/          # raw conversion, receipts, contract builder, fidelity
+│   ├── audio/           # GCC-PHAT/SRP-PHAT and acoustic measurements
+│   ├── multicam/        # camera geometry and triangulation
+│   ├── fusion/          # KF/EKF/UKF/PF/IMM tracker and metrics
+│   ├── data/, eval/     # datasets, synthetic fixtures, evaluation
+│   └── cli.py
+├── src/
+│   ├── runtime_contract.rs  # bounded schema-2 native admission
+│   ├── native_runtime.rs    # shared model load and inference pipeline
+│   ├── model.rs             # Candle YOLOv8 detect/pose graph
+│   ├── lib.rs               # preprocessing, validation, NMS, reports
+│   ├── main.rs              # JSONL batch CLI + durable image publication
+│   └── bin/                 # experimental viewer and credential-safe launcher
+├── metal-yolo-tests/        # bounded profiling tools, not a parity benchmark
 └── docs/
-    ├── ARCHITECTURE.md           # this file
-    ├── INTEGRATION_CREBAIN.md    # audited consumer compatibility and adapter gates
-    ├── MODEL_CONTRACTS.md        # candidate manifests and fidelity limits
-    └── research/SOTA-2026.md     # dated, source-cited survey with explicit cautions
 ```
 
-## Data flow and trust boundaries
+## Platform and numerical boundaries
 
-```
- datasets ─▶ vision ─▶ checkpoint ─▶ raw backend conversion ─┐
- mic arrays ─▶ audio ─▶ local measurement ───────────────────┤
- cameras ─▶ multicam ─▶ local 3D detection ─────────────────┤
- measurements ─▶ fusion ─▶ local track state ───────────────┤
-                                                            ▼
-                                            untrusted Manwe output
-                                                            │
-                    versioned adapter + taxonomy/frame/time/shape conversion
-                                                            │
-                       fixtures + numerical + fidelity + failure-mode gates
-                                                            ▼
-                                                     consumer input
-```
+- The NumPy core and contract layer are lightweight; heavy Python runtimes remain
+  optional. POSIX descriptor-relative protections make Windows a fail-closed,
+  unsupported alpha target for affected workflows.
+- CUDA is the intended large-training path and Apple MPS is a development path;
+  neither is promoted without exact-build operator and numerical evidence.
+- Rust supports CPU, optional Metal, and optional CUDA compilation. CI exercises
+  Linux CPU and macOS Metal/viewer; CUDA execution and CPU/Metal golden-forward
+  parity still require a pinned real model fixture.
+- Multi-camera covariance is conditional on analytically exact calibration.
+  Estimated intrinsic/extrinsic uncertainty is not yet propagated, so real rigs
+  must not reinterpret pixel-only covariance as complete state uncertainty.
+- Fusion is an independent event-indexed reference, not a numerical twin of a
+  downstream tracker.
 
-- **vision** → from-scratch detector experiments mapped to
-  `drone/bird/aircraft/helicopter/unknown`,
-  with raw ONNX/CoreML/TensorRT conversion utilities. The five-class output is not
-  accepted by crebain's fixed 80-class native YOLO parser without an adapter.
-- **audio** → microphone-array direction-of-arrival producing the
-  local azimuth/elevation/range/SPL representation. A consumer adapter must define
-  angle origin/sign, frame transform, range observability, covariance, clock, and ID.
-- **multicam** → calibrated cameras + N-view triangulation producing local 3D
-  detections and covariance conditional on exact camera calibration under
-  declared pixel/time assumptions. Intrinsic/extrinsic parameter uncertainty is
-  not yet propagated, so real estimated rigs fail closed instead of exposing
-  pixel-only covariance as a complete fusion measurement covariance.
-  Moving-target views must be physically simultaneous: equal zero-uncertainty
-  capture timestamps, or an explicit simultaneous-capture acknowledgement for
-  an untimestamped hardware-triggered batch. Bounded skew is accepted only for
-  a declared static target. Camera YAML, units, distortion, handedness, world
-  frame, synchronization, and ID semantics are part of the adapter contract,
-  not inferred defaults.
-- **fusion** → an independent Python implementation of 6-state filters,
-  association, and M-of-N lifecycle. It is useful as a seeded reference, but it is
-  not a numerical twin of crebain: defaults, association, process noise,
-  initialization, timing, and output schemas differ.
-
-## Hardware strategy (from the SOTA survey)
-
-- CUDA is the intended large-training path; Apple MPS is useful for development
-  and bounded experiments. Device choice does not replace a measured parity test.
-- ONNX is a useful interchange candidate, not a universal executable contract.
-  Tensor names/layouts, preprocessing, postprocessing, opsets, dynamic dimensions,
-  precision, and provider behavior must be pinned.
-- MPS promotion requires a pinned PyTorch build, explicit fallback logging, and a
-  target-hardware assertion that a detector forward/backward has no NaNs or silent
-  CPU offload. That heavy hardware gate is not implemented in current CI.
-- The fusion stack is currently NumPy/CPU. Its latency and scaling have not been
-  established for every target count or consumer workload.
-
-See [the integration status](INTEGRATION_CREBAIN.md) for the audited boundaries,
-and [the research survey](research/SOTA-2026.md) for dated background rather than
-deployment guarantees.
+See [MODEL_CONTRACTS.md](MODEL_CONTRACTS.md) for schema semantics and
+[INTEGRATION_CREBAIN.md](INTEGRATION_CREBAIN.md) for the downstream boundary.

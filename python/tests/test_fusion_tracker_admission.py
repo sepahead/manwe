@@ -314,6 +314,25 @@ def test_probability_overflow_and_near_max_covariance_fail_without_warnings():
     assert np.all(np.linalg.eigvalsh(stabilized) > 0)
 
 
+def test_birth_covariance_stabilization_preserves_independent_axis_scales():
+    covariance = np.diag([1e300, 1.0, 1e-6])
+    stabilized = MultiSensorTracker._stabilize_covariance(covariance)
+
+    assert np.array_equal(np.diag(stabilized), np.diag(covariance))
+    assert np.array_equal(stabilized, covariance)
+
+
+def test_birth_covariance_stabilization_is_exactly_pd_at_subnormal_scale():
+    minimum = np.nextafter(0.0, 1.0)
+    covariance = np.full((3, 3), minimum)
+
+    stabilized = MultiSensorTracker._stabilize_covariance(covariance)
+
+    assert np.array_equal(np.diag(stabilized), np.diag(covariance))
+    assert tracker_module._is_exactly_positive_semidefinite(stabilized)
+    assert tracker_module._exact_determinant_3x3(stabilized) > 0
+
+
 def test_covariance_congruence_preserves_exact_float64_extremes_under_seterr():
     maximum = np.finfo(float).max
     minimum = np.nextafter(0.0, 1.0)
@@ -690,6 +709,7 @@ def test_iterable_callback_mutations_are_rolled_back():
         object.__setattr__(tracker.cfg, "max_tracks", 1)
         tracker.rng = np.random.default_rng(999)
         tracker.tracks.clear()
+        tracker.injected_by_callback = object()
         yield object()
 
     with pytest.raises(TypeError, match=r"measurements\[0\]"):
@@ -699,6 +719,7 @@ def test_iterable_callback_mutations_are_rolled_back():
     assert tracker.cfg is not original_cfg
     assert tracker.rng is original_rng
     assert tracker.rng.bit_generator.state == original_rng_state
+    assert not hasattr(tracker, "injected_by_callback")
     assert tracker._last_t == 0.0
     assert tracker.tracks[0].age == original_age
     np.testing.assert_array_equal(tracker.tracks[0].filt.state.x, original_state.x)

@@ -6,6 +6,9 @@ use std::net::Ipv6Addr;
 pub const INVALID_RTSP_URL: &str =
     "stream URLs must be valid rtsp:// or rtsps:// URLs with an explicit host";
 
+/// One shared work bound for both the credential-holding launcher and viewer.
+pub const MAX_STREAMS: usize = 8;
+
 /// Validate the subset of RTSP URLs accepted by the viewer.
 pub fn validate_rtsp_url(value: &str) -> Result<(), &'static str> {
     if value.is_empty()
@@ -45,10 +48,21 @@ fn has_valid_percent_encoding(value: &str) -> bool {
     let mut index = 0;
     while index < bytes.len() {
         if bytes[index] == b'%' {
-            if bytes
-                .get(index + 1..index + 3)
-                .is_none_or(|hex| !hex.iter().all(u8::is_ascii_hexdigit))
-            {
+            let Some(hex) = bytes.get(index + 1..index + 3) else {
+                return false;
+            };
+            let Some(high) = hex_value(hex[0]) else {
+                return false;
+            };
+            let Some(low) = hex_value(hex[1]) else {
+                return false;
+            };
+            // The raw ffconcat record cannot contain controls, and neither may
+            // the URL that FFmpeg reconstructs after percent decoding. This
+            // closes CR/LF/NUL ambiguity in downstream RTSP request parsing
+            // while retaining ordinary escaped URL bytes such as space or '@'.
+            let decoded = high * 16 + low;
+            if decoded.is_ascii_control() {
                 return false;
             }
             index += 3;
@@ -57,6 +71,15 @@ fn has_valid_percent_encoding(value: &str) -> bool {
         }
     }
     true
+}
+
+fn hex_value(value: u8) -> Option<u8> {
+    match value {
+        b'0'..=b'9' => Some(value - b'0'),
+        b'a'..=b'f' => Some(value - b'a' + 10),
+        b'A'..=b'F' => Some(value - b'A' + 10),
+        _ => None,
+    }
 }
 
 fn validate_host_port(host_port: &str) -> Result<(), &'static str> {
@@ -187,10 +210,12 @@ mod tests {
 
     #[test]
     fn percent_encoding_requires_exactly_two_hex_digits() {
-        for value in ["", "plain", "a%00", "a%aF", "a%20b%2F"] {
+        for value in ["", "plain", "a%aF", "a%20b%2F"] {
             assert!(has_valid_percent_encoding(value), "rejected {value:?}");
         }
-        for value in ["%", "%0", "%GG", "%0g", "a%0g", "aa%00%", "plain%"] {
+        for value in [
+            "%", "%0", "%GG", "%0g", "a%0g", "%00", "%0A", "%0d", "%7F", "aa%00%", "plain%",
+        ] {
             assert!(!has_valid_percent_encoding(value), "accepted {value:?}");
         }
     }

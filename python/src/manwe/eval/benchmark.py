@@ -60,7 +60,7 @@ def benchmark(
     """
     if not callable(fn):
         raise TypeError("fn must be callable")
-    if not isinstance(name, str) or not name.strip():
+    if type(name) is not str or not name.strip():
         raise ValueError("name must be a nonempty string")
     if type(warmup) is not int or warmup < 0:
         raise ValueError("warmup must be a nonnegative integer")
@@ -84,7 +84,10 @@ def benchmark(
         fn()
         if sync is not None:
             sync()
-        times[i] = (time.perf_counter_ns() - t0) / 1_000_000.0
+        elapsed_ns = time.perf_counter_ns() - t0
+        if elapsed_ns <= 0:
+            raise RuntimeError("the monotonic benchmark clock did not advance")
+        times[i] = elapsed_ns / 1_000_000.0
 
     mean = float(times.mean())
     return BenchmarkResult(
@@ -95,7 +98,7 @@ def benchmark(
         p95_ms=float(np.percentile(times, 95)),
         p99_ms=float(np.percentile(times, 99)),
         std_ms=float(times.std()),
-        fps=1000.0 / mean if mean > 0 else float("inf"),
+        fps=1000.0 / mean,
         hardware=describe_hardware(),
     )
 

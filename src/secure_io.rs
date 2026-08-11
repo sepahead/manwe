@@ -67,6 +67,19 @@ pub struct FileIdentity {
     modified: Option<std::time::SystemTime>,
 }
 
+/// Authenticated result of one no-replace hard-link publication attempt.
+///
+/// `AlreadyLinked` covers the important remote-filesystem case where the link
+/// became visible but its successful reply was lost. `DestinationOccupied`
+/// means an `EEXIST` destination identifies a different filesystem object, so
+/// a caller may safely choose another name.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HardLinkPublication {
+    Created,
+    AlreadyLinked,
+    DestinationOccupied,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct DirectoryIdentity {
     #[cfg(unix)]
@@ -75,6 +88,21 @@ struct DirectoryIdentity {
     inode: u64,
     #[cfg(not(unix))]
     unsupported: (),
+}
+
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct UnixEntryIdentity {
+    device: u64,
+    inode: u64,
+    is_regular: bool,
+}
+
+#[cfg(unix)]
+fn is_same_regular_entry(source: FileIdentity, destination: UnixEntryIdentity) -> bool {
+    destination.is_regular
+        && destination.device == source.device
+        && destination.inode == source.inode
 }
 
 /// An opened directory bound to the device/inode identity of its canonical path.
@@ -197,6 +225,21 @@ impl BoundDirectory {
         &self.path
     }
 
+    /// Duplicate this retained directory authority without reopening its path.
+    pub fn try_clone(&self) -> Result<Self> {
+        self.verify()?;
+        let cloned = Self {
+            path: self.path.clone(),
+            file: self
+                .file
+                .try_clone()
+                .with_context(|| format!("failed to clone directory {}", self.path.display()))?,
+            identity: self.identity,
+        };
+        cloned.verify()?;
+        Ok(cloned)
+    }
+
     /// Fail if the canonical path no longer identifies the opened directory.
     pub fn verify(&self) -> Result<()> {
         #[cfg(not(unix))]
@@ -228,6 +271,414 @@ impl BoundDirectory {
         self.verify()?;
         self.file.sync_all()?;
         self.verify()
+    }
+
+    /// Exclusively create a regular-file entry through this directory descriptor.
+    pub fn create_new_regular_file_entry(&self, name: &std::ffi::OsStr, mode: u32) -> Result<File> {
+        if mode & !0o777 != 0 {
+            anyhow::bail!("regular-file creation mode must contain only permission bits")
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (name, mode);
+            anyhow::bail!("descriptor-relative regular-file creation requires Unix")
+        }
+        #[cfg(unix)]
+        {
+            use std::os::fd::{AsRawFd, FromRawFd};
+
+            let encoded = directory_entry_cstring(name)?;
+            self.verify()?;
+            // SAFETY: `self.file` is a live directory descriptor, `encoded` is
+            // one validated basename, and ownership of the returned descriptor
+            // transfers exactly once to `File`.
+            let descriptor = unsafe {
+                libc::openat(
+                    self.file.as_raw_fd(),
+                    encoded.as_ptr(),
+                    libc::O_WRONLY
+                        | libc::O_CREAT
+                        | libc::O_EXCL
+                        | libc::O_CLOEXEC
+                        | libc::O_NOFOLLOW,
+                    mode as libc::c_uint,
+                )
+            };
+            if descriptor < 0 {
+                return Err(std::io::Error::last_os_error()).with_context(|| {
+                    format!(
+                        "failed to create bound directory entry {}",
+                        self.path.join(name).display()
+                    )
+                });
+            }
+            // SAFETY: the successful `openat` returned a unique descriptor.
+            // `O_CREAT | O_EXCL` creates a regular file, and the process umask
+            // can only remove permissions from `mode`; no fallible pathname or
+            // metadata operation is needed after the visible side effect.
+            Ok(unsafe { File::from_raw_fd(descriptor) })
+        }
+    }
+
+    /// Exclusively create and bind a child directory through this descriptor.
+    pub fn create_directory_entry(&self, name: &std::ffi::OsStr, mode: u32) -> Result<Self> {
+        if mode & !0o777 != 0 {
+            anyhow::bail!("directory creation mode must contain only permission bits")
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (name, mode);
+            anyhow::bail!("descriptor-relative directory creation requires Unix")
+        }
+        #[cfg(unix)]
+        {
+            use std::os::fd::{AsRawFd, FromRawFd};
+
+            let encoded = directory_entry_cstring(name)?;
+            let display_path = self.path.join(name);
+            self.verify()?;
+            // SAFETY: `self.file` is a live directory descriptor and `encoded`
+            // is one validated NUL-terminated basename.
+            if unsafe {
+                libc::mkdirat(
+                    self.file.as_raw_fd(),
+                    encoded.as_ptr(),
+                    mode as libc::mode_t,
+                )
+            } != 0
+            {
+                return Err(std::io::Error::last_os_error()).with_context(|| {
+                    format!(
+                        "failed to create bound directory entry {}",
+                        display_path.display()
+                    )
+                });
+            }
+            let descriptor = unsafe {
+                libc::openat(
+                    self.file.as_raw_fd(),
+                    encoded.as_ptr(),
+                    libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_DIRECTORY,
+                )
+            };
+            if descriptor < 0 {
+                anyhow::bail!(
+                    "bound directory entry was created at {}, but could not be opened: {}",
+                    display_path.display(),
+                    std::io::Error::last_os_error()
+                )
+            }
+            // SAFETY: the successful `openat` returned a unique descriptor.
+            let file = unsafe { File::from_raw_fd(descriptor) };
+            let metadata = file.metadata().with_context(|| {
+                format!(
+                    "bound directory entry was created at {}, but could not be inspected",
+                    display_path.display()
+                )
+            })?;
+            if !metadata.is_dir() {
+                anyhow::bail!(
+                    "created bound directory entry is not a directory: {}",
+                    display_path.display()
+                )
+            }
+            let child = Self {
+                path: display_path,
+                identity: directory_identity(&metadata),
+                file,
+            };
+            Ok(child)
+        }
+    }
+
+    /// Publish a bounded regular file between two retained directory authorities.
+    ///
+    /// A failed syscall is reconciled descriptor-relatively by filesystem
+    /// object identity. This makes publication idempotent when a remote
+    /// filesystem committed the link but lost the success response, regardless
+    /// of the error code returned to the client. An `EEXIST` entry belonging to
+    /// another inode is a conclusive name collision; every other unresolved
+    /// error remains indeterminate because the link may still become visible.
+    pub fn hard_link_file_entry_to(
+        &self,
+        source_name: &std::ffi::OsStr,
+        destination: &Self,
+        destination_name: &std::ffi::OsStr,
+        max_bytes: u64,
+    ) -> Result<HardLinkPublication> {
+        #[cfg(not(unix))]
+        {
+            let _ = (source_name, destination, destination_name, max_bytes);
+            anyhow::bail!("descriptor-relative hard-link publication requires Unix")
+        }
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd;
+
+            let source_encoded = directory_entry_cstring(source_name)?;
+            let destination_encoded = directory_entry_cstring(destination_name)?;
+            let source_identity = self.regular_file_entry_identity(source_name, max_bytes)?;
+            self.verify().with_context(|| {
+                format!(
+                    "hard-link publication at {} reported failure and the source directory identity could not be re-authenticated; the visible outcome is indeterminate",
+                    destination.path.join(destination_name).display()
+                )
+            })?;
+            destination.verify().with_context(|| {
+                format!(
+                    "hard-link publication at {} reported failure and the destination directory identity could not be re-authenticated; the visible outcome is indeterminate",
+                    destination.path.join(destination_name).display()
+                )
+            })?;
+            // SAFETY: both retained files are live directory descriptors and
+            // both names are validated NUL-terminated basenames.
+            let status = unsafe {
+                libc::linkat(
+                    self.file.as_raw_fd(),
+                    source_encoded.as_ptr(),
+                    destination.file.as_raw_fd(),
+                    destination_encoded.as_ptr(),
+                    0,
+                )
+            };
+            if status == 0 {
+                // A successful syscall only proves that *some* source entry was
+                // linked at its linearization point. Authenticate the visible
+                // destination against the source inode admitted above so a
+                // concurrent source-name substitution cannot be mislabeled as a
+                // successful publication by this shared primitive.
+                let destination_identity = destination
+                    .entry_identity_nofollow(destination_name)
+                    .with_context(|| {
+                        format!(
+                            "hard-link publication created an entry at {}, but its visible identity could not be authenticated",
+                            destination.path.join(destination_name).display()
+                        )
+                    })?;
+                self.verify().with_context(|| {
+                    format!(
+                        "hard-link publication created an entry at {}, but the source directory identity could not be re-authenticated",
+                        destination.path.join(destination_name).display()
+                    )
+                })?;
+                destination.verify().with_context(|| {
+                    format!(
+                        "hard-link publication created an entry at {}, but the destination directory identity could not be re-authenticated",
+                        destination.path.join(destination_name).display()
+                    )
+                })?;
+                if is_same_regular_entry(source_identity, destination_identity) {
+                    return Ok(HardLinkPublication::Created);
+                }
+                anyhow::bail!(
+                    "hard-link publication created an entry at {}, but the visible destination does not identify the authenticated source inode",
+                    destination.path.join(destination_name).display()
+                )
+            }
+
+            let link_error = std::io::Error::last_os_error();
+            // `link(2)` is not reliably at-most-once on a remote filesystem: a
+            // server may commit the link and lose the reply. Inspect the visible
+            // destination without following a final symlink and compare the only
+            // stable hard-link identity, device + inode. Timestamps are
+            // deliberately excluded because a successful link itself changes
+            // ctime. Do this for every reported error, not merely EEXIST: a
+            // committed operation can surface as EIO or another transport error.
+            let destination_identity = match destination.entry_identity_nofollow(destination_name) {
+                Ok(identity) => identity,
+                Err(inspection) => {
+                    return Err(anyhow::anyhow!(link_error)).with_context(|| {
+                        format!(
+                            "hard-link publication at {} has an indeterminate visible outcome; descriptor-relative inspection also failed: {inspection:#}",
+                            destination.path.join(destination_name).display()
+                        )
+                    });
+                }
+            };
+            self.verify()?;
+            destination.verify()?;
+            if is_same_regular_entry(source_identity, destination_identity) {
+                Ok(HardLinkPublication::AlreadyLinked)
+            } else if link_error.kind() == std::io::ErrorKind::AlreadyExists {
+                Ok(HardLinkPublication::DestinationOccupied)
+            } else {
+                Err(anyhow::anyhow!(link_error)).with_context(|| {
+                    format!(
+                        "hard-link publication at {} failed and the visible destination identifies another filesystem object",
+                        destination.path.join(destination_name).display()
+                    )
+                })
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    fn entry_identity_nofollow(&self, name: &std::ffi::OsStr) -> Result<UnixEntryIdentity> {
+        use std::mem::MaybeUninit;
+        use std::os::fd::AsRawFd;
+
+        let encoded = directory_entry_cstring(name)?;
+        let display_path = self.path.join(name);
+        self.verify()?;
+        let mut status = MaybeUninit::<libc::stat>::uninit();
+        // SAFETY: the directory descriptor and encoded basename are live, and
+        // `status` points to writable storage for one `libc::stat`. The final
+        // component is inspected rather than followed.
+        if unsafe {
+            libc::fstatat(
+                self.file.as_raw_fd(),
+                encoded.as_ptr(),
+                status.as_mut_ptr(),
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        } != 0
+        {
+            return Err(std::io::Error::last_os_error()).with_context(|| {
+                format!(
+                    "failed to inspect bound directory entry {}",
+                    display_path.display()
+                )
+            });
+        }
+        // SAFETY: successful `fstatat` initialized the complete structure.
+        let status = unsafe { status.assume_init() };
+        self.verify()?;
+        Ok(UnixEntryIdentity {
+            device: status.st_dev as u64,
+            inode: status.st_ino,
+            is_regular: status.st_mode & libc::S_IFMT == libc::S_IFREG,
+        })
+    }
+
+    /// Read one bounded regular-file entry through this directory descriptor.
+    ///
+    /// Resolving the basename with `openat` keeps the read anchored to the
+    /// directory inode even if an attacker transiently renames the canonical
+    /// pathname and later restores it. The final component is never followed
+    /// when it is a symbolic link, and non-regular entries are rejected before
+    /// any bytes are consumed.
+    pub fn read_bounded_regular_file_entry(
+        &self,
+        name: &std::ffi::OsStr,
+        max_bytes: u64,
+    ) -> Result<Vec<u8>> {
+        self.read_bounded_regular_file_entry_with_identity(name, max_bytes)
+            .map(|(bytes, _identity)| bytes)
+    }
+
+    /// Read and bind one regular-file entry through this retained directory.
+    pub fn read_bounded_regular_file_entry_with_identity(
+        &self,
+        name: &std::ffi::OsStr,
+        max_bytes: u64,
+    ) -> Result<(Vec<u8>, FileIdentity)> {
+        if max_bytes == 0 {
+            anyhow::bail!("file size limit must be positive")
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = name;
+            anyhow::bail!("descriptor-relative regular-file reads require Unix")
+        }
+        #[cfg(unix)]
+        {
+            use std::os::fd::{AsRawFd, FromRawFd};
+
+            let encoded = directory_entry_cstring(name)?;
+            let display_path = self.path.join(name);
+            self.verify()?;
+            // SAFETY: `self.file` is a live directory descriptor, `encoded` is
+            // one validated NUL-terminated basename, and the returned descriptor
+            // is immediately owned by `File`. O_NONBLOCK prevents a raced FIFO
+            // substitution from hanging the process; it has no effect on regular
+            // file reads.
+            let descriptor = unsafe {
+                libc::openat(
+                    self.file.as_raw_fd(),
+                    encoded.as_ptr(),
+                    libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK,
+                )
+            };
+            if descriptor < 0 {
+                return Err(std::io::Error::last_os_error()).with_context(|| {
+                    format!(
+                        "failed to open bound directory entry {} without following links",
+                        display_path.display()
+                    )
+                });
+            }
+            // SAFETY: `descriptor` is a unique, newly opened descriptor on the
+            // success path above and ownership transfers exactly once to `File`.
+            let mut file = unsafe { File::from_raw_fd(descriptor) };
+            let metadata = file.metadata().with_context(|| {
+                format!("failed to inspect opened file {}", display_path.display())
+            })?;
+            validate_metadata(&display_path, &metadata, max_bytes)?;
+            let file_identity = identity(&metadata);
+            self.verify()?;
+            let bytes = read_bounded_open_file(&mut file, file_identity, &display_path, max_bytes)?;
+            self.verify()?;
+            // Reopen the basename through the same directory authority. The
+            // bytes and identity therefore describe the entry that remains
+            // published at return, not merely a detached descriptor.
+            let current = self.open_regular_file_entry(name, max_bytes)?;
+            if identity(&current.metadata()?) != file_identity {
+                anyhow::bail!(
+                    "bound directory entry changed while it was being read: {}",
+                    display_path.display()
+                )
+            }
+            Ok((bytes, file_identity))
+        }
+    }
+
+    /// Return the current identity of one bounded regular-file entry.
+    pub fn regular_file_entry_identity(
+        &self,
+        name: &std::ffi::OsStr,
+        max_bytes: u64,
+    ) -> Result<FileIdentity> {
+        #[cfg(not(unix))]
+        {
+            let _ = (name, max_bytes);
+            anyhow::bail!("descriptor-relative regular-file inspection requires Unix")
+        }
+        #[cfg(unix)]
+        {
+            let file = self.open_regular_file_entry(name, max_bytes)?;
+            Ok(identity(&file.metadata()?))
+        }
+    }
+
+    #[cfg(unix)]
+    fn open_regular_file_entry(&self, name: &std::ffi::OsStr, max_bytes: u64) -> Result<File> {
+        use std::os::fd::{AsRawFd, FromRawFd};
+
+        let encoded = directory_entry_cstring(name)?;
+        let display_path = self.path.join(name);
+        self.verify()?;
+        // SAFETY: `self.file` is live, `encoded` is one validated basename, and
+        // ownership transfers exactly once to `File`.
+        let descriptor = unsafe {
+            libc::openat(
+                self.file.as_raw_fd(),
+                encoded.as_ptr(),
+                libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK,
+            )
+        };
+        if descriptor < 0 {
+            return Err(std::io::Error::last_os_error()).with_context(|| {
+                format!(
+                    "failed to open bound directory entry {} without following links",
+                    display_path.display()
+                )
+            });
+        }
+        // SAFETY: the successful `openat` returned a unique descriptor.
+        let file = unsafe { File::from_raw_fd(descriptor) };
+        validate_metadata(&display_path, &file.metadata()?, max_bytes)?;
+        self.verify()?;
+        Ok(file)
     }
 
     /// Require this directory to be an owner-controlled mutation boundary.
@@ -315,14 +766,8 @@ impl BoundDirectory {
         #[cfg(unix)]
         {
             use std::os::fd::AsRawFd;
-            use std::os::unix::ffi::OsStrExt;
 
-            let bytes = name.as_bytes();
-            if bytes.is_empty() || bytes == b"." || bytes == b".." || bytes.contains(&b'/') {
-                anyhow::bail!("directory entry name must be one non-special basename")
-            }
-            let encoded = std::ffi::CString::new(bytes)
-                .context("directory entry name contains an interior NUL")?;
+            let encoded = directory_entry_cstring(name)?;
             self.verify()?;
             // SAFETY: `self.file` is a live directory descriptor and `encoded` is
             // one live NUL-terminated basename. `flags` is either 0 or AT_REMOVEDIR.
@@ -342,6 +787,17 @@ impl BoundDirectory {
             Ok(true)
         }
     }
+}
+
+#[cfg(unix)]
+fn directory_entry_cstring(name: &std::ffi::OsStr) -> Result<std::ffi::CString> {
+    use std::os::unix::ffi::OsStrExt;
+
+    let bytes = name.as_bytes();
+    if bytes.is_empty() || bytes == b"." || bytes == b".." || bytes.contains(&b'/') {
+        anyhow::bail!("directory entry name must be one non-special basename")
+    }
+    std::ffi::CString::new(bytes).context("directory entry name contains an interior NUL")
 }
 
 #[cfg(not(unix))]
@@ -396,7 +852,9 @@ pub fn open_bounded_regular_file(path: &Path, max_bytes: u64) -> Result<(File, F
         options.read(true);
         use std::os::unix::fs::OpenOptionsExt;
 
-        options.custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
+        // O_NONBLOCK prevents a raced FIFO substitution from hanging open(); it
+        // does not alter regular-file behavior.
+        options.custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK);
         let file = options.open(path).with_context(|| {
             format!("failed to open {} without following links", path.display())
         })?;
@@ -1040,14 +1498,77 @@ fn ensure_no_extended_acl_permissions(
     inspection
 }
 
-#[cfg(all(unix, not(target_os = "macos")))]
-fn ensure_no_mutating_extended_acl(_path: &Path) -> Result<()> {
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn ensure_no_mutating_extended_acl(path: &Path) -> Result<()> {
+    ensure_no_linux_access_acl(path)
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn ensure_no_access_granting_extended_acl(path: &Path) -> Result<()> {
+    ensure_no_linux_access_acl(path)
+}
+
+/// Reject Linux ACL xattrs rather than trusting mode bits that may understate
+/// effective access. POSIX ACLs are allow-only; an inherited default ACL is
+/// equally relevant for directories that will create files. RichACL, NFSv4,
+/// and Samba NT ACL metadata use separate conventional xattrs and are rejected
+/// conservatively too.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn ensure_no_linux_access_acl(path: &Path) -> Result<()> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let encoded = CString::new(path.as_os_str().as_bytes())
+        .with_context(|| format!("path contains an interior NUL: {}", path.display()))?;
+    for name in [
+        b"security.NTACL\0".as_slice(),
+        b"system.richacl\0".as_slice(),
+        b"system.posix_acl_access\0".as_slice(),
+        b"system.posix_acl_default\0".as_slice(),
+        b"system.nfs4_acl\0".as_slice(),
+    ] {
+        // SAFETY: both pointers are live NUL-terminated strings. A null value
+        // pointer with size zero asks only whether the attribute exists.
+        let size = unsafe {
+            libc::lgetxattr(
+                encoded.as_ptr(),
+                name.as_ptr().cast(),
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        if size >= 0 {
+            anyhow::bail!(
+                "path component has an access-granting extended ACL: {}",
+                path.display()
+            )
+        }
+        let error = std::io::Error::last_os_error();
+        let absent_or_unsupported = error.raw_os_error().is_some_and(|code| {
+            code == libc::ENODATA || code == libc::ENOTSUP || code == libc::EOPNOTSUPP
+        });
+        if !absent_or_unsupported {
+            return Err(error)
+                .with_context(|| format!("failed to inspect ACL for {}", path.display()));
+        }
+    }
     Ok(())
 }
 
-#[cfg(all(unix, not(target_os = "macos")))]
+#[cfg(all(
+    unix,
+    not(any(target_os = "macos", target_os = "linux", target_os = "android"))
+))]
+fn ensure_no_mutating_extended_acl(_path: &Path) -> Result<()> {
+    anyhow::bail!("extended ACL validation is unsupported on this Unix platform")
+}
+
+#[cfg(all(
+    unix,
+    not(any(target_os = "macos", target_os = "linux", target_os = "android"))
+))]
 fn ensure_no_access_granting_extended_acl(_path: &Path) -> Result<()> {
-    Ok(())
+    anyhow::bail!("extended ACL validation is unsupported on this Unix platform")
 }
 
 #[cfg(not(unix))]
@@ -1157,6 +1678,126 @@ mod tests {
         drop(bound);
         std::fs::remove_dir_all(directory).unwrap();
         std::fs::remove_dir_all(moved).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bound_directory_reads_only_regular_basename_entries() {
+        use std::os::unix::fs::symlink;
+
+        let directory = test_directory("descriptor-relative-read");
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir(&directory).unwrap();
+        std::fs::write(directory.join("artifact.bin"), b"authenticated bytes").unwrap();
+        symlink("artifact.bin", directory.join("alias.bin")).unwrap();
+        let bound = BoundDirectory::open(&directory).unwrap();
+
+        assert_eq!(
+            bound
+                .read_bounded_regular_file_entry(std::ffi::OsStr::new("artifact.bin"), 64)
+                .unwrap(),
+            b"authenticated bytes"
+        );
+        assert!(bound
+            .read_bounded_regular_file_entry(std::ffi::OsStr::new("alias.bin"), 64)
+            .is_err());
+        assert!(bound
+            .read_bounded_regular_file_entry(std::ffi::OsStr::new("../artifact.bin"), 64)
+            .is_err());
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bound_directory_creates_and_publishes_exact_private_entries() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = test_directory("descriptor-relative-publication");
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir(&directory).unwrap();
+        let parent = BoundDirectory::open(&directory).unwrap();
+        let stage_name = std::ffi::OsStr::new("stage");
+        let stage = parent.create_directory_entry(stage_name, 0o700).unwrap();
+        let staged_name = std::ffi::OsStr::new("output.jpg");
+        let mut staged = stage
+            .create_new_regular_file_entry(staged_name, 0o600)
+            .unwrap();
+        std::io::Write::write_all(&mut staged, b"exact bytes").unwrap();
+        staged.sync_all().unwrap();
+        drop(staged);
+
+        let final_name = std::ffi::OsStr::new("final.jpg");
+        assert_eq!(
+            stage
+                .hard_link_file_entry_to(staged_name, &parent, final_name, 64)
+                .unwrap(),
+            HardLinkPublication::Created
+        );
+        // Model the replay after a remote server committed the first request
+        // but its success reply was lost. The exact same inode is idempotent,
+        // while a distinct existing entry is conclusively occupied.
+        assert_eq!(
+            stage
+                .hard_link_file_entry_to(staged_name, &parent, final_name, 64)
+                .unwrap(),
+            HardLinkPublication::AlreadyLinked
+        );
+        let occupied_name = std::ffi::OsStr::new("occupied.jpg");
+        std::fs::write(directory.join(occupied_name), b"different bytes").unwrap();
+        assert_eq!(
+            stage
+                .hard_link_file_entry_to(staged_name, &parent, occupied_name, 64)
+                .unwrap(),
+            HardLinkPublication::DestinationOccupied
+        );
+        let staged_identity = stage.regular_file_entry_identity(staged_name, 64).unwrap();
+        let final_identity = parent.regular_file_entry_identity(final_name, 64).unwrap();
+
+        assert_eq!(staged_identity, final_identity);
+        assert_eq!(
+            std::fs::read(directory.join(final_name)).unwrap(),
+            b"exact bytes"
+        );
+        assert_eq!(
+            std::fs::metadata(directory.join(final_name))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o077,
+            0
+        );
+        assert!(parent
+            .create_new_regular_file_entry(std::ffi::OsStr::new("../escape"), 0o600)
+            .is_err());
+
+        stage.remove_file_entry(staged_name).unwrap();
+        parent.remove_file_entry(final_name).unwrap();
+        parent.remove_file_entry(occupied_name).unwrap();
+        drop(stage);
+        parent.remove_directory_entry(stage_name).unwrap();
+        drop(parent);
+        std::fs::remove_dir(directory).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_reads_reject_a_fifo_without_waiting_for_a_writer() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let directory = test_directory("fifo");
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir(&directory).unwrap();
+        let fifo = directory.join("artifact.fifo");
+        let encoded = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        // SAFETY: `encoded` is one live NUL-terminated path and the mode is a
+        // conventional owner-only FIFO mode.
+        assert_eq!(unsafe { libc::mkfifo(encoded.as_ptr(), 0o600) }, 0);
+
+        let error = read_bounded_regular_file(&fifo, 64).unwrap_err();
+
+        assert!(error.to_string().contains("regular file"));
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[cfg(unix)]

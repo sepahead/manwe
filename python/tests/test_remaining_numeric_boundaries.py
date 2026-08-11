@@ -10,7 +10,7 @@ import numpy as np
 import pytest
 from PIL import Image
 
-from manwe.common.contracts import MAX_CONTRACT_CLASSES, TensorSpec
+from manwe.common.contracts import MAX_CONTRACT_CLASSES, TensorSpec, detection_runtime
 from manwe.common.numeric import finite_float64_scalar
 from manwe.data.synthetic import write_png
 from manwe.eval.detection import Detections, GroundTruth
@@ -83,6 +83,11 @@ def _signature(input_tensor: TensorSpec | None = None) -> VerifiedArtifactSignat
         source_classes=("drone",),
         inputs=(input_tensor or TensorSpec("images", [1, 3, 32, 32], "float32", "NCHW/RGB"),),
         outputs=(TensorSpec("output0", [1, 5, 21], "float32"),),
+        runtime=detection_runtime(
+            input_tensor="images",
+            output_tensor="output0",
+            image_size=32,
+        ),
         preprocess="bounded RGB",
         postprocess="raw detect",
         failure_behavior="reject malformed inputs",
@@ -381,6 +386,11 @@ def test_signature_and_tensor_text_reject_string_subclasses_without_callbacks():
             source_classes=(_CoerciveString("drone"),),
             inputs=(TensorSpec("images", [1, 3, 32, 32], "float32", "NCHW/RGB"),),
             outputs=(TensorSpec("output0", [1, 5, 21], "float32"),),
+            runtime=detection_runtime(
+                input_tensor="images",
+                output_tensor="output0",
+                image_size=32,
+            ),
             preprocess="bounded RGB",
             postprocess="raw detect",
             failure_behavior="reject malformed inputs",

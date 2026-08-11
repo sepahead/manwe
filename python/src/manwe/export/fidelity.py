@@ -1,7 +1,7 @@
 """Export-fidelity gate: an exported model must match its PyTorch reference.
 
 Gate every backend on the AP delta versus the FP32 PyTorch reference before any
-performance claim or hand-off to crebain. The default tolerance is an absolute
+performance claim or downstream hand-off. The default tolerance is an absolute
 0.005 AP (0.5 percentage points); callers may set a stricter small-object policy
 for quantized exports. Small-object AP is always checked separately.
 """
@@ -16,7 +16,13 @@ from typing import cast
 import numpy as np
 
 from ..common.numeric import finite_float64_scalar
-from ..eval.detection import Detections, GroundTruth, iou_matrix, mean_average_precision
+from ..eval.detection import (
+    Detections,
+    GroundTruth,
+    _validated_image_id,
+    iou_matrix,
+    mean_average_precision,
+)
 from ..fusion.association import GATE_INF, linear_assignment
 
 _MAX_FIDELITY_FRAMES = 10_000
@@ -188,9 +194,18 @@ def _require_aligned_image_ids(
     reference: list[Detections], exported: list[Detections], ground_truth: list[GroundTruth]
 ) -> None:
     sequences = {
-        "reference": [frame.image_id for frame in reference],
-        "exported": [frame.image_id for frame in exported],
-        "ground_truth": [frame.image_id for frame in ground_truth],
+        "reference": [
+            _validated_image_id(frame.image_id, f"reference[{index}].image_id")
+            for index, frame in enumerate(reference)
+        ],
+        "exported": [
+            _validated_image_id(frame.image_id, f"exported[{index}].image_id")
+            for index, frame in enumerate(exported)
+        ],
+        "ground_truth": [
+            _validated_image_id(frame.image_id, f"ground_truth[{index}].image_id")
+            for index, frame in enumerate(ground_truth)
+        ],
     }
     for name, values in sequences.items():
         if any(value is None for value in values):

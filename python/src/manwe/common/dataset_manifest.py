@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 import hashlib
+import json
 import math
 import os
 import pathlib
@@ -15,11 +16,14 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from functools import partial
 from itertools import combinations
+from typing import cast
 
+from .artifacts import _DescriptorTreeEntry
 from .config_io import (
     load_unambiguous_yaml,
     open_directory_nofollow,
     open_regular_nofollow,
+    read_bounded_regular_bytes,
 )
 from .fd_io import (
     attach_cleanup_failure,
@@ -45,6 +49,34 @@ _CALIBRATION_IMAGE_FORMATS = {
     ".webp": frozenset({"WEBP"}),
 }
 _CALIBRATION_IMAGE_MODES = frozenset({"1", "L", "LA", "P", "RGB", "RGBA"})
+_ULTRALYTICS_IMAGE_SUFFIXES = frozenset(
+    {
+        ".avif",
+        ".bmp",
+        ".dng",
+        ".heic",
+        ".heif",
+        ".jp2",
+        ".jpeg",
+        ".jpg",
+        ".mpo",
+        ".png",
+        ".tif",
+        ".tiff",
+        ".webp",
+    }
+)
+_MAX_TRAINING_IMAGE_BYTES = 128 * 1024 * 1024
+_MAX_TRAINING_IMAGE_DIMENSION = 32_768
+_MAX_TRAINING_IMAGE_PIXELS = 64 * 1024 * 1024
+_MAX_TRAINING_LABEL_BYTES = 16 * 1024 * 1024
+_MAX_TRAINING_LABEL_ROWS = 100_000
+_MAX_TRAINING_LABEL_TOKEN_BYTES = 64
+# Common YOLO writers round normalized coordinates to six decimal places.
+# Independent centre/size rounding can move an exactly edge-touching box by up
+# to 0.75e-6, so admit that representation noise while rejecting any material
+# out-of-frame annotation.
+_TRAINING_LABEL_EDGE_TOLERANCE = 1e-6
 _MIN_CALIBRATION_IMAGES = 1_000
 _BACKEND_CALIBRATION_IMAGES = 512
 _MAX_CALIBRATION_IMAGES = 4_096
@@ -56,6 +88,15 @@ _MAX_CALIBRATION_TENSOR_BYTES = 64 * 1024 * 1024 * 1024
 _MAX_MODELOPT_CALIBRATION_WORK_BYTES = 8 * 1024 * 1024 * 1024
 _MAX_DATASET_BYTES = 64 * 1024 * 1024 * 1024
 _MAX_DATASET_ENTRIES = 100_000
+_MAX_RFDETR_ANNOTATION_BYTES = 128 * 1024 * 1024
+_MAX_RFDETR_JSON_NODES = 2_000_000
+_MAX_RFDETR_JSON_DEPTH = 64
+_MAX_RFDETR_IMAGES = 1_000_000
+_MAX_RFDETR_ANNOTATIONS = 2_000_000
+_MAX_RFDETR_IMAGE_DIMENSION = _MAX_TRAINING_IMAGE_DIMENSION
+_MAX_RFDETR_IMAGE_PIXELS = _MAX_TRAINING_IMAGE_PIXELS
+_MAX_RFDETR_PATH_BYTES = 4096
+_RFDETR_IMAGE_SUFFIXES = frozenset({".bmp", ".jpeg", ".jpg", ".png", ".tif", ".tiff", ".webp"})
 _CALIBRATION_POLICY = (
     b"ultralytics==8.4.92;task=detect;source=validated-val;"
     b"private-splits=train,val,test=same-curated-set;channels=3;"
@@ -529,7 +570,7 @@ class _BoundSourceDirectory:
         except ValueError as exc:
             if f"{_MAX_DATASET_BYTES}-byte safety limit" in str(exc):
                 raise ValueError(
-                    f"calibration dataset exceeds the {_MAX_DATASET_BYTES}-byte safety limit"
+                    f"dataset exceeds the {_MAX_DATASET_BYTES}-byte safety limit"
                 ) from exc
             raise
 
@@ -787,6 +828,115 @@ def _inventory_selected_split_set(
     return split_files
 
 
+def _validate_split_file_identities(
+    split_files: Mapping[str, Sequence[tuple[pathlib.Path, tuple[int, int]]]],
+) -> None:
+    """Reject duplicate regular-file identities within or across selected splits."""
+    split_origins: dict[str, dict[tuple[int, int], pathlib.Path]] = {}
+    for field, inventoried_files in split_files.items():
+        origins: dict[tuple[int, int], pathlib.Path] = {}
+        for split_path, identity in inventoried_files:
+            previous = origins.get(identity)
+            if previous is not None:
+                raise ValueError(
+                    f"dataset {field} paths identify the same filesystem entry and would "
+                    f"select files more than once: {previous} and {split_path}"
+                )
+            origins[identity] = split_path
+        split_origins[field] = origins
+
+    for (left_name, left_origins), (right_name, right_origins) in combinations(
+        split_origins.items(), 2
+    ):
+        for identity, left in left_origins.items():
+            right_origin = right_origins.get(identity)
+            if right_origin is not None:
+                raise ValueError(
+                    f"dataset {left_name} and {right_name} paths identify the same "
+                    f"filesystem entry: {left} and {right_origin}"
+                )
+
+
+def _validate_snapshotted_split_identities(
+    root: pathlib.Path,
+    payload: Mapping[str, object],
+    entries: Sequence[_DescriptorTreeEntry],
+    *,
+    require_nonempty: frozenset[str] = frozenset(),
+) -> None:
+    """Validate split identities on the exact source inventory being copied.
+
+    ``ArtifactSnapshot`` invokes this callback on the immutable descriptor
+    inventory that drives its copy, then proves the source inventory did not
+    change before returning. This makes split disjointness a property of the
+    consumed snapshot rather than an earlier observation of a mutable tree.
+    Ultralytics derives label paths outside commonly selected ``images/...``
+    directories, so those backend-consumed files participate in the same
+    identity boundary even when the manifest does not name them directly.
+    """
+
+    by_path: dict[str, _DescriptorTreeEntry] = {}
+    for entry in entries:
+        if entry.relative in by_path:
+            raise RuntimeError("dataset snapshot source-tree inventory contains duplicate paths")
+        by_path[entry.relative] = entry
+
+    split_files: dict[str, tuple[tuple[pathlib.Path, tuple[int, int]], ...]] = {}
+    for field in ("train", "val", "test"):
+        if field not in payload:
+            continue
+        selected: dict[str, tuple[pathlib.Path, tuple[int, int]]] = {}
+        for value in _split_values(payload[field], field):
+            try:
+                relative_path = pathlib.Path(value).relative_to(root)
+            except ValueError as exc:  # defensive: admission already normalized this
+                raise RuntimeError("dataset snapshot split escaped its admitted root") from exc
+            relative = relative_path.as_posix()
+            if relative == ".":
+                candidates = tuple(entry for entry in entries if not entry.is_directory)
+            else:
+                selected_root = by_path.get(relative)
+                if selected_root is None:
+                    raise ValueError(f"dataset {field} split changed before snapshotting: {value}")
+                if not selected_root.is_directory:
+                    raise ValueError(
+                        f"dataset {field} split must remain a directory while snapshotting: {value}"
+                    )
+                prefix = f"{relative}/"
+                candidates = tuple(
+                    entry
+                    for entry in entries
+                    if not entry.is_directory and entry.relative.startswith(prefix)
+                )
+            if field in require_nonempty and not candidates:
+                raise ValueError(
+                    f"dataset {field} split must contain at least one regular file: {value}"
+                )
+            consumed_entries = list(candidates)
+            for entry in candidates:
+                if pathlib.PurePosixPath(entry.relative).suffix.lower() not in (
+                    _ULTRALYTICS_IMAGE_SUFFIXES
+                ):
+                    continue
+                image_path = root / pathlib.PurePosixPath(entry.relative)
+                label_path = _ultralytics_label_path(root, image_path)
+                label_relative = label_path.relative_to(root).as_posix()
+                label_entry = by_path.get(label_relative)
+                if label_entry is not None and not label_entry.is_directory:
+                    consumed_entries.append(label_entry)
+            for entry in consumed_entries:
+                identity = entry.identity
+                device, inode = identity[:2]
+                entry_path = root / pathlib.PurePosixPath(entry.relative)
+                if type(device) is not int or type(inode) is not int or device < 0 or inode <= 0:
+                    raise ValueError(
+                        f"{entry_path} filesystem does not expose a stable device/inode identity"
+                    )
+                selected.setdefault(entry.relative, (entry_path, (device, inode)))
+        split_files[field] = tuple(sorted(selected.values(), key=lambda item: str(item[0])))
+    _validate_split_file_identities(split_files)
+
+
 def _pillow_open_function(image_module):
     """Return pristine Pillow opening, rejecting unknown process-wide hooks."""
     opener = image_module.open
@@ -798,6 +948,273 @@ def _pillow_open_function(image_module):
         if callable(original) and getattr(original, "__module__", None) == "PIL.Image":
             return original
     raise RuntimeError("Pillow Image.open was replaced by an untrusted runtime hook")
+
+
+def _validate_training_image_header(
+    path: pathlib.Path,
+    relative_path: pathlib.Path,
+    expected_metadata: os.stat_result,
+    *,
+    expected_dimensions: tuple[int, int] | None = None,
+) -> tuple[int, int]:
+    """Authenticate one backend-visible still image and bound its decoded shape."""
+    try:
+        from PIL import Image
+    except ImportError as exc:  # pragma: no cover - optional training boundary
+        raise RuntimeError("training dataset validation requires the vision runtime") from exc
+
+    expected_formats = _CALIBRATION_IMAGE_FORMATS.get(path.suffix.lower())
+    if expected_formats is None:
+        raise ValueError(f"unsupported training image format: {relative_path}")
+    image_open = _pillow_open_function(Image)
+    try:
+        with open_regular_nofollow(path.absolute(), "training image") as handle:
+            before = os.fstat(handle.fileno())
+            if _regular_file_identity(before) != _regular_file_identity(expected_metadata):
+                raise ValueError(f"training image changed after inventory: {relative_path}")
+            if before.st_size == 0 or before.st_size > _MAX_TRAINING_IMAGE_BYTES:
+                raise ValueError(
+                    "training image must contain 1.."
+                    f"{_MAX_TRAINING_IMAGE_BYTES} bytes: {relative_path}"
+                )
+            with warnings.catch_warnings():
+                warnings.simplefilter("error", Image.DecompressionBombWarning)
+                with image_open(handle) as probe:
+                    width, height = probe.size
+                    image_format = probe.format
+                    image_mode = probe.mode
+                    frame_count = getattr(probe, "n_frames", 1)
+                    exif_orientation = probe.getexif().get(274, 1)
+                handle.seek(0)
+                with image_open(handle) as verifier:
+                    verifier.verify()
+                if image_format == "JPEG":
+                    handle.seek(-2, os.SEEK_END)
+                    if handle.read(2) != b"\xff\xd9":
+                        raise ValueError(
+                            f"training JPEG is truncated or missing its EOI marker: {relative_path}"
+                        )
+            after = os.fstat(handle.fileno())
+    except (OSError, RuntimeError, SyntaxError, ValueError, Image.DecompressionBombWarning) as exc:
+        if isinstance(exc, ValueError) and str(exc).startswith("training image"):
+            raise
+        raise ValueError(
+            f"training image is not a valid bounded still image: {relative_path}"
+        ) from exc
+
+    if _regular_file_identity(after) != _regular_file_identity(before):
+        raise ValueError(f"training image changed while it was inspected: {relative_path}")
+    if image_format not in expected_formats:
+        raise ValueError(
+            f"training image suffix/content mismatch for {relative_path}: {image_format!r}"
+        )
+    if image_mode not in _CALIBRATION_IMAGE_MODES:
+        raise ValueError(f"unsupported training image mode {image_mode!r}: {relative_path}")
+    if frame_count != 1:
+        raise ValueError(f"training images must contain exactly one frame: {relative_path}")
+    if exif_orientation != 1:
+        raise ValueError(f"training images must use identity EXIF orientation: {relative_path}")
+    if (
+        width <= 0
+        or height <= 0
+        or width > _MAX_TRAINING_IMAGE_DIMENSION
+        or height > _MAX_TRAINING_IMAGE_DIMENSION
+        or width * height > _MAX_TRAINING_IMAGE_PIXELS
+    ):
+        raise ValueError(f"training image dimensions exceed the supported bounds: {relative_path}")
+    if expected_dimensions is not None and (width, height) != expected_dimensions:
+        raise ValueError(
+            f"training image dimensions do not match annotation metadata: {relative_path}"
+        )
+    return width, height
+
+
+def _ultralytics_label_path(root: pathlib.Path, image: pathlib.Path) -> pathlib.Path:
+    """Mirror the pinned loader's last ``/images/`` to ``/labels/`` mapping."""
+    image_text = os.fspath(image)
+    image_marker = f"{os.sep}images{os.sep}"
+    label_marker = f"{os.sep}labels{os.sep}"
+    label = pathlib.Path(label_marker.join(image_text.rsplit(image_marker, 1))).with_suffix(".txt")
+    try:
+        label.relative_to(root)
+    except ValueError as exc:
+        raise ValueError(
+            "training image would make the pinned backend select a label outside "
+            f"the private dataset: {image.relative_to(root)}"
+        ) from exc
+    return label
+
+
+def _validate_yolo_detection_label(
+    path: pathlib.Path,
+    relative_path: pathlib.Path,
+    expected_metadata: os.stat_result,
+    class_count: int,
+) -> None:
+    """Validate one stable, bounded five-column YOLO detection label."""
+    try:
+        with open_regular_nofollow(path.absolute(), "training label") as handle:
+            before = os.fstat(handle.fileno())
+            if _regular_file_identity(before) != _regular_file_identity(expected_metadata):
+                raise ValueError(f"training label changed after inventory: {relative_path}")
+            if before.st_size > _MAX_TRAINING_LABEL_BYTES:
+                raise ValueError(
+                    "training label exceeds the "
+                    f"{_MAX_TRAINING_LABEL_BYTES}-byte safety limit: {relative_path}"
+                )
+            encoded = handle.read(_MAX_TRAINING_LABEL_BYTES + 1)
+            after = os.fstat(handle.fileno())
+    except OSError as exc:
+        raise ValueError(f"training label could not be read safely: {relative_path}") from exc
+
+    if (
+        _regular_file_identity(after) != _regular_file_identity(before)
+        or len(encoded) != before.st_size
+    ):
+        raise ValueError(f"training label changed while it was inspected: {relative_path}")
+    try:
+        text = encoded.decode("utf-8", errors="strict")
+    except UnicodeDecodeError as exc:
+        raise ValueError(f"training label must be valid UTF-8: {relative_path}") from exc
+    if "\0" in text:
+        raise ValueError(f"training label must not contain NUL bytes: {relative_path}")
+
+    lines = text.splitlines()
+    if len(lines) > _MAX_TRAINING_LABEL_ROWS:
+        raise ValueError(
+            "training label exceeds the "
+            f"{_MAX_TRAINING_LABEL_ROWS}-row safety limit: {relative_path}"
+        )
+    rows: set[tuple[float, float, float, float, float]] = set()
+    for line_number, line in enumerate(lines, start=1):
+        if not line.strip():
+            continue
+        tokens = line.split()
+        if len(tokens) != 5:
+            raise ValueError(
+                "training labels must use five-column YOLO detection rows "
+                f"(class x_center y_center width height): {relative_path}:{line_number}"
+            )
+        if any(
+            not token.isascii() or len(token.encode("ascii")) > _MAX_TRAINING_LABEL_TOKEN_BYTES
+            for token in tokens
+        ):
+            raise ValueError(
+                f"training label contains an invalid numeric token: {relative_path}:{line_number}"
+            )
+        try:
+            values = [float(token) for token in tokens]
+        except ValueError as exc:
+            raise ValueError(
+                f"training label contains an invalid number: {relative_path}:{line_number}"
+            ) from exc
+        if not all(math.isfinite(value) for value in values):
+            raise ValueError(
+                f"training label numbers must be finite: {relative_path}:{line_number}"
+            )
+        class_id, x_center, y_center, width, height = values
+        row = (class_id, x_center, y_center, width, height)
+        if class_id != math.floor(class_id) or not 0 <= class_id < class_count:
+            raise ValueError(
+                f"training label class is outside [0, {class_count}): {relative_path}:{line_number}"
+            )
+        if (
+            not 0.0 <= x_center <= 1.0
+            or not 0.0 <= y_center <= 1.0
+            or not 0.0 < width <= 1.0
+            or not 0.0 < height <= 1.0
+        ):
+            raise ValueError(
+                "training label boxes must use finite normalized centers and positive sizes: "
+                f"{relative_path}:{line_number}"
+            )
+        if (
+            x_center - width / 2.0 < -_TRAINING_LABEL_EDGE_TOLERANCE
+            or x_center + width / 2.0 > 1.0 + _TRAINING_LABEL_EDGE_TOLERANCE
+            or y_center - height / 2.0 < -_TRAINING_LABEL_EDGE_TOLERANCE
+            or y_center + height / 2.0 > 1.0 + _TRAINING_LABEL_EDGE_TOLERANCE
+        ):
+            raise ValueError(
+                "training label boxes must remain inside the normalized image bounds: "
+                f"{relative_path}:{line_number}"
+            )
+        if row in rows:
+            raise ValueError(
+                f"training label contains a duplicate row: {relative_path}:{line_number}"
+            )
+        rows.add(row)
+
+
+def _validate_ultralytics_training_snapshot(
+    root: pathlib.Path,
+    payload: Mapping[str, object],
+) -> None:
+    """Validate every image the pinned Ultralytics loader can discover."""
+    from .artifacts import _tree_entries
+
+    entries = _tree_entries(root, _MAX_DATASET_ENTRIES)
+    entry_kinds = {entry: kind for entry, kind, _metadata in entries}
+    entry_metadata = {entry: metadata for entry, _kind, metadata in entries}
+    seen: set[pathlib.Path] = set()
+    seen_labels: dict[pathlib.Path, pathlib.Path] = {}
+    class_count = payload.get("nc")
+    if type(class_count) is not int or not 1 <= class_count <= _MAX_CLASSES:
+        raise RuntimeError("private dataset class count was corrupted")
+    for field in ("train", "val", "test"):
+        if field not in payload:
+            continue
+        candidates: list[pathlib.Path] = []
+        for value in _split_values(payload[field], field):
+            split_path = pathlib.Path(value)
+            kind = "directory" if split_path == root else entry_kinds.get(split_path)
+            if kind != "directory":
+                raise RuntimeError(f"private dataset {field} split disappeared: {split_path}")
+            for entry, entry_kind, _metadata in entries:
+                if entry_kind != "file" or not entry.is_relative_to(split_path):
+                    continue
+                suffix = entry.suffix.lower()
+                if suffix not in _ULTRALYTICS_IMAGE_SUFFIXES:
+                    continue
+                if suffix not in _CALIBRATION_IMAGE_FORMATS:
+                    raise ValueError(
+                        "training images use a backend-recognized format outside Manwe's "
+                        f"validated still-image boundary: {entry.relative_to(root)}"
+                    )
+                candidates.append(entry)
+        candidates.sort(key=lambda value: value.relative_to(root).as_posix())
+        if field in {"train", "val"} and not candidates:
+            raise ValueError(f"dataset {field} split contains no supported training images")
+        for candidate in candidates:
+            relative = candidate.relative_to(root)
+            if candidate in seen:
+                raise ValueError(f"training split selects an image more than once: {relative}")
+            seen.add(candidate)
+            _validate_training_image_header(
+                candidate,
+                relative,
+                entry_metadata[candidate],
+            )
+            label = _ultralytics_label_path(root, candidate)
+            previous_image = seen_labels.get(label)
+            if previous_image is not None:
+                raise ValueError(
+                    "training images resolve to the same backend label path: "
+                    f"{previous_image.relative_to(root)} and {relative}"
+                )
+            seen_labels[label] = candidate
+            label_kind = entry_kinds.get(label)
+            if label_kind is None:
+                continue
+            if label_kind != "file":
+                raise ValueError(
+                    f"training label must be a regular file: {label.relative_to(root)}"
+                )
+            _validate_yolo_detection_label(
+                label,
+                label.relative_to(root),
+                entry_metadata[label],
+                class_count,
+            )
 
 
 def _validate_calibration_image(
@@ -1241,8 +1658,15 @@ class _CalibrationLoaderSnapshot:
             raise RuntimeError("private calibration loader inventory changed")
         if any(metadata.st_mode & 0o222 for _entry, _kind, metadata in entries):
             raise RuntimeError("private calibration loader became writable")
-        with open_regular_nofollow(self.path, "private calibration manifest") as handle:
-            manifest_sha256 = hashlib.sha256(handle.read(_MAX_MANIFEST_BYTES + 1)).hexdigest()
+        try:
+            manifest = read_bounded_regular_bytes(
+                self.path,
+                _MAX_MANIFEST_BYTES,
+                "private calibration manifest",
+            )
+        except (OSError, ValueError) as exc:
+            raise RuntimeError("private calibration manifest changed") from exc
+        manifest_sha256 = hashlib.sha256(manifest).hexdigest()
         if manifest_sha256 != self._manifest_sha256:
             raise RuntimeError("private calibration manifest changed")
         for image, destination in zip(images, self._destinations, strict=True):
@@ -1261,7 +1685,11 @@ class _CalibrationLoaderSnapshot:
 
 
 class DatasetManifestSnapshot:
-    """A private normalized dataset manifest kept alive for one operation."""
+    """A validated source binding plus a normalized admission manifest.
+
+    The source tree remains caller-owned and mutable. Long-running consumers
+    must call :meth:`snapshot_for_training` and use that immutable private copy.
+    """
 
     def __init__(
         self,
@@ -1299,7 +1727,8 @@ class DatasetManifestSnapshot:
             finally:
                 if fd >= 0:
                     os.close(fd)
-            assert temporary is not None
+            if temporary is None:
+                raise RuntimeError("dataset manifest staging directory was not initialized")
             self._payload = payload_copy
             self._temporary = temporary
             self.path = snapshot_path
@@ -1328,6 +1757,27 @@ class DatasetManifestSnapshot:
                     ("source dataset manifest cleanup also failed", self._source_manifest.close),
                 )
             )
+
+    def snapshot_for_training(self) -> TrainingDatasetSnapshot:
+        """Revalidate and copy the dataset tree for one deterministic training run."""
+        if self._closed:
+            raise RuntimeError("dataset manifest snapshot is closed")
+        self._source_root.assert_path_unchanged()
+        self._source_manifest.assert_unchanged()
+        # Admission and consumption are separate events. Re-run the complete
+        # split/tree policy at the latter boundary so a caller cannot validate a
+        # benign layout, alter it, and then ask Manwe to preserve the altered
+        # layout in the backend's private copy.
+        with validate_local_detection_manifest(self._source_manifest.path) as refreshed:
+            if (
+                refreshed._source_manifest._identity != self._source_manifest._identity
+                or refreshed._source_manifest.sha256 != self._source_manifest.sha256
+                or refreshed._source_root._identity != self._source_root._identity
+            ):
+                raise ValueError(
+                    "dataset manifest or declared root identity changed after admission"
+                )
+            return TrainingDatasetSnapshot(refreshed)
 
     def _payload_for_root(self, root: pathlib.Path) -> dict[str, object]:
         payload = copy.deepcopy(self._payload)
@@ -1420,6 +1870,11 @@ class DatasetManifestSnapshot:
             display=str(self.root),
             max_bytes=_MAX_DATASET_BYTES,
             max_entries=_MAX_DATASET_ENTRIES,
+            source_tree_validator=partial(
+                _validate_snapshotted_split_identities,
+                self.root,
+                self._payload,
+            ),
         ) as source_snapshot:
             self._source_root.assert_path_unchanged()
             self._source_manifest.assert_unchanged()
@@ -1470,6 +1925,215 @@ class DatasetManifestSnapshot:
         )
 
 
+class TrainingDatasetSnapshot:
+    """An immutable private dataset tree and normalized backend manifest."""
+
+    def __init__(self, source: DatasetManifestSnapshot) -> None:
+        from .artifacts import ArtifactSnapshot
+
+        if type(source) is not DatasetManifestSnapshot or source._closed:
+            raise TypeError("source must be an open DatasetManifestSnapshot")
+        source_root = source._source_root.clone()
+        try:
+            source_manifest = source._source_manifest.clone()
+        except BaseException as primary:
+            _release_resources(
+                (("cloned training dataset root cleanup also failed", source_root.close),),
+                primary=primary,
+            )
+            raise
+
+        artifact_snapshot = None
+        temporary = None
+        try:
+            source_root.assert_path_unchanged()
+            source_manifest.assert_unchanged()
+            content_digest = source_root.digest()
+            artifact_snapshot = ArtifactSnapshot.from_directory_fd(
+                source_root.fd,
+                content_digest,
+                display=str(source.root),
+                max_bytes=_MAX_DATASET_BYTES,
+                max_entries=_MAX_DATASET_ENTRIES,
+                source_tree_validator=partial(
+                    _validate_snapshotted_split_identities,
+                    source.root,
+                    source._payload,
+                    require_nonempty=frozenset({"train", "val"}),
+                ),
+            )
+            source_root.assert_path_unchanged()
+            source_manifest.assert_unchanged()
+            if source_root.digest() != content_digest:
+                raise RuntimeError("source training dataset changed while snapshotting")
+            source_root.assert_path_unchanged()
+            source_manifest.assert_unchanged()
+
+            import yaml
+
+            payload = source._payload_for_root(artifact_snapshot.path)
+            _validate_ultralytics_training_snapshot(artifact_snapshot.path, payload)
+            manifest_bytes = yaml.safe_dump(payload, sort_keys=True).encode("utf-8")
+            if len(manifest_bytes) > _MAX_MANIFEST_BYTES:
+                raise ValueError(
+                    f"normalized training manifest exceeds {_MAX_MANIFEST_BYTES} bytes"
+                )
+            temporary = tempfile.TemporaryDirectory(prefix="manwe-training-dataset-")
+            loader_root = pathlib.Path(temporary.name).resolve(strict=True)
+            manifest_path = loader_root / "dataset.yaml"
+            flags = (
+                os.O_WRONLY
+                | os.O_CREAT
+                | os.O_EXCL
+                | getattr(os, "O_CLOEXEC", 0)
+                | getattr(os, "O_NOFOLLOW", 0)
+            )
+            fd = os.open(manifest_path, flags, 0o400)
+            try:
+                owned_fd = fd
+                fd = -1
+                with owned_binary_writer(owned_fd) as handle:
+                    handle.write(manifest_bytes)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+            finally:
+                if fd >= 0:
+                    os.close(fd)
+            loader_root.chmod(0o500)
+
+            _release_resources(
+                (
+                    ("cloned training dataset root cleanup failed", source_root.close),
+                    ("cloned training dataset manifest cleanup failed", source_manifest.close),
+                )
+            )
+            self._artifact_snapshot = artifact_snapshot
+            self._temporary = temporary
+            self._manifest_sha256 = hashlib.sha256(manifest_bytes).hexdigest()
+            self._closed = False
+            self.root = artifact_snapshot.path
+            self.path = manifest_path
+            self.sha256 = content_digest
+        except BaseException as primary:
+            cleanups: list[_Cleanup] = []
+            if temporary is not None:
+                cleanups.append(
+                    ("training manifest snapshot cleanup also failed", temporary.cleanup)
+                )
+            if artifact_snapshot is not None:
+                cleanups.append(
+                    ("training dataset snapshot cleanup also failed", artifact_snapshot.close)
+                )
+            cleanups.extend(
+                (
+                    ("cloned training dataset root cleanup also failed", source_root.close),
+                    (
+                        "cloned training dataset manifest cleanup also failed",
+                        source_manifest.close,
+                    ),
+                )
+            )
+            _release_resources(cleanups, primary=primary)
+            raise
+
+    def assert_unchanged(self) -> None:
+        """Re-authenticate the exact bytes exposed to the training backend."""
+        if self._closed:
+            raise RuntimeError("training dataset snapshot is closed")
+        from .artifacts import sha256_artifact
+
+        if (
+            sha256_artifact(
+                self.root,
+                max_bytes=_MAX_DATASET_BYTES,
+                max_entries=_MAX_DATASET_ENTRIES,
+            )
+            != self.sha256
+        ):
+            raise RuntimeError("private training dataset changed")
+        try:
+            manifest = read_bounded_regular_bytes(
+                self.path,
+                _MAX_MANIFEST_BYTES,
+                "private training manifest",
+            )
+        except (OSError, ValueError) as exc:
+            raise RuntimeError("private training manifest changed") from exc
+        if hashlib.sha256(manifest).hexdigest() != self._manifest_sha256:
+            raise RuntimeError("private training manifest changed")
+
+    def close(self) -> None:
+        if not self._closed:
+            self._closed = True
+            _release_resources(
+                (
+                    ("training manifest snapshot cleanup failed", self._temporary.cleanup),
+                    (
+                        "training dataset snapshot cleanup also failed",
+                        self._artifact_snapshot.close,
+                    ),
+                )
+            )
+
+    def __enter__(self) -> TrainingDatasetSnapshot:
+        if self._closed:
+            raise RuntimeError("training dataset snapshot is closed")
+        return self
+
+    def __exit__(self, _exc_type, exc, _traceback) -> None:
+        if exc is None:
+            self.close()
+            return
+        _release_resources(
+            (("training dataset snapshot cleanup also failed", self.close),),
+            primary=exc,
+        )
+
+
+class TrainingDirectorySnapshot:
+    """A private regular-tree copy for a backend with its own dataset schema."""
+
+    def __init__(self, artifact_snapshot) -> None:
+        self._artifact_snapshot = artifact_snapshot
+        self.path = artifact_snapshot.path
+        self.sha256 = artifact_snapshot.sha256
+        self._closed = False
+
+    def assert_unchanged(self) -> None:
+        if self._closed:
+            raise RuntimeError("training directory snapshot is closed")
+        from .artifacts import sha256_artifact
+
+        if (
+            sha256_artifact(
+                self.path,
+                max_bytes=_MAX_DATASET_BYTES,
+                max_entries=_MAX_DATASET_ENTRIES,
+            )
+            != self.sha256
+        ):
+            raise RuntimeError("private training directory changed")
+
+    def close(self) -> None:
+        if not self._closed:
+            self._closed = True
+            self._artifact_snapshot.close()
+
+    def __enter__(self) -> TrainingDirectorySnapshot:
+        if self._closed:
+            raise RuntimeError("training directory snapshot is closed")
+        return self
+
+    def __exit__(self, _exc_type, exc, _traceback) -> None:
+        if exc is None:
+            self.close()
+            return
+        _release_resources(
+            (("training directory snapshot cleanup also failed", self.close),),
+            primary=exc,
+        )
+
+
 class CalibrationDatasetSnapshot:
     """A bounded source copy plus the exact read-only backend calibration view."""
 
@@ -1505,6 +2169,11 @@ class CalibrationDatasetSnapshot:
                 display=str(source.root),
                 max_bytes=_MAX_DATASET_BYTES,
                 max_entries=_MAX_DATASET_ENTRIES,
+                source_tree_validator=partial(
+                    _validate_snapshotted_split_identities,
+                    source.root,
+                    source._payload,
+                ),
             )
             source_root.assert_path_unchanged()
             source_manifest.assert_unchanged()
@@ -1719,8 +2388,8 @@ def validate_local_detection_manifest(
                     candidate = pathlib.Path(os.path.abspath(root / relative_candidate))
                 if candidate.suffix.lower() == ".txt":
                     raise ValueError(
-                        f"dataset {field} path-list indirection is not accepted; use explicit "
-                        "local directories or files"
+                        f"dataset {field} path-list indirection is not accepted; use a local "
+                        "directory"
                     )
                 try:
                     relative = candidate.relative_to(root)
@@ -1732,7 +2401,7 @@ def validate_local_detection_manifest(
                     source_root.fd,
                     relative,
                     subject=f"dataset {field}",
-                    require_directory=None,
+                    require_directory=True,
                 )
                 normalized_paths.append(str(candidate))
                 roots.append((candidate, relative, metadata))
@@ -1777,29 +2446,7 @@ def validate_local_detection_manifest(
         if split_files != confirmed_split_files:
             raise ValueError("selected dataset splits changed during aggregate inventory")
 
-        split_origins: dict[str, dict[tuple[int, int], pathlib.Path]] = {}
-        for field, inventoried_files in split_files.items():
-            origins: dict[tuple[int, int], pathlib.Path] = {}
-            for split_path, identity in inventoried_files:
-                previous = origins.get(identity)
-                if previous is not None:
-                    raise ValueError(
-                        f"dataset {field} paths identify the same filesystem entry and would "
-                        f"select files more than once: {previous} and {split_path}"
-                    )
-                origins[identity] = split_path
-            split_origins[field] = origins
-
-        for (left_name, left_origins), (right_name, right_origins) in combinations(
-            split_origins.items(), 2
-        ):
-            for identity, left in left_origins.items():
-                right_origin = right_origins.get(identity)
-                if right_origin is not None:
-                    raise ValueError(
-                        f"dataset {left_name} and {right_name} paths identify the same "
-                        f"filesystem entry: {left} and {right_origin}"
-                    )
+        _validate_split_file_identities(split_files)
 
         names = payload["names"]
         if isinstance(names, Mapping):
@@ -1834,6 +2481,29 @@ def validate_local_detection_manifest(
         sanitized["nc"] = class_count
         if "channels" in payload:
             sanitized["channels"] = payload["channels"]
+
+        # Re-observe the complete aggregate after every other manifest field has
+        # been validated. The result is an admission-time observation, not an
+        # immutable dataset; consumers that run later must use a private copy.
+        try:
+            final_split_files = _inventory_selected_split_set(
+                source_root.fd,
+                split_roots,
+                reverse=False,
+            )
+            final_reverse_split_files = _inventory_selected_split_set(
+                source_root.fd,
+                split_roots,
+                reverse=True,
+            )
+        except (OSError, ValueError) as exc:
+            raise ValueError("selected dataset splits changed before validation completed") from exc
+        if (
+            final_split_files != final_reverse_split_files
+            or final_split_files != confirmed_split_files
+        ):
+            raise ValueError("selected dataset splits changed before validation completed")
+        _validate_split_file_identities(final_split_files)
         source_root.assert_path_unchanged()
         source_manifest.assert_unchanged()
         result = DatasetManifestSnapshot(sanitized, source_manifest, source_root)
@@ -1883,9 +2553,348 @@ def snapshot_local_calibration_dataset(
     return result
 
 
+def _json_object_without_duplicates(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"RF-DETR annotation JSON contains duplicate key {key!r}")
+        result[key] = value
+    return result
+
+
+def _load_rfdetr_annotation(path: pathlib.Path) -> dict[str, object]:
+    try:
+        encoded = read_bounded_regular_bytes(
+            path,
+            _MAX_RFDETR_ANNOTATION_BYTES,
+            "RF-DETR COCO annotation",
+        )
+    except OSError as exc:
+        raise ValueError(f"RF-DETR annotation could not be read safely: {path}") from exc
+    try:
+        payload = json.loads(
+            encoded,
+            object_pairs_hook=_json_object_without_duplicates,
+            parse_constant=lambda value: (_ for _ in ()).throw(
+                ValueError(f"non-finite JSON number {value!r}")
+            ),
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError, RecursionError, ValueError) as exc:
+        raise ValueError(f"RF-DETR annotation is not strict bounded JSON: {path}: {exc}") from exc
+    if type(payload) is not dict:
+        raise ValueError(f"RF-DETR annotation root must be an object: {path}")
+
+    nodes = 0
+    pending: list[tuple[object, int]] = [(payload, 1)]
+    while pending:
+        value, depth = pending.pop()
+        nodes += 1
+        if nodes > _MAX_RFDETR_JSON_NODES:
+            raise ValueError(
+                f"RF-DETR annotation exceeds the {_MAX_RFDETR_JSON_NODES}-node limit: {path}"
+            )
+        if depth > _MAX_RFDETR_JSON_DEPTH:
+            raise ValueError(
+                f"RF-DETR annotation exceeds the {_MAX_RFDETR_JSON_DEPTH}-level limit: {path}"
+            )
+        if type(value) is dict:
+            mapping = cast(dict[object, object], value)
+            if any(type(key) is not str for key in mapping):
+                raise ValueError(f"RF-DETR annotation object keys must be strings: {path}")
+            pending.extend((item, depth + 1) for item in mapping.values())
+        elif type(value) is list:
+            pending.extend((item, depth + 1) for item in cast(list[object], value))
+        elif type(value) is float and not math.isfinite(value):
+            raise ValueError(f"RF-DETR annotation contains a non-finite number: {path}")
+        elif type(value) not in {str, int, float, bool, type(None)}:
+            raise ValueError(f"RF-DETR annotation contains an unsupported JSON value: {path}")
+    return cast(dict[str, object], payload)
+
+
+def _rfdetr_integer(value: object, name: str) -> int:
+    if type(value) is not int or not 0 <= value <= 2**53:
+        raise ValueError(f"{name} must be an integer in [0, 2**53]")
+    return cast(int, value)
+
+
+def _rfdetr_number(value: object, name: str) -> float:
+    if type(value) not in {int, float}:
+        raise ValueError(f"{name} must be a finite number")
+    try:
+        result = float(cast(int | float, value))
+    except OverflowError as exc:
+        raise ValueError(f"{name} must be a finite number") from exc
+    if not math.isfinite(result):
+        raise ValueError(f"{name} must be a finite number")
+    return result
+
+
+def _rfdetr_image_relative_path(value: object, split: str) -> pathlib.PurePosixPath:
+    if type(value) is not str:
+        raise ValueError(f"RF-DETR {split} image file_name must be a relative string")
+    name = cast(str, value)
+    if (
+        not name
+        or not name.isprintable()
+        or "\\" in name
+        or "\0" in name
+        or len(name.encode("utf-8")) > _MAX_RFDETR_PATH_BYTES
+    ):
+        raise ValueError(f"RF-DETR {split} image file_name is not a bounded portable path")
+    relative = pathlib.PurePosixPath(name)
+    if (
+        relative.is_absolute()
+        or any(part in {"", ".", ".."} for part in relative.parts)
+        or relative.as_posix() != name
+    ):
+        raise ValueError(f"RF-DETR {split} image file_name must stay canonically inside its split")
+    if relative.suffix.lower() not in _RFDETR_IMAGE_SUFFIXES:
+        raise ValueError(
+            f"RF-DETR {split} image file_name has unsupported suffix {relative.suffix!r}"
+        )
+    return relative
+
+
+def _validate_rfdetr_coco_split(
+    root: pathlib.Path,
+    split: str,
+    *,
+    require_images: bool,
+) -> tuple[tuple[int, str], ...]:
+    split_path = root / split
+    try:
+        split_metadata = split_path.lstat()
+    except FileNotFoundError as exc:
+        raise ValueError(f"RF-DETR dataset requires a {split!r} directory") from exc
+    if not stat.S_ISDIR(split_metadata.st_mode):
+        raise ValueError(f"RF-DETR dataset {split!r} split must be a directory")
+    annotation_path = split_path / "_annotations.coco.json"
+    payload = _load_rfdetr_annotation(annotation_path)
+
+    raw_categories = payload.get("categories")
+    if type(raw_categories) is not list or not 1 <= len(raw_categories) <= _MAX_CLASSES:
+        raise ValueError(f"RF-DETR {split} categories must contain 1..{_MAX_CLASSES} objects")
+    categories: list[tuple[int, str]] = []
+    category_ids: set[int] = set()
+    category_names: set[str] = set()
+    for index, raw_category in enumerate(raw_categories):
+        if type(raw_category) is not dict:
+            raise ValueError(f"RF-DETR {split} categories[{index}] must be an object")
+        category = cast(dict[str, object], raw_category)
+        category_id = _rfdetr_integer(category.get("id"), f"RF-DETR {split} categories[{index}].id")
+        name_value = category.get("name")
+        if type(name_value) is not str:
+            raise ValueError(f"RF-DETR {split} categories[{index}].name must be a string")
+        name = cast(str, name_value).strip()
+        if not name or not name.isprintable() or len(name.encode("utf-8")) > _MAX_CLASS_NAME_BYTES:
+            raise ValueError(
+                f"RF-DETR {split} categories[{index}].name must be bounded printable text"
+            )
+        if category_id in category_ids or name in category_names:
+            raise ValueError(f"RF-DETR {split} categories must have unique ids and names")
+        category_ids.add(category_id)
+        category_names.add(name)
+        categories.append((category_id, name))
+
+    raw_images = payload.get("images")
+    if type(raw_images) is not list or len(raw_images) > _MAX_RFDETR_IMAGES:
+        raise ValueError(
+            f"RF-DETR {split} images must be a list of at most {_MAX_RFDETR_IMAGES} objects"
+        )
+    if require_images and not raw_images:
+        raise ValueError(f"RF-DETR {split} split must contain at least one image")
+    image_ids: set[int] = set()
+    image_paths: set[str] = set()
+    image_dimensions: dict[int, tuple[int, int]] = {}
+    for index, raw_image in enumerate(raw_images):
+        if type(raw_image) is not dict:
+            raise ValueError(f"RF-DETR {split} images[{index}] must be an object")
+        image = cast(dict[str, object], raw_image)
+        image_id = _rfdetr_integer(image.get("id"), f"RF-DETR {split} images[{index}].id")
+        if image_id in image_ids:
+            raise ValueError(f"RF-DETR {split} image ids must be unique")
+        image_ids.add(image_id)
+        relative = _rfdetr_image_relative_path(image.get("file_name"), split)
+        relative_text = relative.as_posix()
+        if relative_text in image_paths:
+            raise ValueError(f"RF-DETR {split} image file_name values must be unique")
+        image_paths.add(relative_text)
+        width = _rfdetr_integer(image.get("width"), f"RF-DETR {split} images[{index}].width")
+        height = _rfdetr_integer(image.get("height"), f"RF-DETR {split} images[{index}].height")
+        if (
+            width == 0
+            or height == 0
+            or width > _MAX_RFDETR_IMAGE_DIMENSION
+            or height > _MAX_RFDETR_IMAGE_DIMENSION
+            or width * height > _MAX_RFDETR_IMAGE_PIXELS
+        ):
+            raise ValueError(f"RF-DETR {split} image dimensions exceed the supported bounds")
+        image_path = split_path.joinpath(*relative.parts)
+        try:
+            metadata = image_path.lstat()
+        except FileNotFoundError as exc:
+            raise ValueError(
+                f"RF-DETR {split} annotation references missing image {relative_text!r}"
+            ) from exc
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_size <= 0:
+            raise ValueError(
+                f"RF-DETR {split} annotation image must be a nonempty regular file: "
+                f"{relative_text!r}"
+            )
+        _validate_training_image_header(
+            image_path,
+            pathlib.Path(split) / relative,
+            metadata,
+            expected_dimensions=(width, height),
+        )
+        image_dimensions[image_id] = (width, height)
+
+    raw_annotations = payload.get("annotations")
+    if type(raw_annotations) is not list or len(raw_annotations) > _MAX_RFDETR_ANNOTATIONS:
+        raise ValueError(
+            "RF-DETR "
+            f"{split} annotations must be a list of at most {_MAX_RFDETR_ANNOTATIONS} objects"
+        )
+    annotation_ids: set[int] = set()
+    for index, raw_annotation in enumerate(raw_annotations):
+        if type(raw_annotation) is not dict:
+            raise ValueError(f"RF-DETR {split} annotations[{index}] must be an object")
+        annotation = cast(dict[str, object], raw_annotation)
+        annotation_id = _rfdetr_integer(
+            annotation.get("id"), f"RF-DETR {split} annotations[{index}].id"
+        )
+        if annotation_id in annotation_ids:
+            raise ValueError(f"RF-DETR {split} annotation ids must be unique")
+        annotation_ids.add(annotation_id)
+        image_id = _rfdetr_integer(
+            annotation.get("image_id"),
+            f"RF-DETR {split} annotations[{index}].image_id",
+        )
+        category_id = _rfdetr_integer(
+            annotation.get("category_id"),
+            f"RF-DETR {split} annotations[{index}].category_id",
+        )
+        if image_id not in image_ids:
+            raise ValueError(f"RF-DETR {split} annotation references an unknown image id")
+        if category_id not in category_ids:
+            raise ValueError(f"RF-DETR {split} annotation references an unknown category id")
+        bbox = annotation.get("bbox")
+        if type(bbox) is not list or len(bbox) != 4:
+            raise ValueError(f"RF-DETR {split} annotation bbox must be [x, y, width, height]")
+        box = [
+            _rfdetr_number(value, f"RF-DETR {split} annotations[{index}].bbox") for value in bbox
+        ]
+        image_width, image_height = image_dimensions[image_id]
+        if (
+            box[0] < 0.0
+            or box[1] < 0.0
+            or box[2] <= 0.0
+            or box[3] <= 0.0
+            or box[0] + box[2] > image_width
+            or box[1] + box[3] > image_height
+        ):
+            raise ValueError(f"RF-DETR {split} annotation bbox is outside supported bounds")
+        area = _rfdetr_number(annotation.get("area"), f"RF-DETR {split} annotations[{index}].area")
+        if area <= 0.0 or area > image_width * image_height:
+            raise ValueError(f"RF-DETR {split} annotation area is outside supported bounds")
+        if "iscrowd" in annotation and (
+            type(annotation["iscrowd"]) is not int or annotation["iscrowd"] not in {0, 1}
+        ):
+            raise ValueError(f"RF-DETR {split} annotation iscrowd must be 0 or 1")
+    return tuple(sorted(categories))
+
+
+def _validate_rfdetr_coco_snapshot(root: pathlib.Path) -> None:
+    """Bind Manwe's RF-DETR path to the exact Roboflow COCO consumer schema."""
+    train_categories = _validate_rfdetr_coco_split(root, "train", require_images=True)
+    valid_categories = _validate_rfdetr_coco_split(root, "valid", require_images=True)
+    if valid_categories != train_categories:
+        raise ValueError("RF-DETR train and valid category tables must agree exactly")
+    test_path = root / "test"
+    if test_path.exists():
+        test_categories = _validate_rfdetr_coco_split(root, "test", require_images=False)
+        if test_categories != train_categories:
+            raise ValueError("RF-DETR test category table must agree with train and valid")
+
+
+def _reject_rfdetr_split_hardlinks(entries: Sequence[_DescriptorTreeEntry]) -> None:
+    """Reject aliases between files that RF-DETR can treat as independent splits."""
+    identities: dict[tuple[int, int], str] = {}
+    for entry in entries:
+        if entry.is_directory:
+            continue
+        relative = pathlib.PurePosixPath(entry.relative)
+        if not relative.parts or relative.parts[0] not in {"train", "valid", "test"}:
+            continue
+        identity = (entry.identity[0], entry.identity[1])
+        previous = identities.setdefault(identity, entry.relative)
+        if previous != entry.relative:
+            raise ValueError(
+                "RF-DETR split files must not be hardlink aliases: "
+                f"{previous!r} and {entry.relative!r}"
+            )
+
+
+def snapshot_local_training_directory(
+    path: str | pathlib.Path,
+) -> TrainingDirectorySnapshot:
+    """Copy and validate one RF-DETR Roboflow-COCO training directory."""
+    from .artifacts import ArtifactSnapshot, _descriptor_tree_entries
+
+    root = pathlib.Path(os.path.abspath(pathlib.Path(path).expanduser()))
+    source = _BoundSourceDirectory.from_absolute(root)
+    snapshot = None
+    try:
+        source.assert_path_unchanged()
+        source_entries = _descriptor_tree_entries(
+            source.fd,
+            display=str(root),
+            max_entries=_MAX_DATASET_ENTRIES,
+        )
+        _reject_rfdetr_split_hardlinks(source_entries)
+        digest = source.digest()
+        snapshot = ArtifactSnapshot.from_directory_fd(
+            source.fd,
+            digest,
+            display=str(root),
+            max_bytes=_MAX_DATASET_BYTES,
+            max_entries=_MAX_DATASET_ENTRIES,
+            source_tree_validator=_reject_rfdetr_split_hardlinks,
+        )
+        _validate_rfdetr_coco_snapshot(snapshot.path)
+        source.assert_path_unchanged()
+        final_entries = _descriptor_tree_entries(
+            source.fd,
+            display=str(root),
+            max_entries=_MAX_DATASET_ENTRIES,
+        )
+        if final_entries != source_entries or source.digest() != digest:
+            raise RuntimeError("source training dataset changed while snapshotting")
+        source.assert_path_unchanged()
+    except BaseException as primary:
+        cleanups: list[_Cleanup] = []
+        if snapshot is not None:
+            cleanups.append(("private training directory cleanup also failed", snapshot.close))
+        cleanups.append(("source training directory cleanup also failed", source.close))
+        _release_resources(cleanups, primary=primary)
+        raise
+    try:
+        source.close()
+    except BaseException as primary:
+        _release_resources(
+            (("private training directory cleanup also failed", snapshot.close),),
+            primary=primary,
+        )
+        raise
+    return TrainingDirectorySnapshot(snapshot)
+
+
 __all__ = [
     "CalibrationDatasetSnapshot",
     "DatasetManifestSnapshot",
+    "TrainingDatasetSnapshot",
+    "TrainingDirectorySnapshot",
     "snapshot_local_calibration_dataset",
+    "snapshot_local_training_directory",
     "validate_local_detection_manifest",
 ]

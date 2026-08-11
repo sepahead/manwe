@@ -8,14 +8,18 @@ inside :func:`train`, so this module (and its config) import with numpy alone.
 from __future__ import annotations
 
 from collections.abc import Mapping
-from contextlib import suppress
+from contextlib import ExitStack, suppress
 from dataclasses import dataclass, field
 from importlib import metadata
 from pathlib import Path
 from types import MappingProxyType
+from typing import cast
 
 from ..common.config_io import validate_local_path
-from ..common.dataset_manifest import validate_local_detection_manifest
+from ..common.dataset_manifest import (
+    snapshot_local_training_directory,
+    validate_local_detection_manifest,
+)
 from ..common.device import Device, resolve_device
 from ..common.logging import get_logger
 from ..common.numeric import finite_float64_scalar
@@ -121,8 +125,8 @@ def _extra_integer(extra: Mapping[str, object], key: str, minimum: int, maximum:
     value = extra[key]
     if type(value) is not int:
         raise ValueError(f"extra.{key} must be an integer in [{minimum}, {maximum}]")
-    assert isinstance(value, int)
-    if not minimum <= value <= maximum:
+    integer_value = cast(int, value)
+    if not minimum <= integer_value <= maximum:
         raise ValueError(f"extra.{key} must be an integer in [{minimum}, {maximum}]")
 
 
@@ -341,6 +345,8 @@ class VisionTrainConfig:
 
 def resolve_ultralytics_device(device: Device) -> str:
     """Map a manwe :class:`Device` to the string Ultralytics expects."""
+    if type(device) is not Device:
+        raise TypeError("device must be a resolved Manwe Device")
     if device.kind == "cuda":
         return str(device.index)
     return device.kind  # "mps" or "cpu"
@@ -408,10 +414,18 @@ def train(config: VisionTrainConfig):
         if unsupported:
             raise ValueError(f"unsupported Ultralytics extra fields: {unsupported}")
 
-    manifest_snapshot = None
-    try:
-        if spec.family != "rfdetr":
-            manifest_snapshot = validate_local_detection_manifest(data_path)
+    with ExitStack() as resources:
+        training_dataset = None
+        training_directory = None
+        if spec.family == "rfdetr":
+            training_directory = resources.enter_context(
+                snapshot_local_training_directory(data_path)
+            )
+        else:
+            manifest_snapshot = resources.enter_context(
+                validate_local_detection_manifest(data_path)
+            )
+            training_dataset = resources.enter_context(manifest_snapshot.snapshot_for_training())
 
         # No global RNG mutation, device probing, dependency import, or checkpoint
         # download happens until the complete family-specific preflight has passed.
@@ -426,8 +440,11 @@ def train(config: VisionTrainConfig):
         )
         model = build_model(config.model, pretrained=config.pretrained)
         if spec.family == "rfdetr":
-            return model.train(
-                dataset_dir=str(data_path),
+            if training_directory is None:
+                raise RuntimeError("RF-DETR training snapshot was not initialized")
+            training_directory.assert_unchanged()
+            result = model.train(
+                dataset_dir=str(training_directory.path),
                 epochs=config.epochs,
                 batch_size=config.batch,
                 device=device.torch_device,
@@ -438,11 +455,15 @@ def train(config: VisionTrainConfig):
                 early_stopping_patience=config.patience,
                 **config.extra,
             )
+            training_directory.assert_unchanged()
+            return result
 
-        assert manifest_snapshot is not None
+        if training_dataset is None:
+            raise RuntimeError("Ultralytics training snapshot was not initialized")
+        training_dataset.assert_unchanged()
         uld = resolve_ultralytics_device(device)
-        return model.train(
-            data=str(manifest_snapshot.path),
+        result = model.train(
+            data=str(training_dataset.path),
             epochs=config.epochs,
             imgsz=config.imgsz,
             batch=config.batch,
@@ -459,9 +480,8 @@ def train(config: VisionTrainConfig):
             close_mosaic=config.close_mosaic,
             **config.extra,
         )
-    finally:
-        if manifest_snapshot is not None:
-            manifest_snapshot.close()
+        training_dataset.assert_unchanged()
+        return result
 
 
 __all__ = ["VisionTrainConfig", "train", "resolve_ultralytics_device"]

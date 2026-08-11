@@ -7,7 +7,8 @@ from typing import Any
 
 import numpy as np
 
-from .doa import SPEED_OF_SOUND, _signal_matrix, srp_peak_prominence, srp_phat
+from ..common.numeric import finite_float64_scalar, widen_to_float64
+from .doa import SPEED_OF_SOUND, _direction, _signal_matrix, srp_peak_prominence, srp_phat
 from .features import sound_pressure_level_db
 
 MAX_CLASS_LABEL_BYTES = 256
@@ -17,15 +18,10 @@ MAX_ABSOLUTE_AZIMUTH = 1_000_000.0
 def _finite_scalar(
     value: Any, name: str, *, positive: bool = False, nonnegative: bool = False
 ) -> float:
-    if isinstance(value, bool) or not isinstance(value, (int, float, np.integer, np.floating)):
-        raise ValueError(f"{name} must be a finite number")
     try:
-        with np.errstate(over="ignore", invalid="ignore"):
-            value = float(np.float64(value))
-    except (TypeError, ValueError, OverflowError) as exc:
+        value = finite_float64_scalar(value, name)
+    except ValueError as exc:
         raise ValueError(f"{name} must be representable as a finite float") from exc
-    if not np.isfinite(value):
-        raise ValueError(f"{name} must be representable as a finite float")
     if positive and value <= 0:
         raise ValueError(f"{name} must be > 0")
     if nonnegative and value < 0:
@@ -44,8 +40,7 @@ def _finite_vector(value: Any, name: str) -> np.ndarray:
         raise ValueError(f"{name} must contain three values")
     if not np.isfinite(raw).all():
         raise ValueError(f"{name} must contain only finite values")
-    with np.errstate(over="ignore", invalid="ignore"):
-        vector = np.asarray(raw, dtype=float)
+    vector = widen_to_float64(raw, name, validate_exact_integers=True)
     vector = vector.reshape(3)
     if not np.isfinite(vector).all():
         raise ValueError(f"{name} must contain only finite values")
@@ -72,17 +67,42 @@ def _rotation(value: np.ndarray | None) -> np.ndarray:
         raise ValueError("sensor_rotation must be a finite 3x3 matrix")
     if not np.isfinite(raw).all():
         raise ValueError("sensor_rotation must be a finite 3x3 matrix")
-    with np.errstate(over="ignore", invalid="ignore"):
-        rotation = np.asarray(raw, dtype=float)
+    rotation = widen_to_float64(raw, "sensor_rotation", validate_exact_integers=True)
     if not np.isfinite(rotation).all():
         raise ValueError("sensor_rotation must be a finite 3x3 matrix")
     with np.errstate(over="ignore", invalid="ignore"):
         gram = np.einsum("ik,jk->ij", rotation, rotation)
     if not np.isfinite(gram).all() or not np.allclose(gram, np.eye(3), rtol=0.0, atol=1e-7):
         raise ValueError("sensor_rotation must be orthonormal")
-    if not np.isclose(np.linalg.det(rotation), 1.0, rtol=0.0, atol=1e-7):
+    determinant = float(np.linalg.det(rotation))
+    if not np.isclose(determinant, 1.0, rtol=0.0, atol=1e-7):
         raise ValueError("sensor_rotation must have determinant +1")
-    return rotation
+    if np.array_equal(gram, np.eye(3)) and determinant == 1.0:
+        return rotation.copy()
+
+    # A value admitted as a rotation must retain the rotation invariant, not only
+    # be close enough for validation. Otherwise its application changes the
+    # observed range and scales the spherical covariance even though the public
+    # parameters describe a rigid sensor-to-world transform. Project only the
+    # already bounded roundoff band above onto the nearest member of SO(3).
+    try:
+        left, _singular_values, right_transpose = np.linalg.svd(rotation)
+    except np.linalg.LinAlgError as exc:
+        raise ValueError("sensor_rotation orthonormalization did not converge") from exc
+    projected = left @ right_transpose
+    if float(np.linalg.det(projected)) < 0.0:
+        left[:, -1] *= -1.0
+        projected = left @ right_transpose
+    if not np.isfinite(projected).all() or not np.allclose(
+        projected @ projected.T,
+        np.eye(3),
+        rtol=0.0,
+        atol=16.0 * np.finfo(np.float64).eps,
+    ):
+        raise ValueError("sensor_rotation could not be canonicalized as a proper rotation")
+    if not np.isclose(float(np.linalg.det(projected)), 1.0, rtol=0.0, atol=1e-12):
+        raise ValueError("sensor_rotation could not be canonicalized as a proper rotation")
+    return projected
 
 
 def _bounded_class_label(value: str | None) -> str | None:
@@ -143,14 +163,7 @@ class AcousticDetection:
         elevation = _finite_scalar(self.elevation, "elevation")
         if not -np.pi / 2.0 <= elevation <= np.pi / 2.0:
             raise ValueError("elevation must lie in [-pi/2, pi/2]")
-        cos_elevation = np.cos(elevation)
-        return np.array(
-            [
-                cos_elevation * np.cos(azimuth),
-                cos_elevation * np.sin(azimuth),
-                np.sin(elevation),
-            ]
-        )
+        return _direction(azimuth, elevation)
 
     def to_measurement(
         self,
@@ -167,6 +180,7 @@ class AcousticDetection:
         required because a single array's nominal range is not a Cartesian
         position observation.
         """
+        from manwe.fusion.filters import MIN_POLAR_HORIZONTAL_RANGE, _polar_horizontal_range
         from manwe.fusion.tracker import Measurement
 
         if type(self.range_observed) is not bool:
@@ -183,10 +197,14 @@ class AcousticDetection:
         angle_std = _finite_scalar(angle_std, "angle_std", positive=True)
         range_std = _finite_scalar(range_std, "range_std", positive=True)
         distance = _finite_scalar(self.range_estimate, "range_estimate", nonnegative=True)
+        if distance <= MIN_POLAR_HORIZONTAL_RANGE:
+            raise ValueError(f"acoustic fusion range must be > {MIN_POLAR_HORIZONTAL_RANGE:g} m")
         azimuth = _canonical_azimuth(self.azimuth)
         elevation = _finite_scalar(self.elevation, "elevation")
         if not -np.pi / 2.0 <= elevation <= np.pi / 2.0:
             raise ValueError("elevation must lie in [-pi/2, pi/2]")
+        if _polar_horizontal_range(distance, elevation) <= MIN_POLAR_HORIZONTAL_RANGE:
+            raise ValueError("acoustic azimuth is singular on the sensor's vertical axis")
         _finite_scalar(self.spl_db, "spl_db")
         timestamp = _finite_scalar(self.timestamp, "timestamp")
         confidence = _finite_scalar(self.confidence, "confidence")
@@ -194,14 +212,7 @@ class AcousticDetection:
             raise ValueError("confidence must be in [0, 1]")
         class_label = _bounded_class_label(self.class_label)
         with np.errstate(over="ignore", invalid="ignore"):
-            cos_elevation = np.cos(elevation)
-            direction = np.array(
-                [
-                    cos_elevation * np.cos(azimuth),
-                    cos_elevation * np.sin(azimuth),
-                    np.sin(elevation),
-                ]
-            )
+            direction = _direction(azimuth, elevation)
             local_position = distance * direction
             position = origin + np.einsum("ij,j->i", rotation, local_position)
         if not np.isfinite(position).all():
@@ -270,6 +281,11 @@ def detect_from_array(
     derived from SRP peak prominence rather than defaulting every grid maximum
     to full confidence.
     """
+    # Metadata does not depend on the expensive search. Reject malformed output
+    # metadata before allocating FFTs or traversing the steering grid.
+    timestamp = _finite_scalar(timestamp, "timestamp")
+    nominal_range = _finite_scalar(nominal_range, "nominal_range", nonnegative=True)
+    class_label = _bounded_class_label(class_label)
     azimuth, elevation, power = srp_phat(
         signals,
         mic_positions,

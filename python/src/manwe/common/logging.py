@@ -11,7 +11,7 @@ _PACKAGE_LOGGER.addHandler(logging.NullHandler())
 
 
 def _level_number(level: str) -> int:
-    if not isinstance(level, str):
+    if type(level) is not str:
         raise TypeError("log level must be a string")
     numeric = getattr(logging, level.upper(), None)
     if not isinstance(numeric, int):
@@ -28,7 +28,7 @@ def configure_logging(level: str | None = None, *, force: bool = False) -> None:
     global _CONFIGURED
     if type(force) is not bool:
         raise TypeError("force must be a boolean")
-    lvl = (level or os.environ.get("MANWE_LOG_LEVEL", "INFO")).upper()
+    lvl = os.environ.get("MANWE_LOG_LEVEL", "INFO") if level is None else level
     numeric_level = _level_number(lvl)
     if _CONFIGURED and not force:
         _PACKAGE_LOGGER.setLevel(numeric_level)
@@ -55,7 +55,7 @@ def configure_logging(level: str | None = None, *, force: bool = False) -> None:
 
 def get_logger(name: str = "manwe", level: str | None = None) -> logging.Logger:
     """Return a package logger without installing process-global handlers."""
-    if not isinstance(name, str) or (name != "manwe" and not name.startswith("manwe.")):
+    if type(name) is not str or (name != "manwe" and not name.startswith("manwe.")):
         raise ValueError("logger name must be 'manwe' or a child in the 'manwe.' hierarchy")
     logger = logging.getLogger(name)
     if level is not None:

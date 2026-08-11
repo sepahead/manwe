@@ -38,6 +38,26 @@ def test_map_perfect_predictions():
     assert abs(out["mAP"] - 1.0) < 1e-9
 
 
+def test_detection_values_own_immutable_numeric_snapshots():
+    boxes = np.array([[0.0, 0.0, 1.0, 1.0]])
+    scores = np.array([0.9])
+    labels = np.array([0])
+    detection = Detections(boxes, scores, labels, image_id="frame")
+    truth = GroundTruth(boxes, labels, image_id="frame")
+
+    boxes[:] = 7.0
+    scores[:] = 0.0
+    labels[:] = 3
+    np.testing.assert_array_equal(detection.boxes, [[0.0, 0.0, 1.0, 1.0]])
+    np.testing.assert_array_equal(detection.scores, [0.9])
+    np.testing.assert_array_equal(detection.labels, [0])
+    np.testing.assert_array_equal(truth.boxes, [[0.0, 0.0, 1.0, 1.0]])
+    np.testing.assert_array_equal(truth.labels, [0])
+    for value in (detection.boxes, detection.scores, detection.labels, truth.boxes, truth.labels):
+        with pytest.raises(ValueError, match="read-only"):
+            value.flat[0] = 0
+
+
 def test_map_drops_on_missing_detection():
     boxes = np.array([[0, 0, 10, 10], [20, 20, 40, 40], [50, 50, 60, 60]], float)
     labels = np.array([0, 1, 2])
@@ -69,6 +89,15 @@ def test_map_rejects_unbounded_class_by_box_work():
     truth = [GroundTruth(np.empty((0, 4)), np.empty(0, dtype=int), image_id="frame")]
     with pytest.raises(ValueError, match="class-by-box work"):
         mean_average_precision(predictions, truth, num_classes=4096)
+
+
+@pytest.mark.parametrize(
+    "image_id",
+    ["frame\n", "x" * 4097, 1 << 63, -(1 << 63) - 1, True],
+)
+def test_image_ids_are_bounded_portable_scalars(image_id):
+    with pytest.raises(ValueError, match="image_id"):
+        GroundTruth(np.empty((0, 4)), np.empty(0, dtype=int), image_id=image_id)
 
 
 def test_metric_input_caps_and_shape_checks_precede_float_widening(monkeypatch):

@@ -37,6 +37,48 @@ def test_make_vision_smoke_layout_and_labels():
         assert manifest["names"] == ["drone", "bird", "aircraft", "helicopter", "unknown"]
 
 
+def test_synthetic_yolo_label_matches_the_exact_rasterized_box(tmp_path):
+    from PIL import Image
+
+    root = tmp_path / "aligned"
+    make_vision_smoke(root, n_train=1, n_val=1, size=127, max_objs=1, seed=4)
+    label = (root / "labels" / "train" / "train_000.txt").read_text().split()
+    class_index = int(label[0])
+    cx, cy, width, height = (float(value) for value in label[1:])
+    colors = np.array(
+        [
+            (230, 60, 60),
+            (60, 200, 90),
+            (70, 120, 240),
+            (240, 200, 60),
+            (170, 170, 170),
+        ],
+        dtype=np.uint8,
+    )
+    with Image.open(root / "images" / "train" / "train_000.png") as image:
+        pixels = np.asarray(image).copy()
+    ys, xs = np.nonzero(np.all(pixels == colors[class_index], axis=2))
+    assert len(xs) > 0
+    actual_width = int(xs.max() - xs.min() + 1)
+    actual_height = int(ys.max() - ys.min() + 1)
+    assert cx == pytest.approx((xs.min() + xs.max() + 1) / (2 * pixels.shape[1]), abs=5e-7)
+    assert cy == pytest.approx((ys.min() + ys.max() + 1) / (2 * pixels.shape[0]), abs=5e-7)
+    assert width == pytest.approx(actual_width / pixels.shape[1], abs=5e-7)
+    assert height == pytest.approx(actual_height / pixels.shape[0], abs=5e-7)
+
+
+def test_synthetic_generation_rejects_shared_writable_existing_root(tmp_path):
+    root = tmp_path / "shared"
+    root.mkdir()
+    root.chmod(0o777)
+    try:
+        with pytest.raises(PermissionError, match="group- or other-writable"):
+            make_vision_smoke(root, n_train=1, n_val=1)
+        assert list(root.iterdir()) == []
+    finally:
+        root.chmod(0o700)
+
+
 def test_synthetic_generation_rejects_invalid_or_existing_outputs(tmp_path):
     occupied = tmp_path / "occupied"
     occupied.mkdir()
@@ -91,6 +133,23 @@ def test_synthetic_generation_canonicalizes_symlinked_parents_and_rolls_back(tmp
     with pytest.raises(OSError, match="injected write failure"):
         make_vision_smoke(empty_root, n_train=1, n_val=1)
     assert list(empty_root.iterdir()) == []
+
+
+def test_synthetic_outputs_do_not_follow_a_final_symlink(tmp_path):
+    png_target = tmp_path / "png-target"
+    png_link = tmp_path / "frame.png"
+    png_link.symlink_to(png_target)
+    with pytest.raises(FileExistsError, match="refusing to overwrite"):
+        write_png(png_link, np.zeros((2, 2, 3), dtype=np.uint8))
+    assert not png_target.exists()
+
+    dataset_target = tmp_path / "dataset-target"
+    dataset_target.mkdir()
+    dataset_link = tmp_path / "dataset-link"
+    dataset_link.symlink_to(dataset_target, target_is_directory=True)
+    with pytest.raises(FileExistsError, match="actual empty directory"):
+        make_vision_smoke(dataset_link, n_train=1, n_val=1)
+    assert list(dataset_target.iterdir()) == []
 
 
 def test_synthetic_generation_does_not_follow_replaced_output_root(tmp_path, monkeypatch):

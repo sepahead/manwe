@@ -28,7 +28,7 @@ use manwe::model::{Multiples, YoloV8};
 use manwe::secure_io::{
     bounded_open_file_identity, open_bounded_regular_file, read_bounded_open_file,
     read_bounded_regular_file, read_bounded_regular_file_with_identity, sha256_hex, BoundDirectory,
-    FileIdentity, MAX_ENCODED_IMAGE_BYTES, MAX_MODEL_BYTES,
+    FileIdentity, HardLinkPublication, MAX_ENCODED_IMAGE_BYTES, MAX_MODEL_BYTES,
 };
 use manwe::{prepare_image, validate_coco_detection_output_schema, validate_coco_model_output};
 use serde_json::json;
@@ -42,6 +42,13 @@ const EXPECTED_COCO_PREDICTIONS: usize = (INPUT_SIZE / 8) * (INPUT_SIZE / 8)
     + (INPUT_SIZE / 32) * (INPUT_SIZE / 32);
 const MAX_DIRECTORY_ENTRIES: usize = 100_000;
 const MAX_RESULT_BYTES: usize = 64 * 1024 * 1024;
+
+fn has_io_error_kind(error: &anyhow::Error, kind: std::io::ErrorKind) -> bool {
+    error
+        .chain()
+        .filter_map(|cause| cause.downcast_ref::<std::io::Error>())
+        .any(|cause| cause.kind() == kind)
+}
 
 fn positive_count(value: &str) -> std::result::Result<usize, String> {
     let parsed = value
@@ -102,8 +109,15 @@ struct Args {
 #[derive(Debug)]
 struct SelectedImage {
     path: PathBuf,
+    evidence_path: String,
     sha256: String,
     identity: FileIdentity,
+}
+
+fn utf8_evidence_path(path: &Path, label: &str) -> anyhow::Result<String> {
+    path.to_str()
+        .map(str::to_owned)
+        .with_context(|| format!("{label} must be valid UTF-8 for JSON evidence"))
 }
 
 fn load_selected_image(selected: &SelectedImage) -> anyhow::Result<Tensor> {
@@ -135,16 +149,6 @@ fn decode_image_bytes(bytes: &[u8]) -> anyhow::Result<image::DynamicImage> {
     limits.max_alloc = Some(256 * 1024 * 1024);
     reader.limits(limits);
     Ok(reader.decode()?)
-}
-
-fn create_private_directory(path: &Path) -> std::io::Result<()> {
-    let mut builder = fs::DirBuilder::new();
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::DirBuilderExt;
-        builder.mode(0o700);
-    }
-    builder.create(path)
 }
 
 fn set_owner_only_permissions(file: &fs::File) -> std::io::Result<()> {
@@ -252,23 +256,13 @@ impl EvidenceRun {
         run_dir.require_owner_mutation_boundary()?;
         let result_path = run_dir.path().join(format!("results_rust_{run_id}.json"));
         let stage_name = OsString::from(format!(".manwe-static-benchmark-{run_id}.in-progress"));
-        let stage_path = run_dir.path().join(&stage_name);
         run_dir.verify()?;
-        match create_private_directory(&stage_path) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+        let stage_dir = match run_dir.create_directory_entry(&stage_name, 0o700) {
+            Ok(directory) => directory,
+            Err(error) if has_io_error_kind(&error, std::io::ErrorKind::AlreadyExists) => {
                 anyhow::bail!("this benchmark run is already active or needs stale-run cleanup")
             }
-            Err(error) => return Err(error.into()),
-        }
-        run_dir.verify()?;
-        let stage_dir = match BoundDirectory::open(&stage_path) {
-            Ok(directory) => directory,
-            Err(error) => {
-                let _ = run_dir.remove_directory_entry(&stage_name);
-                let _ = run_dir.sync();
-                return Err(error);
-            }
+            Err(error) => return Err(error),
         };
         let run = Self {
             stage_result: stage_dir.path().join("result.json"),
@@ -296,8 +290,36 @@ impl EvidenceRun {
         let expected = write_verified_json_once(&self.stage_result, results)?;
         self.stage_dir.sync()?;
         self.run_dir.verify()?;
-        fs::hard_link(&self.stage_result, &self.result_path)?;
-        self.final_link_created = true;
+        let result_name = self
+            .result_path
+            .file_name()
+            .context("benchmark result path lost its filename")?;
+        let publication = self.stage_dir.hard_link_file_entry_to(
+            std::ffi::OsStr::new("result.json"),
+            &self.run_dir,
+            result_name,
+            MAX_RESULT_BYTES as u64,
+        );
+        match publication {
+            Ok(HardLinkPublication::Created | HardLinkPublication::AlreadyLinked) => {
+                self.final_link_created = true;
+            }
+            Ok(HardLinkPublication::DestinationOccupied) => anyhow::bail!(
+                "benchmark result already exists at {}",
+                self.result_path.display()
+            ),
+            Err(error) => {
+                // A remote filesystem may make the entry visible and still
+                // report failure. Preserve the stage and identify the candidate.
+                self.final_link_created = true;
+                return Err(error).with_context(|| {
+                    format!(
+                        "benchmark result publication at {} has an indeterminate visibility state",
+                        self.result_path.display()
+                    )
+                });
+            }
+        }
         let stage_identity = verify_json_file(&self.stage_result, &expected)?;
         self.run_dir.verify()?;
         self.stage_dir.verify()?;
@@ -369,11 +391,8 @@ fn timing_summary(latencies_ms: &[f64]) -> anyhow::Result<(f64, f64, f64)> {
     Ok((total_ms / 1000.0, 1000.0 / average_ms, average_ms))
 }
 
-fn run_dir() -> anyhow::Result<PathBuf> {
-    let dir = env::var("RUN_DIR").unwrap_or_else(|_| ".".to_string());
-    let path = PathBuf::from(dir);
-    fs::create_dir_all(&path)?;
-    Ok(path)
+fn run_dir() -> PathBuf {
+    PathBuf::from(env::var_os("RUN_DIR").unwrap_or_else(|| OsString::from(".")))
 }
 
 fn main() -> anyhow::Result<()> {
@@ -383,7 +402,9 @@ fn main() -> anyhow::Result<()> {
     } else {
         args.run_id
     };
-    let base_dir = run_dir()?;
+    // The evidence boundary must exist before it can be bound and authenticated.
+    // Creating arbitrary path components here would follow links before that check.
+    let base_dir = run_dir();
     let mut evidence = EvidenceRun::acquire(&base_dir, &run_id)?;
 
     println!("╔══════════════════════════════════════════════════════════╗");
@@ -421,6 +442,7 @@ fn main() -> anyhow::Result<()> {
 
     // Load and preprocess images
     let image_dir = args.image_dir;
+    let image_dir_for_evidence = utf8_evidence_path(&image_dir, "image directory")?;
     println!("Loading images from {image_dir:?}...");
 
     let mut images: Vec<SelectedImage> = Vec::new();
@@ -448,6 +470,7 @@ fn main() -> anyhow::Result<()> {
             break;
         }
         let path = entry.path();
+        let evidence_path = utf8_evidence_path(&path, "selected image path")?;
         let (bytes, identity) =
             match read_bounded_regular_file_with_identity(&path, MAX_ENCODED_IMAGE_BYTES) {
                 Ok(value) => value,
@@ -462,6 +485,7 @@ fn main() -> anyhow::Result<()> {
         }
         images.push(SelectedImage {
             path,
+            evidence_path,
             sha256: sha256_hex(&bytes),
             identity,
         });
@@ -546,7 +570,7 @@ fn main() -> anyhow::Result<()> {
         .iter()
         .map(|image| {
             json!({
-                "path": image.path.to_string_lossy(),
+                "path": image.evidence_path.as_str(),
                 "sha256": image.sha256,
             })
         })
@@ -562,7 +586,7 @@ fn main() -> anyhow::Result<()> {
         "excluded_from_timing": ["full-output device compaction, CPU readback, and finite-value validation", "image decode", "resize/letterbox", "normalization", "NMS/postprocess", "rendering"],
         "input_selection": "lexicographically sorted file names, first N valid images",
         "input_manifest": input_manifest,
-        "image_dir": image_dir,
+        "image_dir": image_dir_for_evidence,
         "images": num_images,
         "total_time_s": total_time_s,
         "fps": fps,
@@ -613,6 +637,17 @@ mod tests {
         assert!(safe_run_id("../escape").is_err());
         assert!(sha256_digest(&"f".repeat(64)).is_ok());
         assert!(sha256_digest(&"f".repeat(65)).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn benchmark_evidence_rejects_lossy_paths() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let path = PathBuf::from(OsString::from_vec(vec![b'i', 0xff, b'.', b'j', b'p', b'g']));
+        let error = utf8_evidence_path(&path, "selected image path").unwrap_err();
+
+        assert!(error.to_string().contains("valid UTF-8"));
     }
 
     #[test]

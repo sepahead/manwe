@@ -1,52 +1,40 @@
+use std::collections::HashSet;
 use std::ffi::{OsStr, OsString};
-use std::fs::{self, OpenOptions};
+use std::fs;
 use std::io::{Cursor, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
-use candle::{DType, Tensor};
-use candle_nn::{Module, VarBuilder};
-use clap::{Parser, ValueEnum};
+use clap::Parser;
 use image::DynamicImage;
-use manwe::model::{Multiples, YoloV8, YoloV8Pose};
+use manwe::native_runtime::{NativeInferenceReport, NativeRuntime};
+use manwe::runtime_contract::ModelTask;
 use manwe::secure_io::{
-    open_bounded_regular_file, read_bounded_open_file, read_bounded_regular_file, sha256_hex,
-    BoundDirectory, FileIdentity, MAX_ENCODED_IMAGE_BYTES, MAX_MODEL_BYTES,
+    bounded_open_file_identity, open_bounded_regular_file, read_bounded_regular_file, sha256_hex,
+    BoundDirectory, FileIdentity, HardLinkPublication, MAX_ENCODED_IMAGE_BYTES,
 };
-use manwe::{
-    device, prepare_image, report_detect_with_output, report_pose_with_output, ImageTransform,
-    ReportOutput,
-};
+use manwe::{DetectionRecord, PoseRecord};
+use serde::Serialize;
 
 const MAX_OUTPUT_ATTEMPTS: u32 = 10_000;
 const MAX_OUTPUT_JPEG_BYTES: u64 = 256 * 1024 * 1024;
-static OUTPUT_STAGE_COUNTER: AtomicU64 = AtomicU64::new(0);
+const MAX_TRACE_BYTES: u64 = 1024 * 1024 * 1024;
+const MAX_INPUT_IMAGES: usize = 10_000;
+const STAGED_OUTPUT_NAME: &str = "output.jpg";
 
-#[derive(Clone, Copy, ValueEnum, Debug)]
-enum Which {
-    N,
-    S,
-    M,
-    L,
-    X,
+fn secure_name_token(purpose: &str) -> Result<String> {
+    let mut entropy = [0_u8; 32];
+    getrandom::fill(&mut entropy)
+        .with_context(|| format!("failed to obtain OS randomness for {purpose}"))?;
+    Ok(sha256_hex(&entropy))
 }
 
-#[derive(Clone, Copy, ValueEnum, Debug)]
-enum YoloTask {
-    Detect,
-    Pose,
-}
-
-fn probability(value: &str) -> std::result::Result<f32, String> {
-    let parsed = value
-        .parse::<f32>()
-        .map_err(|_| format!("{value:?} is not a number"))?;
-    if parsed.is_finite() && (0.0..=1.0).contains(&parsed) {
-        Ok(parsed)
-    } else {
-        Err("value must be finite and between 0 and 1".to_string())
-    }
+fn has_io_error_kind(error: &anyhow::Error, kind: std::io::ErrorKind) -> bool {
+    error
+        .chain()
+        .filter_map(|cause| cause.downcast_ref::<std::io::Error>())
+        .any(|cause| cause.kind() == kind)
 }
 
 fn bounded_legend_size(value: &str) -> std::result::Result<u32, String> {
@@ -57,14 +45,6 @@ fn bounded_legend_size(value: &str) -> std::result::Result<u32, String> {
         Ok(parsed)
     } else {
         Err("legend size must not exceed 256 pixels".to_string())
-    }
-}
-
-fn sha256_digest(value: &str) -> std::result::Result<String, String> {
-    if value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-        Ok(value.to_ascii_lowercase())
-    } else {
-        Err("SHA-256 must contain exactly 64 hexadecimal characters".to_string())
     }
 }
 
@@ -79,129 +59,208 @@ struct Args {
     #[arg(long)]
     tracing: bool,
 
-    /// Local, non-symlinked model weights in safetensors format.
-    #[arg(long, env = "MANWE_MODEL")]
-    model: PathBuf,
-
-    /// Expected SHA-256 for the exact model artifact.
-    #[arg(long, env = "MANWE_MODEL_SHA256", value_parser = sha256_digest)]
-    model_sha256: String,
-
-    /// Which model variant to use.
-    #[arg(long, value_enum, default_value_t = Which::S)]
-    which: Which,
+    /// Schema-2 contract beside the exact model artifact.
+    #[arg(long, env = "MANWE_CONTRACT")]
+    contract: PathBuf,
 
     /// One or more input images.
-    #[arg(required = true, num_args = 1..)]
+    #[arg(required = true, num_args = 1..=10_000)]
     images: Vec<PathBuf>,
 
-    /// Threshold for the model confidence level.
-    #[arg(long, default_value_t = 0.25, value_parser = probability)]
-    confidence_threshold: f32,
-
-    /// Threshold for non-maximum suppression.
-    #[arg(long, default_value_t = 0.45, value_parser = probability)]
-    nms_threshold: f32,
-
-    /// The task to run.
-    #[arg(long, value_enum, default_value_t = YoloTask::Detect)]
-    task: YoloTask,
+    /// Existing owner-controlled directory for annotated JPEGs.
+    /// Defaults to each input image's directory.
+    #[arg(long)]
+    output_dir: Option<PathBuf>,
 
     /// Legend size; zero disables labels.
     #[arg(long, default_value_t = 14, value_parser = bounded_legend_size)]
     legend_size: u32,
 }
 
-impl Args {
-    fn model_path(&self) -> Result<&Path> {
-        if self.model.extension().and_then(|ext| ext.to_str()) != Some("safetensors") {
+#[derive(Serialize)]
+struct InferenceReceipt<'a> {
+    schema_version: &'static str,
+    task: &'static str,
+    device: &'static str,
+    model_name: &'a str,
+    model_version: &'a str,
+    contract_path: &'a str,
+    contract_sha256: &'a str,
+    artifact_path: &'a str,
+    artifact_sha256: &'a str,
+    input_path: &'a str,
+    input_sha256: &'a str,
+    output_path: &'a str,
+    output_sha256: &'a str,
+    objects: &'a InferenceObjects,
+}
+
+#[derive(Serialize)]
+#[serde(tag = "kind", content = "items", rename_all = "snake_case")]
+enum InferenceObjects {
+    Detections(Vec<DetectionRecord>),
+    Poses(Vec<PoseRecord>),
+}
+
+fn create_trace_file(parent: &Path) -> Result<(fs::File, PathBuf, BoundDirectory)> {
+    let parent = BoundDirectory::open(parent).context("failed to bind trace output directory")?;
+    parent.require_owner_mutation_boundary()?;
+    for _ in 0..MAX_OUTPUT_ATTEMPTS {
+        let token = secure_name_token("trace-file naming")?;
+        let name = OsString::from(format!("manwe-trace-{token}.json"));
+        let path = parent.path().join(&name);
+        parent.verify()?;
+        match parent.create_new_regular_file_entry(&name, 0o600) {
+            Ok(file) => {
+                parent.sync().with_context(|| {
+                    format!(
+                        "trace file was created at {}, but its directory entry has unknown durability",
+                        path.display()
+                    )
+                })?;
+                return Ok((file, path, parent));
+            }
+            Err(error) if has_io_error_kind(&error, std::io::ErrorKind::AlreadyExists) => continue,
+            Err(error) => return Err(error).context("failed to create private trace output"),
+        }
+    }
+    anyhow::bail!("could not reserve a unique trace output name")
+}
+
+fn remember_trace_write_error(error: &Mutex<Option<String>>, message: String) {
+    let mut slot = error
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if slot.is_none() {
+        *slot = Some(message);
+    }
+}
+
+struct CheckedTraceWriter {
+    file: Arc<Mutex<fs::File>>,
+    write_error: Arc<Mutex<Option<String>>>,
+}
+
+impl Write for CheckedTraceWriter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        let result = self
+            .file
+            .lock()
+            .map_err(|_| std::io::Error::other("trace file lock was poisoned"))
+            .and_then(|mut file| {
+                let current = file.metadata()?.len();
+                let incoming = u64::try_from(bytes.len())
+                    .map_err(|_| std::io::Error::other("trace write length overflowed"))?;
+                if incoming > MAX_TRACE_BYTES.saturating_sub(current) {
+                    return Err(std::io::Error::other(format!(
+                        "trace exceeds the {MAX_TRACE_BYTES}-byte limit"
+                    )));
+                }
+                file.write(bytes)
+            });
+        match result {
+            Ok(written) => Ok(written),
+            Err(error) => {
+                remember_trace_write_error(&self.write_error, error.to_string());
+                // The dependency unwraps writer errors on its background thread.
+                // Record the first failure and act as a sink so the foreground can
+                // join the thread and return a normal, contextualized error.
+                Ok(bytes.len())
+            }
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        let result = self
+            .file
+            .lock()
+            .map_err(|_| std::io::Error::other("trace file lock was poisoned"))
+            .and_then(|mut file| file.flush());
+        if let Err(error) = result {
+            remember_trace_write_error(&self.write_error, error.to_string());
+        }
+        Ok(())
+    }
+}
+
+struct TraceCompletion {
+    path: PathBuf,
+    parent: BoundDirectory,
+    file: Arc<Mutex<fs::File>>,
+    write_error: Arc<Mutex<Option<String>>>,
+}
+
+impl TraceCompletion {
+    fn finish(self) -> Result<()> {
+        let write_error = self
+            .write_error
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(error) = write_error {
+            anyhow::bail!("failed to write trace {}: {error}", self.path.display())
+        }
+        let name = self
+            .path
+            .file_name()
+            .context("trace output path lost its filename")?;
+        let written_identity = {
+            let file = self
+                .file
+                .lock()
+                .map_err(|_| anyhow::anyhow!("trace file lock was poisoned"))?;
+            file.sync_all()
+                .with_context(|| format!("failed to synchronize trace {}", self.path.display()))?;
+            bounded_open_file_identity(&file, &self.path, MAX_TRACE_BYTES)?
+        };
+        let visible_identity = self
+            .parent
+            .regular_file_entry_identity(name, MAX_TRACE_BYTES)
+            .with_context(|| {
+                format!(
+                    "trace bytes were synchronized, but {} no longer identifies them",
+                    self.path.display()
+                )
+            })?;
+        if visible_identity != written_identity {
             anyhow::bail!(
-                "model must be a .safetensors file: {}",
-                self.model.display()
+                "trace bytes were synchronized, but {} was replaced before completion",
+                self.path.display()
             )
         }
-        Ok(&self.model)
+        self.parent.sync().with_context(|| {
+            format!(
+                "trace data was synchronized at {}, but its directory entry has unknown durability",
+                self.path.display()
+            )
+        })
     }
 }
 
-trait Task: Module + Sized {
-    fn load(vb: VarBuilder, multiples: Multiples) -> candle::Result<Self>;
-    fn report(
-        pred: &Tensor,
-        image: DynamicImage,
-        transform: &ImageTransform,
-        confidence_threshold: f32,
-        nms_threshold: f32,
-        legend_size: u32,
-    ) -> candle::Result<DynamicImage>;
+struct TraceSession {
+    guard: tracing_chrome::FlushGuard,
+    completion: TraceCompletion,
 }
 
-impl Task for YoloV8 {
-    fn load(vb: VarBuilder, multiples: Multiples) -> candle::Result<Self> {
-        YoloV8::load(vb, multiples, 80)
-    }
-
-    fn report(
-        pred: &Tensor,
-        image: DynamicImage,
-        transform: &ImageTransform,
-        confidence_threshold: f32,
-        nms_threshold: f32,
-        legend_size: u32,
-    ) -> candle::Result<DynamicImage> {
-        report_detect_with_output(
-            pred,
-            image,
-            transform,
-            confidence_threshold,
-            nms_threshold,
-            legend_size,
-            ReportOutput::Stdout,
-        )
+impl TraceSession {
+    fn finish(self) -> Result<()> {
+        let Self { guard, completion } = self;
+        drop(guard);
+        completion.finish()
     }
 }
 
-impl Task for YoloV8Pose {
-    fn load(vb: VarBuilder, multiples: Multiples) -> candle::Result<Self> {
-        YoloV8Pose::load(vb, multiples, 1, (17, 3))
-    }
-
-    fn report(
-        pred: &Tensor,
-        image: DynamicImage,
-        transform: &ImageTransform,
-        confidence_threshold: f32,
-        nms_threshold: f32,
-        legend_size: u32,
-    ) -> candle::Result<DynamicImage> {
-        report_pose_with_output(
-            pred,
-            image,
-            transform,
-            confidence_threshold,
-            nms_threshold,
-            legend_size,
-            ReportOutput::Stdout,
-        )
-    }
-}
-
-fn create_private_directory(path: &Path) -> std::io::Result<()> {
-    let mut builder = fs::DirBuilder::new();
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::DirBuilderExt;
-        builder.mode(0o700);
-    }
-    builder.create(path)
-}
-
-fn verify_jpeg_file(path: &Path, expected: &[u8]) -> Result<FileIdentity> {
+fn verify_jpeg_file_at(
+    directory: &BoundDirectory,
+    name: &OsStr,
+    expected: &[u8],
+) -> Result<FileIdentity> {
     if expected.is_empty() || expected.len() as u64 > MAX_OUTPUT_JPEG_BYTES {
         anyhow::bail!("annotated JPEG must contain between 1 and {MAX_OUTPUT_JPEG_BYTES} bytes")
     }
-    let (mut file, identity) = open_bounded_regular_file(path, MAX_OUTPUT_JPEG_BYTES)?;
-    let actual = read_bounded_open_file(&mut file, identity, path, MAX_OUTPUT_JPEG_BYTES)?;
+    let path = directory.path().join(name);
+    let (actual, identity) =
+        directory.read_bounded_regular_file_entry_with_identity(name, MAX_OUTPUT_JPEG_BYTES)?;
     if actual != expected {
         anyhow::bail!("annotated JPEG verification failed: {}", path.display())
     }
@@ -218,23 +277,24 @@ fn verify_jpeg_file(path: &Path, expected: &[u8]) -> Result<FileIdentity> {
     Ok(identity)
 }
 
-fn write_verified_jpeg_once(path: &Path, encoded: &[u8]) -> Result<()> {
-    let mut options = OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-
-        // The hard link published later exposes this exact inode. Set the mode
-        // at creation so a permissive process umask cannot make it writable by
-        // another account between linking and post-link authentication.
-        options.mode(0o600);
-    }
-    let mut file = options.open(path)?;
+fn write_verified_jpeg_once(
+    directory: &BoundDirectory,
+    name: &OsStr,
+    encoded: &[u8],
+) -> Result<()> {
+    let path = directory.path().join(name);
+    // The hard link published later exposes this exact inode. Set the mode at
+    // descriptor-relative creation so neither a pathname swap nor a permissive
+    // process umask can redirect or broaden the output authority.
+    let mut file = directory.create_new_regular_file_entry(name, 0o600)?;
     file.write_all(encoded)?;
     file.sync_all()?;
+    let written_identity = bounded_open_file_identity(&file, &path, MAX_OUTPUT_JPEG_BYTES)?;
     drop(file);
-    verify_jpeg_file(path, encoded)?;
+    let visible_identity = verify_jpeg_file_at(directory, name, encoded)?;
+    if visible_identity != written_identity {
+        anyhow::bail!("staged JPEG was replaced after its synchronized write")
+    }
     Ok(())
 }
 
@@ -242,43 +302,22 @@ struct ImagePublication {
     parent_dir: BoundDirectory,
     stage_dir: BoundDirectory,
     stage_name: OsString,
-    stage_file: PathBuf,
     final_link_created: bool,
     committed: bool,
     cleanup_started: bool,
 }
 
 impl ImagePublication {
-    fn acquire(parent_dir: &Path) -> Result<Self> {
-        let parent_dir = BoundDirectory::open(parent_dir)?;
+    fn acquire(parent_dir: &BoundDirectory) -> Result<Self> {
+        let parent_dir = parent_dir.try_clone()?;
         parent_dir.require_owner_mutation_boundary()?;
         for _ in 0..MAX_OUTPUT_ATTEMPTS {
-            let sequence = OUTPUT_STAGE_COUNTER.fetch_add(1, Ordering::Relaxed);
-            let stage_name = OsString::from(format!(
-                ".manwe-image-output-{}-{sequence}.in-progress",
-                std::process::id()
-            ));
-            let stage_path = parent_dir.path().join(&stage_name);
+            let token = secure_name_token("image-output staging")?;
+            let stage_name = OsString::from(format!(".manwe-image-output-{token}.in-progress"));
             parent_dir.verify()?;
-            match create_private_directory(&stage_path) {
-                Ok(()) => {
-                    parent_dir.verify()?;
-                    let stage_dir = match BoundDirectory::open(&stage_path) {
-                        Ok(directory) => directory,
-                        Err(error) => {
-                            let cleanup_result = parent_dir
-                                .remove_directory_entry(&stage_name)
-                                .and_then(|()| parent_dir.sync());
-                            if let Err(cleanup_error) = cleanup_result {
-                                return Err(error.context(format!(
-                                    "failed to bind the new staging directory; exact-entry cleanup was refused or its durability is unknown: {cleanup_error:#}"
-                                )));
-                            }
-                            return Err(error);
-                        }
-                    };
+            match parent_dir.create_directory_entry(&stage_name, 0o700) {
+                Ok(stage_dir) => {
                     let publication = Self {
-                        stage_file: stage_dir.path().join("output.jpg"),
                         parent_dir,
                         stage_dir,
                         stage_name,
@@ -286,12 +325,27 @@ impl ImagePublication {
                         committed: false,
                         cleanup_started: false,
                     };
-                    publication.parent_dir.sync()?;
-                    publication.stage_dir.require_owner_mutation_boundary()?;
+                    publication.parent_dir.sync().with_context(|| {
+                        format!(
+                            "image-output staging marker was created at {}, but its visibility or durability is unknown",
+                            publication.stage_dir.path().display()
+                        )
+                    })?;
+                    publication
+                        .stage_dir
+                        .require_owner_mutation_boundary()
+                        .with_context(|| {
+                            format!(
+                                "image-output staging marker was created at {}, but could not be authenticated",
+                                publication.stage_dir.path().display()
+                            )
+                        })?;
                     return Ok(publication);
                 }
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
-                Err(error) => return Err(error.into()),
+                Err(error) if has_io_error_kind(&error, std::io::ErrorKind::AlreadyExists) => {
+                    continue;
+                }
+                Err(error) => return Err(error),
             }
         }
         anyhow::bail!("could not reserve a unique image-output staging directory")
@@ -314,7 +368,8 @@ impl ImagePublication {
     {
         self.parent_dir.require_owner_mutation_boundary()?;
         self.stage_dir.require_owner_mutation_boundary()?;
-        write_verified_jpeg_once(&self.stage_file, encoded)?;
+        let staged_output_name = OsStr::new(STAGED_OUTPUT_NAME);
+        write_verified_jpeg_once(&self.stage_dir, staged_output_name, encoded)?;
         self.stage_dir.sync()?;
         let mut output = None;
         for attempt in 0..MAX_OUTPUT_ATTEMPTS {
@@ -323,18 +378,25 @@ impl ImagePublication {
                 name.push(format!(".{attempt}"));
             }
             name.push(".jpg");
-            let candidate = self.parent_dir.path().join(name);
+            let candidate = self.parent_dir.path().join(&name);
             self.parent_dir.verify()?;
             self.stage_dir.verify()?;
-            match fs::hard_link(&self.stage_file, &candidate) {
-                Ok(()) => {
+            match self.stage_dir.hard_link_file_entry_to(
+                staged_output_name,
+                &self.parent_dir,
+                &name,
+                MAX_OUTPUT_JPEG_BYTES,
+            ) {
+                Ok(HardLinkPublication::Created | HardLinkPublication::AlreadyLinked) => {
                     self.final_link_created = true;
                     let mut authenticate = || -> Result<()> {
                         after_link(&candidate)?;
-                        let stage_identity = verify_jpeg_file(&self.stage_file, encoded)?;
+                        let stage_identity =
+                            verify_jpeg_file_at(&self.stage_dir, staged_output_name, encoded)?;
                         self.parent_dir.verify()?;
                         self.stage_dir.verify()?;
-                        let output_identity = verify_jpeg_file(&candidate, encoded)?;
+                        let output_identity =
+                            verify_jpeg_file_at(&self.parent_dir, &name, encoded)?;
                         if output_identity != stage_identity {
                             anyhow::bail!(
                                 "published JPEG identity does not match the staged output"
@@ -351,8 +413,20 @@ impl ImagePublication {
                     output = Some(candidate);
                     break;
                 }
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
-                Err(error) => return Err(error.into()),
+                Ok(HardLinkPublication::DestinationOccupied) => continue,
+                Err(error) => {
+                    // A remote filesystem may publish a hard link and then
+                    // report failure. Preserve the private stage and identify
+                    // the exact candidate instead of pretending no side effect
+                    // occurred or retrying under another name.
+                    self.final_link_created = true;
+                    return Err(error).with_context(|| {
+                        format!(
+                            "hard-link publication at {} failed with an indeterminate visibility state",
+                            candidate.display()
+                        )
+                    });
+                }
             }
         }
         let output = output.context("could not find an unused image-output name")?;
@@ -394,7 +468,7 @@ impl ImagePublication {
         self.parent_dir.require_owner_mutation_boundary()?;
         self.stage_dir.require_owner_mutation_boundary()?;
 
-        let output_name = OsStr::new("output.jpg");
+        let output_name = OsStr::new(STAGED_OUTPUT_NAME);
         if require_staged_output {
             self.stage_dir.remove_file_entry(output_name)?;
         } else {
@@ -417,7 +491,11 @@ impl Drop for ImagePublication {
     }
 }
 
-fn save_output(input: &Path, image: &DynamicImage) -> Result<PathBuf> {
+fn save_output_with_digest(
+    input: &Path,
+    image: &DynamicImage,
+    output_dir: &BoundDirectory,
+) -> Result<(PathBuf, String)> {
     let stem = input.file_stem().context("input image needs a file name")?;
     let mut base = stem.to_os_string();
     base.push(".pp");
@@ -428,16 +506,25 @@ fn save_output(input: &Path, image: &DynamicImage) -> Result<PathBuf> {
     if encoded.get_ref().len() as u64 > MAX_OUTPUT_JPEG_BYTES {
         anyhow::bail!("annotated JPEG exceeds the {MAX_OUTPUT_JPEG_BYTES}-byte limit")
     }
-    let parent_dir = input
+    let digest = sha256_hex(encoded.get_ref());
+    let mut publication = ImagePublication::acquire(output_dir)?;
+    let path = publication.publish(encoded.get_ref(), &base)?;
+    Ok((path, digest))
+}
+
+#[cfg(test)]
+fn save_output(input: &Path, image: &DynamicImage) -> Result<PathBuf> {
+    let parent = input
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
-    let mut publication = ImagePublication::acquire(parent_dir)?;
-    publication.publish(encoded.get_ref(), &base)
+    let parent = BoundDirectory::open(parent)?;
+    save_output_with_digest(input, image, &parent).map(|(path, _digest)| path)
 }
 
-fn decode_image(path: &Path) -> Result<DynamicImage> {
+fn decode_image(path: &Path) -> Result<(DynamicImage, String)> {
     let bytes = read_bounded_regular_file(path, MAX_ENCODED_IMAGE_BYTES)?;
+    let digest = sha256_hex(&bytes);
     let mut reader = image::ImageReader::new(Cursor::new(bytes))
         .with_guessed_format()
         .with_context(|| format!("failed to determine image format for {}", path.display()))?;
@@ -446,43 +533,180 @@ fn decode_image(path: &Path) -> Result<DynamicImage> {
     limits.max_image_height = Some(32_768);
     limits.max_alloc = Some(256 * 1024 * 1024);
     reader.limits(limits);
-    reader
+    let image = reader
         .decode()
-        .with_context(|| format!("failed to decode image {}", path.display()))
+        .with_context(|| format!("failed to decode image {}", path.display()))?;
+    Ok((image, digest))
 }
 
-fn run<T: Task>(args: Args) -> Result<()> {
-    let device = device(args.cpu)?;
-    let multiples = match args.which {
-        Which::N => Multiples::n(),
-        Which::S => Multiples::s(),
-        Which::M => Multiples::m(),
-        Which::L => Multiples::l(),
-        Which::X => Multiples::x(),
-    };
-    let model_path = args.model_path()?;
-    let model_bytes = read_bounded_regular_file(model_path, MAX_MODEL_BYTES)?;
-    let actual_digest = sha256_hex(&model_bytes);
-    if actual_digest != args.model_sha256 {
-        anyhow::bail!("model SHA-256 does not match the expected digest")
-    }
-    let vb = VarBuilder::from_buffered_safetensors(model_bytes, DType::F32, &device)?;
-    let model = T::load(vb, multiples)?;
+fn utf8_path(path: &Path) -> Result<&str> {
+    path.to_str().with_context(|| {
+        format!(
+            "path must be valid UTF-8 for structured output: {}",
+            path.display()
+        )
+    })
+}
 
-    for image_path in &args.images {
-        let original = decode_image(image_path)?;
-        let (input, transform) = prepare_image(&original, 640, 32, &device)?;
-        let predictions = model.forward(&input)?.squeeze(0)?;
-        let annotated = T::report(
-            &predictions,
-            original,
-            &transform,
-            args.confidence_threshold,
-            args.nms_threshold,
-            args.legend_size,
-        )?;
-        let output = save_output(image_path, &annotated)?;
-        println!("{}", output.display());
+fn canonical_input_path(path: &Path) -> Result<PathBuf> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let name = path
+        .file_name()
+        .context("input path must identify one image file")?;
+    let parent = BoundDirectory::open(parent).context("failed to bind input image directory")?;
+    let result = parent.path().join(name);
+    parent.verify()?;
+    Ok(result)
+}
+
+fn preflight_image_paths(paths: &[PathBuf]) -> Result<Vec<PathBuf>> {
+    if paths.is_empty() || paths.len() > MAX_INPUT_IMAGES {
+        anyhow::bail!("input batch must contain between 1 and {MAX_INPUT_IMAGES} images")
+    }
+    let mut seen = HashSet::with_capacity(paths.len());
+    let mut canonical_paths = Vec::with_capacity(paths.len());
+    for path in paths {
+        let canonical = canonical_input_path(path)?;
+        utf8_path(&canonical)?;
+        if !seen.insert(canonical.clone()) {
+            anyhow::bail!("input image paths must not contain duplicates")
+        }
+        let _ =
+            open_bounded_regular_file(&canonical, MAX_ENCODED_IMAGE_BYTES).with_context(|| {
+                format!(
+                    "input image failed bounded preflight: {}",
+                    canonical.display()
+                )
+            })?;
+        canonical_paths.push(canonical);
+    }
+    Ok(canonical_paths)
+}
+
+fn preflight_default_output_directories(image_paths: &[PathBuf]) -> Result<()> {
+    let mut seen = HashSet::new();
+    for image_path in image_paths {
+        let parent = image_path
+            .parent()
+            .context("canonical input image must have a parent directory")?;
+        if seen.insert(parent.to_path_buf()) {
+            let directory = BoundDirectory::open(parent)
+                .context("failed to bind default annotated-image output directory")?;
+            directory.require_owner_mutation_boundary()?;
+            utf8_path(directory.path())?;
+        }
+    }
+    Ok(())
+}
+
+fn run(args: Args) -> Result<()> {
+    // Prove all caller-controlled filesystem authority before allocating a
+    // model or initializing an accelerator. Each image is reopened and fully
+    // authenticated at consumption time; this pass rejects impossible batches,
+    // duplicate paths, missing/special inputs, and oversized files without
+    // expensive model side effects.
+    let image_paths = preflight_image_paths(&args.images)?;
+    let output_dir = match args.output_dir {
+        Some(path) => {
+            let directory = BoundDirectory::open(&path)
+                .context("failed to bind annotated-image output directory")?;
+            directory.require_owner_mutation_boundary()?;
+            directory.verify()?;
+            utf8_path(directory.path())?;
+            Some(directory)
+        }
+        None => {
+            preflight_default_output_directories(&image_paths)?;
+            None
+        }
+    };
+    let runtime = NativeRuntime::load(&args.contract, args.cpu)?;
+    let contract = runtime.contract();
+    let contract_path = utf8_path(runtime.contract_path())?;
+    let artifact_path = utf8_path(runtime.artifact_path())?;
+
+    for image_path in &image_paths {
+        // Retain the exact default output-directory descriptor across decoding,
+        // inference, and publication. A dedicated directory is already retained
+        // for the whole batch.
+        let per_image_output_dir = if output_dir.is_none() {
+            let parent = image_path
+                .parent()
+                .context("canonical input image must have a parent directory")?;
+            let directory = BoundDirectory::open(parent)
+                .context("failed to rebind default annotated-image output directory")?;
+            directory.require_owner_mutation_boundary()?;
+            Some(directory)
+        } else {
+            None
+        };
+        let output_directory = output_dir
+            .as_ref()
+            .or(per_image_output_dir.as_ref())
+            .context("validated output directory was not retained")?;
+        output_directory.verify()?;
+        let (original, input_sha256) = decode_image(image_path)?;
+        let (annotated, objects) = match runtime.infer(original, args.legend_size)? {
+            NativeInferenceReport::Detect(report) => (
+                report.annotated_image,
+                InferenceObjects::Detections(report.detections),
+            ),
+            NativeInferenceReport::Pose(report) => (
+                report.annotated_image,
+                InferenceObjects::Poses(report.poses),
+            ),
+        };
+        let (output_path, output_sha256) =
+            save_output_with_digest(image_path, &annotated, output_directory)?;
+        output_directory.verify().with_context(|| {
+            format!(
+                "output is committed at the last-authenticated path {}, but its parent directory identity changed before receipt emission",
+                output_path.display()
+            )
+        })?;
+        let committed_output_path = utf8_path(&output_path)?;
+        let receipt = InferenceReceipt {
+            schema_version: "manwe-inference-result-v1",
+            task: match contract.task() {
+                ModelTask::Detect => "detect",
+                ModelTask::Pose => "pose",
+            },
+            device: runtime.device_name(),
+            model_name: contract.model_name(),
+            model_version: contract.model_version(),
+            contract_path,
+            contract_sha256: runtime.contract_sha256(),
+            artifact_path,
+            artifact_sha256: contract.artifact_sha256(),
+            input_path: utf8_path(image_path)?,
+            input_sha256: &input_sha256,
+            output_path: committed_output_path,
+            output_sha256: &output_sha256,
+            objects: &objects,
+        };
+        let stdout = std::io::stdout();
+        let mut output = stdout.lock();
+        serde_json::to_writer(&mut output, &receipt).with_context(|| {
+            format!(
+                "output is committed at {committed_output_path}, but its inference receipt \
+                     could not be serialized to stdout"
+            )
+        })?;
+        output.write_all(b"\n").with_context(|| {
+            format!(
+                "output is committed at {committed_output_path}, but its inference receipt \
+                 newline could not be written to stdout"
+            )
+        })?;
+        output.flush().with_context(|| {
+            format!(
+                "output is committed at {committed_output_path}, but its inference receipt \
+                     could not be flushed to stdout"
+            )
+        })?;
     }
 
     Ok(())
@@ -493,23 +717,52 @@ fn main() -> Result<()> {
     use tracing_subscriber::prelude::*;
 
     let args = Args::parse();
-    let _trace_guard = if args.tracing {
-        let (chrome_layer, guard) = ChromeLayerBuilder::new().build();
+    let trace_session = if args.tracing {
+        let (trace_file, trace_path, trace_parent) = create_trace_file(Path::new("."))?;
+        let trace_file = Arc::new(Mutex::new(trace_file));
+        let write_error = Arc::new(Mutex::new(None));
+        let trace_writer = CheckedTraceWriter {
+            file: Arc::clone(&trace_file),
+            write_error: Arc::clone(&write_error),
+        };
+        eprintln!("writing private trace to {}", trace_path.display());
+        // Supplying our own exclusive, owner-private writer avoids the
+        // dependency's panic-prone, truncating default File::create path.
+        let (chrome_layer, guard) = ChromeLayerBuilder::new().writer(trace_writer).build();
         tracing_subscriber::registry().with(chrome_layer).init();
-        Some(guard)
+        Some(TraceSession {
+            guard,
+            completion: TraceCompletion {
+                path: trace_path,
+                parent: trace_parent,
+                file: trace_file,
+                write_error,
+            },
+        })
     } else {
         None
     };
 
-    match args.task {
-        YoloTask::Detect => run::<YoloV8>(args),
-        YoloTask::Pose => run::<YoloV8Pose>(args),
+    let inference = run(args);
+    let trace = trace_session.map_or(Ok(()), TraceSession::finish);
+    match (inference, trace) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(()), Err(error)) => Err(error),
+        (Err(error), Err(trace_error)) => {
+            Err(error.context(format!("trace finalization also failed: {trace_error:#}")))
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn acquire_publication(path: &Path) -> Result<ImagePublication> {
+        let directory = BoundDirectory::open(path)?;
+        ImagePublication::acquire(&directory)
+    }
 
     fn encoded_test_jpeg() -> Vec<u8> {
         let image = DynamicImage::ImageRgb8(image::RgbImage::new(2, 2));
@@ -521,13 +774,197 @@ mod tests {
     }
 
     #[test]
-    fn probability_rejects_nonfinite_and_out_of_range_values() {
-        assert!(probability("NaN").is_err());
-        assert!(probability("-0.1").is_err());
-        assert!(probability("1.1").is_err());
-        assert_eq!(probability("0.5").unwrap(), 0.5);
-        assert!(sha256_digest(&"0".repeat(63)).is_err());
-        assert_eq!(sha256_digest(&"A".repeat(64)).unwrap(), "a".repeat(64));
+    fn cli_requires_one_contract_instead_of_independent_model_guesses() {
+        assert!(Args::try_parse_from(["manwe", "frame.jpg"]).is_err());
+        let args =
+            Args::try_parse_from(["manwe", "--contract", "model.contract.json", "frame.jpg"])
+                .unwrap();
+        assert_eq!(args.contract, PathBuf::from("model.contract.json"));
+        assert_eq!(args.images, [PathBuf::from("frame.jpg")]);
+        assert_eq!(args.output_dir, None);
+    }
+
+    #[test]
+    fn private_entry_tokens_have_full_lowercase_sha256_shape() {
+        let first = secure_name_token("test entry").unwrap();
+        let second = secure_name_token("test entry").unwrap();
+
+        assert_eq!(first.len(), 64);
+        assert!(first
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)));
+        assert_ne!(first, second);
+    }
+
+    #[test]
+    fn cli_accepts_a_dedicated_output_directory() {
+        let args = Args::try_parse_from([
+            "manwe",
+            "--contract",
+            "model.contract.json",
+            "--output-dir",
+            "annotated",
+            "frame.jpg",
+        ])
+        .unwrap();
+
+        assert_eq!(args.output_dir, Some(PathBuf::from("annotated")));
+        assert_eq!(args.images, [PathBuf::from("frame.jpg")]);
+    }
+
+    #[test]
+    fn cli_bounds_the_input_batch_before_runtime_construction() {
+        let mut arguments = vec![
+            OsString::from("manwe"),
+            OsString::from("--contract"),
+            OsString::from("model.contract.json"),
+        ];
+        arguments
+            .extend((0..=MAX_INPUT_IMAGES).map(|index| OsString::from(format!("{index}.jpg"))));
+
+        assert!(Args::try_parse_from(arguments).is_err());
+    }
+
+    #[test]
+    fn input_preflight_rejects_duplicate_and_missing_paths() {
+        let directory = std::env::temp_dir().join(format!(
+            "manwe-input-preflight-test-{}-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("unnamed")
+        ));
+        let _ = fs::remove_dir_all(&directory);
+        fs::create_dir(&directory).unwrap();
+        let input = directory.join("frame.jpg");
+        fs::write(&input, b"not decoded during preflight").unwrap();
+
+        let duplicate = preflight_image_paths(&[input.clone(), input.clone()]).unwrap_err();
+        assert!(duplicate.to_string().contains("duplicates"));
+        let missing = preflight_image_paths(&[directory.join("missing.jpg")]).unwrap_err();
+        assert!(missing.to_string().contains("bounded preflight"));
+
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn default_output_preflight_rejects_a_shared_mutation_boundary() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = std::env::temp_dir().join(format!(
+            "manwe-default-output-preflight-test-{}-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("unnamed")
+        ));
+        let _ = fs::remove_dir_all(&directory);
+        fs::create_dir(&directory).unwrap();
+        let input = directory.join("frame.jpg");
+        fs::write(&input, b"not decoded during preflight").unwrap();
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o777)).unwrap();
+
+        let error = preflight_default_output_directories(&[input]).unwrap_err();
+        assert!(error.to_string().contains("group- or world-writable"));
+
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn trace_creation_is_exclusive_and_owner_private() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = std::env::temp_dir().join(format!(
+            "manwe-trace-output-test-{}-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("unnamed")
+        ));
+        let _ = fs::remove_dir_all(&directory);
+        fs::create_dir(&directory).unwrap();
+
+        let (mut file, path, parent) = create_trace_file(&directory).unwrap();
+        file.write_all(b"[]").unwrap();
+        file.sync_all().unwrap();
+        assert_eq!(fs::metadata(&path).unwrap().permissions().mode() & 0o077, 0);
+        assert!(path
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .starts_with("manwe-trace-"));
+        let (_second_file, second_path, second_parent) = create_trace_file(&directory).unwrap();
+        assert_ne!(path, second_path);
+        assert_eq!(fs::read(&path).unwrap(), b"[]");
+
+        drop(file);
+        drop(parent);
+        drop(second_parent);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn trace_writer_enforces_its_limit_before_writing() {
+        let directory = std::env::temp_dir().join(format!(
+            "manwe-trace-limit-test-{}-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("unnamed")
+        ));
+        let _ = fs::remove_dir_all(&directory);
+        fs::create_dir(&directory).unwrap();
+        let (file, path, parent) = create_trace_file(&directory).unwrap();
+        file.set_len(MAX_TRACE_BYTES).unwrap();
+        let file = Arc::new(Mutex::new(file));
+        let write_error = Arc::new(Mutex::new(None));
+        let mut writer = CheckedTraceWriter {
+            file: Arc::clone(&file),
+            write_error: Arc::clone(&write_error),
+        };
+
+        assert_eq!(writer.write(b"x").unwrap(), 1);
+        assert_eq!(fs::metadata(&path).unwrap().len(), MAX_TRACE_BYTES);
+        assert!(write_error
+            .lock()
+            .unwrap()
+            .as_deref()
+            .is_some_and(|error| error.contains("trace exceeds")));
+
+        drop(writer);
+        drop(file);
+        drop(parent);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn inference_receipt_has_exactly_one_tagged_object_payload() {
+        let objects = InferenceObjects::Detections(vec![DetectionRecord {
+            prediction_index: 7,
+            class_index: 1,
+            class_name: "bird".to_owned(),
+            airspace_class: Some("bird".to_owned()),
+            confidence: 0.75,
+            bbox_xyxy: [1.0, 2.0, 3.0, 4.0],
+        }]);
+        let receipt = InferenceReceipt {
+            schema_version: "manwe-inference-result-v1",
+            task: "detect",
+            device: "cpu",
+            model_name: "model",
+            model_version: "1",
+            contract_path: "/contract.json",
+            contract_sha256: "contract-digest",
+            artifact_path: "/model.safetensors",
+            artifact_sha256: "artifact-digest",
+            input_path: "/frame.png",
+            input_sha256: "input-digest",
+            output_path: "/frame.pp.jpg",
+            output_sha256: "output-digest",
+            objects: &objects,
+        };
+
+        let value = serde_json::to_value(receipt).unwrap();
+        assert_eq!(value["objects"]["kind"], "detections");
+        assert_eq!(value["objects"]["items"][0]["prediction_index"], 7);
+        assert_eq!(value["objects"]["items"][0]["airspace_class"], "bird");
+        assert!(value.get("detections").is_none());
+        assert!(value.get("poses").is_none());
     }
 
     #[test]
@@ -553,6 +990,31 @@ mod tests {
         );
         assert_eq!(std::fs::read(&occupied).unwrap(), b"do-not-overwrite");
         std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn dedicated_output_directory_keeps_publication_out_of_the_input_tree() {
+        let root = std::env::temp_dir().join(format!(
+            "manwe-output-directory-test-{}-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("unnamed")
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let input_dir = root.join("inputs");
+        let output_dir = root.join("outputs");
+        fs::create_dir_all(&input_dir).unwrap();
+        fs::create_dir(&output_dir).unwrap();
+        let input = input_dir.join("frame.png");
+        fs::write(&input, b"input-marker").unwrap();
+
+        let image = DynamicImage::ImageRgb8(image::RgbImage::new(2, 2));
+        let output_directory = BoundDirectory::open(&output_dir).unwrap();
+        let (output, digest) = save_output_with_digest(&input, &image, &output_directory).unwrap();
+
+        assert_eq!(output.parent().unwrap(), output_dir.canonicalize().unwrap());
+        assert!(!input_dir.join("frame.pp.jpg").exists());
+        assert_eq!(sha256_hex(&fs::read(output).unwrap()), digest);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[cfg(unix)]
@@ -587,7 +1049,7 @@ mod tests {
         ));
         let _ = fs::remove_dir_all(&directory);
         fs::create_dir(&directory).unwrap();
-        let mut publication = ImagePublication::acquire(&directory).unwrap();
+        let mut publication = acquire_publication(&directory).unwrap();
         let output = publication.parent_dir.path().join("frame.pp.jpg");
         let stage_dir = publication.stage_dir.path().to_path_buf();
 
@@ -622,7 +1084,7 @@ mod tests {
         let _ = fs::remove_dir_all(&directory);
         let _ = fs::remove_dir_all(&moved);
         fs::create_dir(&directory).unwrap();
-        let mut publication = ImagePublication::acquire(&directory).unwrap();
+        let mut publication = acquire_publication(&directory).unwrap();
         let output = publication.parent_dir.path().join("frame.pp.jpg");
 
         let error = publication
@@ -657,9 +1119,9 @@ mod tests {
         ));
         let _ = fs::remove_dir_all(&directory);
         fs::create_dir(&directory).unwrap();
-        let mut publication = ImagePublication::acquire(&directory).unwrap();
+        let mut publication = acquire_publication(&directory).unwrap();
         let stage_dir = publication.stage_dir.path().to_path_buf();
-        fs::create_dir(&publication.stage_file).unwrap();
+        fs::create_dir(publication.stage_dir.path().join(STAGED_OUTPUT_NAME)).unwrap();
         let encoded = encoded_test_jpeg();
 
         assert!(publication
@@ -682,7 +1144,7 @@ mod tests {
         ));
         let _ = fs::remove_dir_all(&directory);
         fs::create_dir(&directory).unwrap();
-        let publication = ImagePublication::acquire(&directory).unwrap();
+        let publication = acquire_publication(&directory).unwrap();
         let stage_dir = publication.stage_dir.path().to_path_buf();
 
         drop(publication);
@@ -700,12 +1162,26 @@ mod tests {
         ));
         let _ = fs::remove_dir_all(&directory);
         fs::create_dir(&directory).unwrap();
-        let mut publication = ImagePublication::acquire(&directory).unwrap();
+        let mut publication = acquire_publication(&directory).unwrap();
         let encoded = encoded_test_jpeg();
-        write_verified_jpeg_once(&publication.stage_file, &encoded).unwrap();
+        write_verified_jpeg_once(
+            &publication.stage_dir,
+            OsStr::new(STAGED_OUTPUT_NAME),
+            &encoded,
+        )
+        .unwrap();
         let output = publication.parent_dir.path().join("frame.pp.jpg");
-        fs::hard_link(&publication.stage_file, &output).unwrap();
-        verify_jpeg_file(&publication.stage_file, &encoded).unwrap();
+        fs::hard_link(
+            publication.stage_dir.path().join(STAGED_OUTPUT_NAME),
+            &output,
+        )
+        .unwrap();
+        verify_jpeg_file_at(
+            &publication.stage_dir,
+            OsStr::new(STAGED_OUTPUT_NAME),
+            &encoded,
+        )
+        .unwrap();
         publication.final_link_created = true;
         fs::remove_file(&output).unwrap();
         fs::write(&output, b"replacement-image").unwrap();
@@ -727,12 +1203,26 @@ mod tests {
         ));
         let _ = fs::remove_dir_all(&directory);
         fs::create_dir(&directory).unwrap();
-        let mut publication = ImagePublication::acquire(&directory).unwrap();
+        let mut publication = acquire_publication(&directory).unwrap();
         let encoded = encoded_test_jpeg();
-        write_verified_jpeg_once(&publication.stage_file, &encoded).unwrap();
+        write_verified_jpeg_once(
+            &publication.stage_dir,
+            OsStr::new(STAGED_OUTPUT_NAME),
+            &encoded,
+        )
+        .unwrap();
         let output = publication.parent_dir.path().join("frame.pp.jpg");
-        fs::hard_link(&publication.stage_file, &output).unwrap();
-        verify_jpeg_file(&publication.stage_file, &encoded).unwrap();
+        fs::hard_link(
+            publication.stage_dir.path().join(STAGED_OUTPUT_NAME),
+            &output,
+        )
+        .unwrap();
+        verify_jpeg_file_at(
+            &publication.stage_dir,
+            OsStr::new(STAGED_OUTPUT_NAME),
+            &encoded,
+        )
+        .unwrap();
         publication.final_link_created = true;
         let stage_dir = publication.stage_dir.path().to_path_buf();
 
@@ -754,7 +1244,7 @@ mod tests {
         let _ = fs::remove_dir_all(&directory);
         let _ = fs::remove_dir_all(&moved);
         fs::create_dir(&directory).unwrap();
-        let mut publication = ImagePublication::acquire(&directory).unwrap();
+        let mut publication = acquire_publication(&directory).unwrap();
         fs::rename(&directory, &moved).unwrap();
         fs::create_dir(&directory).unwrap();
         let replacement = directory.join("frame.pp.jpg");
@@ -785,7 +1275,7 @@ mod tests {
         fs::create_dir(&directory).unwrap();
         fs::set_permissions(&directory, fs::Permissions::from_mode(0o770)).unwrap();
 
-        let result = ImagePublication::acquire(&directory);
+        let result = acquire_publication(&directory);
 
         assert!(result.is_err());
         assert!(fs::read_dir(&directory).unwrap().next().is_none());
@@ -805,7 +1295,7 @@ mod tests {
         ));
         let _ = fs::remove_dir_all(&directory);
         fs::create_dir(&directory).unwrap();
-        let mut publication = ImagePublication::acquire(&directory).unwrap();
+        let mut publication = acquire_publication(&directory).unwrap();
         let stage_dir = publication.stage_dir.path().to_path_buf();
         fs::set_permissions(&directory, fs::Permissions::from_mode(0o770)).unwrap();
 
@@ -830,7 +1320,7 @@ mod tests {
         ));
         let _ = fs::remove_dir_all(&directory);
         fs::create_dir(&directory).unwrap();
-        let publication = ImagePublication::acquire(&directory).unwrap();
+        let publication = acquire_publication(&directory).unwrap();
         let stage_dir = publication.stage_dir.path().to_path_buf();
         let detached_stage = directory.join("detached-original-stage");
         fs::rename(&stage_dir, &detached_stage).unwrap();
@@ -857,7 +1347,7 @@ mod tests {
         ));
         let _ = fs::remove_dir_all(&directory);
         fs::create_dir(&directory).unwrap();
-        let publication = ImagePublication::acquire(&directory).unwrap();
+        let publication = acquire_publication(&directory).unwrap();
         let stage_dir = publication.stage_dir.path().to_path_buf();
         let detached_stage = directory.join("detached-original-stage");
         let victim = directory.join("victim");
@@ -887,7 +1377,7 @@ mod tests {
         ));
         let _ = fs::remove_dir_all(&directory);
         fs::create_dir(&directory).unwrap();
-        let mut publication = ImagePublication::acquire(&directory).unwrap();
+        let mut publication = acquire_publication(&directory).unwrap();
         let stage_dir = publication.stage_dir.path().to_path_buf();
         let unexpected = stage_dir.join("unexpected-content");
         fs::write(&unexpected, b"do-not-delete").unwrap();
@@ -915,7 +1405,7 @@ mod tests {
         let _ = fs::remove_dir_all(&directory);
         let _ = fs::remove_dir_all(&moved);
         fs::create_dir(&directory).unwrap();
-        let mut publication = ImagePublication::acquire(&directory).unwrap();
+        let mut publication = acquire_publication(&directory).unwrap();
         let stage_name = publication.stage_name.clone();
         publication.cleanup_started = true;
 

@@ -18,6 +18,7 @@ from typing import Any
 
 import numpy as np
 
+from ..common.numeric import validated_psd_covariance
 from .camera import (
     Camera,
     _admit_fixed_array,
@@ -84,41 +85,16 @@ def _readonly_array(array: np.ndarray) -> np.ndarray:
 
 def _validated_covariance(admitted: np.ndarray, name: str) -> np.ndarray:
     covariance = _copy_finite_array(admitted, name, maximum=None)
-    scale = max(1.0, float(np.max(np.abs(covariance))))
-    normalized = covariance / scale
-    if not np.allclose(normalized, normalized.T, rtol=1e-10, atol=1e-10):
-        raise ValueError(f"{name} must be symmetric")
-    covariance = 0.5 * covariance + 0.5 * covariance.T
-    if not np.isfinite(covariance).all():
-        raise ValueError(f"{name} exceeds the finite numeric range")
-    normalized = covariance / scale
-    try:
-        values, vectors = np.linalg.eigh(normalized)
-    except np.linalg.LinAlgError as exc:
-        raise ValueError(f"{name} eigendecomposition did not converge") from exc
-    if not np.isfinite(values).all() or not np.isfinite(vectors).all():
-        raise ValueError(f"{name} eigendecomposition is non-finite")
-    if float(values[0]) < -1e-10:
-        raise ValueError(f"{name} must be positive semidefinite")
-    if float(values[-1]) > np.finfo(np.float64).max / scale:
-        raise ValueError(f"{name} spectral magnitude exceeds the finite numeric range")
-    if values[0] < 0.0:
-        normalized = vectors @ np.diag(np.maximum(values, 0.0)) @ vectors.T
-        normalized = 0.5 * normalized + 0.5 * normalized.T
-        covariance = normalized * scale
-        if not np.isfinite(covariance).all():
-            raise ValueError(f"{name} repair exceeds the finite numeric range")
-    if float(np.trace(normalized)) <= 0.0:
-        raise ValueError(f"{name} must contain non-zero uncertainty")
+    covariance = validated_psd_covariance(covariance, name, require_nonzero=True)
     return _readonly_array(covariance)
 
 
 def _bounded_identity(value: str, name: str) -> str:
-    if not isinstance(value, str) or not value.strip():
+    if type(value) is not str or not value.strip():
         raise ValueError(f"{name} must be a non-empty string")
-    if any(ord(character) < 0x20 or ord(character) == 0x7F for character in value):
-        raise ValueError(f"{name} must not contain control characters")
     result = value.strip()
+    if not result.isprintable():
+        raise ValueError(f"{name} must contain only printable characters")
     try:
         encoded = result.encode("utf-8")
     except UnicodeEncodeError as exc:
@@ -338,7 +314,7 @@ class Detection3D:
 @dataclass(frozen=True, slots=True)
 class _Hypothesis:
     members: tuple[int, ...]
-    mask: int
+    ranks: frozenset[int]
     association_cost: float
     key: tuple[tuple[Any, ...], ...]
     detection: Detection3D
@@ -377,7 +353,7 @@ def _classes_compatible(first: str | None, second: str | None) -> bool:
 def _resolve_camera_ids(cameras: list[Camera], detections: list[Detection2D]) -> list[str]:
     configured_names: dict[str, int] = {}
     for index, camera in enumerate(cameras):
-        if not isinstance(camera, Camera):
+        if type(camera) is not Camera:
             raise TypeError("cameras must contain only Camera instances")
         if camera.name:
             previous = configured_names.setdefault(camera.name, index)
@@ -388,7 +364,7 @@ def _resolve_camera_ids(cameras: list[Camera], detections: list[Detection2D]) ->
     identity_to_index: dict[str, int] = {}
     index_to_identity: dict[int, str] = {}
     for detection in detections:
-        if not isinstance(detection, Detection2D):
+        if type(detection) is not Detection2D:
             raise TypeError("detections must contain only Detection2D instances")
         index = detection.camera_index
         if index >= len(cameras):
@@ -548,7 +524,11 @@ def _build_hypothesis(
     )
     return _Hypothesis(
         members=members,
-        mask=sum(1 << canonical_ranks[index] for index in members),
+        # A Python integer bitmask grows with the largest rank, not with the
+        # hypothesis cardinality. At the public 100k-detection bound that made
+        # even a two-view hypothesis carry a 100k-bit object. A frozenset stays
+        # proportional to the at-most-64 contributing cameras instead.
+        ranks=frozenset(canonical_ranks[index] for index in members),
         association_cost=association_cost,
         key=tuple(keys[index] for index in members),
         detection=detection,
@@ -654,9 +634,7 @@ def _select_multi_camera_hypotheses(
         return []
     ordered = sorted(hypotheses, key=lambda hypothesis: hypothesis.key)
     all_indices = tuple(range(len(ordered)))
-    stack: list[tuple[int, tuple[int, ...], int, int, tuple[int, ...]]] = [
-        (0, (), 0, 0, all_indices)
-    ]
+    stack: list[tuple[tuple[int, ...], int, int, tuple[int, ...]]] = [((), 0, 0, all_indices)]
     best_indices: tuple[int, ...] = ()
     best_cardinality = -1
     best_support = -1
@@ -665,11 +643,11 @@ def _select_multi_camera_hypotheses(
 
     while stack:
         budget.transition()
-        resolved, selected, cardinality, support, available = stack.pop()
-        available_mask = 0
+        selected, cardinality, support, available = stack.pop()
+        available_ranks: set[int] = set()
         for index in available:
-            budget.transition()
-            available_mask |= ordered[index].mask
+            budget.transition(len(ordered[index].ranks))
+            available_ranks.update(ordered[index].ranks)
         if not available:
             candidate_indices = tuple(sorted(selected))
             candidate_cost = math.fsum(
@@ -699,7 +677,7 @@ def _select_multi_camera_hypotheses(
                 best_key = candidate_key
             continue
 
-        remaining_count = available_mask.bit_count()
+        remaining_count = len(available_ranks)
         if cardinality + remaining_count < best_cardinality:
             continue
         if (
@@ -708,18 +686,18 @@ def _select_multi_camera_hypotheses(
         ):
             continue
 
-        pivot = available_mask & -available_mask
+        pivot = min(available_ranks)
         containing: list[int] = []
         without_pivot: list[int] = []
         for index in available:
             budget.transition()
-            if ordered[index].mask & pivot:
+            if pivot in ordered[index].ranks:
                 containing.append(index)
             else:
                 without_pivot.append(index)
         # The skip branch is pushed first so the strongest select branch is
         # explored first and establishes useful exact branch-and-bound limits.
-        stack.append((resolved | pivot, selected, cardinality, support, tuple(without_pivot)))
+        stack.append((selected, cardinality, support, tuple(without_pivot)))
         choices = sorted(
             containing,
             key=lambda index: (
@@ -733,12 +711,11 @@ def _select_multi_camera_hypotheses(
             hypothesis = ordered[index]
             compatible: list[int] = []
             for other in available:
-                budget.transition()
-                if other != index and not (ordered[other].mask & hypothesis.mask):
+                budget.transition(min(len(ordered[other].ranks), len(hypothesis.ranks)))
+                if other != index and ordered[other].ranks.isdisjoint(hypothesis.ranks):
                     compatible.append(other)
             stack.append(
                 (
-                    resolved | hypothesis.mask,
                     (*selected, index),
                     cardinality + hypothesis.cardinality,
                     support + hypothesis.support,
@@ -990,12 +967,14 @@ def correlate_and_triangulate(
 def to_measurements(detections: Sequence[Detection3D], timestamp: float | None = None) -> list[Any]:
     """Convert uncertainty-aware 3D detections into visual fusion measurements.
 
-    Per-detection covariance is preserved. An explicit cycle timestamp may move
-    the reference away from ``latest_capture``; the covariance is then inflated
-    by the stored speed bound and absolute time offset. For an untimestamped
-    moving-target detection, the explicit timestamp is the acknowledged shared
-    capture time. For a declared static detection it is the external batch
-    reference. It is required in both cases.
+    Per-detection covariance is preserved. Temporal uncertainty is conservatively
+    mapped to isotropic position variance through the stored speed bound. An
+    explicit cycle timestamp may additionally move the reference away from
+    ``latest_capture``; the worst-case temporal radius is then the stored
+    uncertainty plus the absolute offset. For an untimestamped moving-target
+    detection, the explicit timestamp is the acknowledged shared capture time.
+    For a declared static detection it is the external batch reference. It is
+    required in both cases.
     """
 
     from manwe.fusion.tracker import Measurement
@@ -1004,7 +983,7 @@ def to_measurements(detections: Sequence[Detection3D], timestamp: float | None =
         raise TypeError("detections must contain only Detection3D instances")
     if len(detections) > _MAX_DETECTIONS:
         raise ValueError(f"detections must contain at most {_MAX_DETECTIONS} entries")
-    if any(not isinstance(detection, Detection3D) for detection in detections):
+    if any(type(detection) is not Detection3D for detection in detections):
         raise TypeError("detections must contain only Detection3D instances")
     if timestamp is not None:
         timestamp = _finite_scalar(timestamp, "timestamp", maximum=_MAX_TIMESTAMP_MAGNITUDE)
@@ -1014,11 +993,14 @@ def to_measurements(detections: Sequence[Detection3D], timestamp: float | None =
         if measurement_timestamp is None:
             raise ValueError("timestamp is required when a detection has no capture timestamp")
         covariance = np.array(detection.position_covariance, copy=True)
+        temporal_radius = detection.time_uncertainty_s
         if timestamp is not None and detection.timestamp is not None:
             offset = abs(timestamp - detection.timestamp)
             if offset > _MAX_TIME_SKEW_S:
                 raise ValueError("timestamp override exceeds the supported temporal offset")
-            motion_std = detection.motion_speed_bound_mps * offset
+            temporal_radius += offset
+        if temporal_radius > 0.0 and detection.motion_speed_bound_mps > 0.0:
+            motion_std = detection.motion_speed_bound_mps * temporal_radius
             covariance += np.eye(3) * motion_std**2
         measurements.append(
             Measurement(

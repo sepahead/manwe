@@ -7,6 +7,7 @@ manwe synth OUT         generate an offline synthetic detection dataset
 manwe fusion-sim        run a synthetic multi-sensor scenario across filters
 manwe vision-train CFG  train a detector architecture from scratch (needs an extra)
 manwe export W -f onnx  produce one provenance-bound raw artifact   (needs [export])
+manwe contract FILE     validate/inspect a schema-2 model sidecar and artifact
 """
 
 from __future__ import annotations
@@ -83,13 +84,41 @@ def _sha256(value: str) -> str:
 
 def _cmd_doctor(_args) -> int:
     from .common.device import describe_hardware, resolve_device
+    from .common.ultralytics import harden_ultralytics_runtime, verify_ultralytics_policy
+    from .vision.models import _harden_rfdetr_runtime, _verify_rfdetr_policy
 
-    hw = describe_hardware()
-    resolved_device = resolve_device("auto")
-    torch_probe_failed = hw.get("torch_error") is not None or resolved_device.name in {
-        "torch failed to load",
-        "torch hardware probe failed",
-    }
+    # Importing Ultralytics is itself a process-wide operation: upstream may
+    # otherwise enable downloads, analytics, or settings persistence while a
+    # diagnostic command is merely checking whether the extra is installed.
+    # Establish Manwe's offline policy before *any* optional runtime probe.
+    ultralytics_policy_error: Exception | None = None
+    try:
+        harden_ultralytics_runtime()
+    except Exception as error:
+        # A diagnostic must remain useful when an already-imported optional
+        # runtime is precisely what is broken. Do not probe Ultralytics again in
+        # this state: its process-wide offline policy was not established.
+        ultralytics_policy_error = error
+
+    hardware_error: Exception | None = None
+    try:
+        hw = describe_hardware()
+    except Exception as error:
+        hardware_error = error
+        hw = {"hardware_error": f"{type(error).__name__}: {error}"}
+    try:
+        resolved_device = str(resolve_device("auto"))
+    except Exception as error:
+        hardware_error = hardware_error or error
+        resolved_device = f"unavailable ({type(error).__name__}: {error})"
+    torch_probe_failed = (
+        hardware_error is not None
+        or hw.get("torch_error") is not None
+        or any(
+            marker in resolved_device
+            for marker in ("torch failed to load", "torch hardware probe failed")
+        )
+    )
     print(f"manwe {__version__}")
     print(json.dumps(hw, indent=2))
     print(f"resolved device: {resolved_device}")
@@ -102,13 +131,34 @@ def _cmd_doctor(_args) -> int:
         ("onnxruntime", "export"),
         ("coremltools", "export"),
     ]:
+        if mod == "ultralytics" and ultralytics_policy_error is not None:
+            status = "✗ installed but failed the offline safety policy"
+            print(f"  {mod:14s} {status}")
+            continue
         try:
+            if mod == "rfdetr":
+                _harden_rfdetr_runtime()
             __import__(mod)
-            status = (
-                "✗ installed but failed to load (native-library error)"
-                if mod == "torch" and torch_probe_failed
-                else "✓ installed"
-            )
+            if mod == "ultralytics":
+                try:
+                    verify_ultralytics_policy()
+                except (ImportError, OSError, RuntimeError):
+                    status = "✗ installed but failed the offline safety policy"
+                else:
+                    status = "✓ installed (offline safety policy verified)"
+            elif mod == "rfdetr":
+                try:
+                    _verify_rfdetr_policy()
+                except (ImportError, OSError, RuntimeError):
+                    status = "✗ installed but failed the offline safety policy"
+                else:
+                    status = "✓ installed (offline safety policy verified)"
+            else:
+                status = (
+                    "✗ installed but failed to load (native-library error)"
+                    if mod == "torch" and torch_probe_failed
+                    else "✓ installed"
+                )
         except ImportError:
             status = (
                 f"— missing (local extra manwe-perception[{extra}]: "
@@ -116,6 +166,8 @@ def _cmd_doctor(_args) -> int:
             )
         except OSError:
             status = "✗ installed but failed to load (native-library error)"
+        except Exception:
+            status = "✗ installed but failed to load (runtime error)"
         print(f"  {mod:14s} {status}")
     return 0
 
@@ -171,6 +223,8 @@ def _cmd_synth(args) -> int:
 def _cmd_fusion_sim(args) -> int:
     from .fusion import MultiSensorTracker, TrackerConfig, make_scenario, score_tracker
 
+    if len(set(args.filters)) != len(args.filters):
+        raise _CLIUsageError("filters must not contain duplicates")
     if len(set(args.modalities)) != len(args.modalities):
         raise _CLIUsageError("modalities must not contain duplicates")
     try:
@@ -258,7 +312,7 @@ def _cmd_export(args) -> int:
             int8=args.int8,
             data=args.data,
             device=args.device,
-            nms=args.nms,
+            nms=False,
             opset=args.opset,
         )
     except (
@@ -273,6 +327,53 @@ def _cmd_export(args) -> int:
     print(f"  {receipt.format:10s} → {receipt.artifact_path}")
     print(f"  SHA-256   → {receipt.artifact_sha256}")
     print("  tensor signature remains unverified; build it from backend inspection")
+    return 0
+
+
+def _cmd_contract(args) -> int:
+    from .common.contracts import ModelContract
+
+    try:
+        contract = ModelContract.load(
+            args.path,
+            verify_artifact=not args.no_verify_artifact,
+        )
+    except (
+        TypeError,
+        ValueError,
+        OSError,
+        RuntimeError,
+    ) as error:
+        _usage_error(error)
+    if args.json:
+        print(contract.to_json(indent=2))
+        return 0
+
+    runtime = contract.runtime
+    if runtime is None:  # unreachable after schema validation; keeps the output total.
+        raise RuntimeError("validated contract has no runtime specification")
+    verification = "not requested" if args.no_verify_artifact else "verified"
+    print(f"model:    {contract.model_name} {contract.model_version}")
+    print(f"backend:  {contract.backend} ({runtime.adapter})")
+    print(f"artifact: {contract.file_path} [{verification}]")
+    print(f"sha256:   {contract.file_sha256.lower()}")
+    print(
+        f"input:    {runtime.input.width}x{runtime.input.height} "
+        f"{runtime.input.layout} {runtime.input.dtype}; "
+        f"{runtime.input.interpolation}; align={runtime.input.alignment}"
+    )
+    keypoint_policy = ""
+    if runtime.output.keypoint_confidence_threshold is not None:
+        keypoint_policy = (
+            f"; keypoints={len(runtime.keypoint_names)}"
+            f">={runtime.output.keypoint_confidence_threshold:g}"
+        )
+    print(
+        f"output:   {contract.outputs[0].shape}; {contract.num_classes} classes; "
+        f"conf>{runtime.output.confidence_threshold:g}; "
+        f"iou={runtime.output.iou_threshold:g}; max={runtime.output.max_detections}"
+        f"{keypoint_policy}"
+    )
     return 0
 
 
@@ -385,13 +486,29 @@ def build_parser() -> argparse.ArgumentParser:
         default=17,
         help="pinned ONNX opset (ONNX/TensorRT)",
     )
-    ex.add_argument("--nms", action="store_true", help="embed NMS when the backend supports it")
     ex.add_argument(
         "--allow-unverified",
         action="store_true",
         help="acknowledge that export alone does not satisfy a consumer contract",
     )
     ex.set_defaults(func=_cmd_export)
+
+    contract = sub.add_parser(
+        "contract",
+        help="validate and inspect a schema-2 model contract",
+    )
+    contract.add_argument("path", help="model contract JSON sidecar")
+    contract.add_argument(
+        "--no-verify-artifact",
+        action="store_true",
+        help="validate metadata only; do not verify the sibling artifact",
+    )
+    contract.add_argument(
+        "--json",
+        action="store_true",
+        help="print canonical validated JSON instead of a summary",
+    )
+    contract.set_defaults(func=_cmd_contract)
 
     return p
 

@@ -27,11 +27,12 @@ from ..common.artifacts import (
     DEFAULT_MAX_ARTIFACT_ENTRIES,
     ArtifactSnapshot,
     _copy_directory_fd,
+    normalize_sha256,
     require_pickle_acknowledgement,
     sha256_artifact,
     sha256_artifact_at,
 )
-from ..common.config_io import open_directory_nofollow
+from ..common.config_io import open_directory_nofollow, require_safe_publication_directory
 from ..common.dataset_manifest import snapshot_local_calibration_dataset
 from ..common.deps import require
 from ..common.fd_io import attach_cleanup_failure, owned_binary_writer
@@ -48,7 +49,6 @@ _MAX_MODEL_STRIDES = 64
 _MAX_MODEL_STRIDE_NODES = 128
 _LINUX_RENAME_NOREPLACE = 1
 _DARWIN_RENAME_EXCL = 0x00000004
-_DARWIN_ACL_TYPE_EXTENDED = 0x00000100
 _STAGE_NAME_ATTEMPTS = 16
 _STAGE_TOKEN_BYTES = 24
 
@@ -311,9 +311,14 @@ def _checkpoint_max_stride(value: object) -> int:
 @dataclass(frozen=True)
 class FormatSpec:
     ultralytics: str | None  # ultralytics export `format=` value, or None
-    crebain_backend: str
+    contract_backend: str
     ext: str
     notes: str
+
+    @property
+    def crebain_backend(self) -> str:
+        """Pre-2.0 compatibility alias for :attr:`contract_backend`."""
+        return self.contract_backend
 
 
 @dataclass(frozen=True)
@@ -463,7 +468,7 @@ def _checkpoint_input_channels(model_graph: object) -> int:
     return channels
 
 
-#: manwe format name → how to produce it + crebain backend + gotchas from research.
+#: Manwe format name → producer, contract backend, and reviewed constraints.
 EXPORT_FORMATS: dict[str, FormatSpec] = {
     "onnx": FormatSpec("onnx", "onnx", ".onnx", "pin opset, run onnxslim, keep NMS external"),
     "tensorrt": FormatSpec(
@@ -482,54 +487,6 @@ EXPORT_FORMATS: dict[str, FormatSpec] = {
 }
 
 
-def _assert_no_darwin_extended_acl(parent_fd: int, path: Path) -> None:
-    """Reject macOS ACLs whose delete rights are not proven by mode bits."""
-    if sys.platform != "darwin":
-        return
-    try:
-        libc = ctypes.CDLL(None, use_errno=True)
-        acl_get_fd_np = libc.acl_get_fd_np
-        acl_free = libc.acl_free
-    except (AttributeError, OSError) as exc:
-        raise RuntimeError(f"output parent ACL policy could not be inspected: {path}") from exc
-    acl_get_fd_np.argtypes = [ctypes.c_int, ctypes.c_int]
-    acl_get_fd_np.restype = ctypes.c_void_p
-    acl_free.argtypes = [ctypes.c_void_p]
-    acl_free.restype = ctypes.c_int
-    ctypes.set_errno(0)
-    acl = acl_get_fd_np(parent_fd, _DARWIN_ACL_TYPE_EXTENDED)
-    if not acl:
-        error_number = ctypes.get_errno()
-        no_acl_errors = {
-            errno.ENOENT,
-            getattr(errno, "ENOTSUP", errno.ENOENT),
-            getattr(errno, "EOPNOTSUPP", errno.ENOENT),
-        }
-        if error_number in no_acl_errors:
-            return
-        operation_error = OSError(
-            error_number,
-            os.strerror(error_number) if error_number > 0 else "unknown ACL inspection error",
-            str(path),
-        )
-        raise RuntimeError(
-            f"output parent ACL policy could not be inspected: {path}"
-        ) from operation_error
-
-    rejection = PermissionError(
-        f"output parent has an extended ACL that prevents a mode-bit trust proof: {path}"
-    )
-    ctypes.set_errno(0)
-    if acl_free(acl) != 0:
-        error_number = ctypes.get_errno()
-        cleanup = OSError(
-            error_number,
-            os.strerror(error_number) if error_number > 0 else "unknown ACL cleanup error",
-        )
-        attach_cleanup_failure(rejection, cleanup, "output parent ACL cleanup failed")
-    raise rejection
-
-
 def _assert_publication_parent_trust(
     parent_fd: int,
     metadata: os.stat_result,
@@ -542,21 +499,7 @@ def _assert_publication_parent_trust(
     effective UID, and a privileged process, remain outside what pathname-based
     POSIX publication can defend against.
     """
-    if not stat.S_ISDIR(metadata.st_mode):
-        raise RuntimeError(f"output parent is not a directory: {path}")
-    _assert_no_darwin_extended_acl(parent_fd, path)
-    shared_write = metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
-    if not shared_write:
-        return
-    if not (metadata.st_mode & stat.S_ISVTX):
-        raise PermissionError(
-            f"output parent is group/other-writable without sticky-directory protection: {path}"
-        )
-    effective_uid = os.geteuid()
-    if metadata.st_uid not in {0, effective_uid}:
-        raise PermissionError(
-            f"shared sticky output parent must be owned by the effective user or root: {path}"
-        )
+    require_safe_publication_directory(parent_fd, metadata, path, "output parent")
 
 
 @dataclass
@@ -840,7 +783,12 @@ def _publish_exclusive(source: Path, destination: Path | _PreparedDestination, d
     recovery_reported = False
     try:
         anchor.assert_parent_path()
-        with ArtifactSnapshot(source, digest, allowed_suffixes={source.suffix.lower()}) as snapshot:
+        with ArtifactSnapshot(
+            source,
+            digest,
+            allowed_suffixes={source.suffix.lower()},
+            expect_directory=source.suffix.lower() == ".mlpackage",
+        ) as snapshot:
             if snapshot.path.suffix.lower() != anchor.path.suffix.lower():
                 raise ValueError(
                     "output suffix must match the exact artifact type returned by the exporter"
@@ -966,11 +914,34 @@ def _publish_exclusive(source: Path, destination: Path | _PreparedDestination, d
                 if _entry_identity_at(anchor.parent_fd, stage_name) != stage_identity:
                     raise RuntimeError("export stage was replaced before atomic publication")
                 rename_attempted = True
-                _rename_noreplace_at(
-                    anchor.parent_fd,
-                    stage_name,
-                    anchor.path.name,
-                )
+                try:
+                    _rename_noreplace_at(
+                        anchor.parent_fd,
+                        stage_name,
+                        anchor.path.name,
+                    )
+                except OSError as rename_error:
+                    # NFS can commit a rename and lose the success reply. The
+                    # move is conclusive when the private source name vanished
+                    # and the final name now identifies the exact staged inode;
+                    # continue the ordinary authentication and durability path
+                    # instead of reporting a false failure.
+                    try:
+                        source_after_error = _entry_identity_at(anchor.parent_fd, stage_name)
+                        destination_after_error = _entry_identity_at(
+                            anchor.parent_fd, anchor.path.name
+                        )
+                    except OSError as inspection_error:
+                        attach_cleanup_failure(
+                            rename_error,
+                            inspection_error,
+                            "exclusive rename outcome inspection failed",
+                        )
+                        raise rename_error from inspection_error
+                    if not (
+                        source_after_error is None and destination_after_error == stage_identity
+                    ):
+                        raise
                 rename_returned = True
                 if _entry_identity_at(anchor.parent_fd, stage_name) is not None:
                     raise RuntimeError(
@@ -1052,7 +1023,7 @@ def export_model(
     One target per call makes failure and artifact ownership unambiguous. All
     static arguments are validated before Torch/Ultralytics or the model loads.
     """
-    if not isinstance(formats, list) or any(not isinstance(value, str) for value in formats):
+    if type(formats) is not list or any(type(value) is not str for value in formats):
         raise TypeError("formats must be a list containing one format name")
     if len(formats) != 1:
         raise ValueError("export exactly one format per call")
@@ -1065,22 +1036,32 @@ def export_model(
             f"conversion is not implemented for {unsupported}; produce those artifacts with "
             "their native toolchain, then build and validate a Manwe model contract"
         )
-    if not isinstance(weights, str) or not weights.strip():
+    if type(weights) is not str or not weights.strip():
         raise TypeError("weights must be a nonempty path string")
     if type(allow_pickle_checkpoint) is not bool:
         raise TypeError("allow_pickle_checkpoint must be a boolean")
+    weights_sha256 = normalize_sha256(weights_sha256)
     require_pickle_acknowledgement(Path(weights), allow_pickle_checkpoint)
     if type(imgsz) is not int or not 32 <= imgsz <= 4096:
         raise ValueError("imgsz must be an integer in [32, 4096]")
     for value, name in ((half, "half"), (int8, "int8"), (nms, "nms")):
         if type(value) is not bool:
             raise TypeError(f"{name} must be a boolean")
+    if nms:
+        raise ValueError(
+            "embedded NMS is not supported by Manwe model contracts; export raw tensors "
+            "and bind the reviewed postprocessing policy in the consumer contract"
+        )
     if half and int8:
         raise ValueError("half and int8 are mutually exclusive export modes")
     if type(opset) is not int or not 12 <= opset <= 20:
         raise ValueError("opset must be an integer in [12, 20]")
-    if not isinstance(device, str):
+    if type(device) is not str:
         raise TypeError("device must be a string")
+    if type(output) is not str or not output.strip():
+        raise TypeError("output must be a nonempty path string")
+    if data is not None and (type(data) is not str or not data.strip()):
+        raise TypeError("data must be a nonempty path string or None")
 
     export_format = formats[0]
     spec = EXPORT_FORMATS[export_format]
@@ -1104,7 +1085,8 @@ def export_model(
             raise RuntimeError("TensorRT export requires an available CUDA device")
         dev = resolve_ultralytics_device(resolved_device)
         if int8:
-            assert data is not None
+            if data is None:
+                raise RuntimeError("TensorRT INT8 calibration data was not initialized")
             tensorrt_version, modelopt_version = _preflight_tensorrt_int8(resolved_device.index)
             calibration_snapshot = snapshot_local_calibration_dataset(
                 data,
@@ -1114,7 +1096,12 @@ def export_model(
             )
 
         destination = _prepare_destination(output, output_suffixes)
-        weights_snapshot = ArtifactSnapshot(weights, weights_sha256, allowed_suffixes={".pt"})
+        weights_snapshot = ArtifactSnapshot(
+            weights,
+            weights_sha256,
+            allowed_suffixes={".pt"},
+            expect_directory=False,
+        )
         calibration_sha256 = (
             calibration_snapshot.sha256 if calibration_snapshot is not None else None
         )
@@ -1123,10 +1110,9 @@ def export_model(
         ultralytics = require("ultralytics", "export")
         verify_ultralytics_policy()
         model = ultralytics.YOLO(str(weights_snapshot.path))
-        if getattr(model, "task", None) != "detect":
-            raise ValueError(
-                f"checkpoint task must be 'detect', got {getattr(model, 'task', None)!r}"
-            )
+        task = getattr(model, "task", None)
+        if type(task) is not str or task != "detect":
+            raise ValueError(f"checkpoint task must be 'detect', got {task!r}")
         model_graph = getattr(model, "model", None)
         end_to_end = getattr(model_graph, "end2end", None)
         if type(end_to_end) is not bool:
@@ -1154,12 +1140,13 @@ def export_model(
             "imgsz": imgsz,
             "half": half,
             "device": dev,
-            "nms": nms,
+            "nms": False,
         }
         if export_format in {"onnx", "tensorrt"}:
             kwargs["opset"] = opset
         if int8:
-            assert calibration_snapshot is not None
+            if calibration_snapshot is None:
+                raise RuntimeError("TensorRT INT8 calibration snapshot was not initialized")
             kwargs["int8"] = True
             kwargs["data"] = str(calibration_snapshot.path)
             kwargs["batch"] = 1
@@ -1191,8 +1178,10 @@ def export_model(
                 f"{sorted(output_suffixes)}"
             )
         artifact_sha256 = sha256_artifact(produced)
-        _publish_exclusive(produced, destination, artifact_sha256)
         precision = "int8" if int8 else "float16" if half else "float32"
+        # Complete every fallible receipt invariant before the no-replace rename.
+        # Once publication starts, failure must mean a publication/recovery state,
+        # never a metadata error that could have been rejected beforehand.
         receipt = ExportReceipt(
             format=export_format,
             artifact_path=str(destination.path),
@@ -1208,6 +1197,7 @@ def export_model(
             end_to_end=False,
             calibration_manifest_sha256=calibration_sha256,
         )
+        _publish_exclusive(produced, destination, artifact_sha256)
     except BaseException as error:
         for resource, label in (
             (weights_snapshot, "weights snapshot cleanup failed"),

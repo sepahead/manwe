@@ -1,8 +1,9 @@
 use candle::{DType, IndexOp, Result, Tensor, D};
 use candle_nn::{batch_norm, conv2d, conv2d_no_bias, Conv2d, Conv2dConfig, Module, VarBuilder};
 
+use crate::{MAX_INFERENCE_DIMENSION, MAX_NATIVE_MODEL_CLASSES};
+
 const MAX_MODEL_BATCH_SIZE: usize = 64;
-const MAX_MODEL_INPUT_DIMENSION: usize = 4_096;
 const MAX_MODEL_BATCH_PIXELS: usize = 32 * 1024 * 1024;
 const MODEL_INPUT_ALIGNMENT: usize = 32;
 const POSE_KEYPOINT_SHAPE: (usize, usize) = (17, 3);
@@ -579,8 +580,8 @@ struct DetectionHeadOut {
 }
 
 fn validate_class_count(count: usize) -> Result<()> {
-    if !(1..=1_000).contains(&count) {
-        candle::bail!("class count must be between 1 and 1000")
+    if !(1..=MAX_NATIVE_MODEL_CLASSES).contains(&count) {
+        candle::bail!("class count must be between 1 and {MAX_NATIVE_MODEL_CLASSES}")
     }
     Ok(())
 }
@@ -612,8 +613,8 @@ fn validate_model_input_shape(
     if height == 0 || width == 0 {
         candle::bail!("model input dimensions must be non-zero")
     }
-    if height > MAX_MODEL_INPUT_DIMENSION || width > MAX_MODEL_INPUT_DIMENSION {
-        candle::bail!("model input dimensions must not exceed {MAX_MODEL_INPUT_DIMENSION}")
+    if height > MAX_INFERENCE_DIMENSION || width > MAX_INFERENCE_DIMENSION {
+        candle::bail!("model input dimensions must not exceed {MAX_INFERENCE_DIMENSION}")
     }
     if !height.is_multiple_of(MODEL_INPUT_ALIGNMENT) || !width.is_multiple_of(MODEL_INPUT_ALIGNMENT)
     {
@@ -740,7 +741,7 @@ impl DetectionHead {
 
 impl PoseHead {
     // kpt: keypoints, (17, 3)
-    // nc: num-classes, 80
+    // nc: source-class count (the reviewed native pose adapter requires one)
     fn load(
         vb: VarBuilder,
         nc: usize,

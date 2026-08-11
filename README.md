@@ -45,9 +45,14 @@ airspace situational awareness.
   installed separately.
 - **Explicit device selection.** Python helpers can select CUDA, MPS, or CPU;
   actual operator coverage and numerical parity still have to be checked per path.
-- **A candidate contract is code.** `manwe.common.contracts` validates a model
-  manifest, artifact digest, tensor descriptions, and the five-class taxonomy. A
-  valid manifest does not make an artifact compatible with a consumer by itself.
+- **One native model authority.** Schema-2 contracts bind artifact bytes, tensor
+  interface, preprocessing, source taxonomy, optional airspace mapping, and
+  postprocessing. The Rust CLI and viewer consume that contract through one
+  shared runtime; downstream systems still need their own adapters.
+- **Admission is not consumption.** Dataset YAML is validated when accepted, then
+  revalidated and copied into a private read-only snapshot for training. A mutable
+  caller path is never handed to a long-running backend merely because it passed
+  an earlier check.
 - **Promotion requires evidence.** The repo contains AP50/AP50-small,
   deployed-threshold precision/recall/FPPI and direct export-agreement gates, plus
   OSPA/GOSPA and latency tools. Consumer fixtures and operational tests remain
@@ -57,7 +62,7 @@ airspace situational awareness.
 
 | Pillar | What it does | Runnable today |
 |--------|--------------|----------------|
-| **vision** | Detector registry, from-scratch architecture training, sliced inference, postprocess and class mapping | Ultralytics training is runnable with `[vision]`; `[rfdetr]` pins RF-DETR 1.8.3 for construction/inference and a contract-checked training argument mapping, but local-checkpoint fine-tuning is not implemented |
+| **vision** | Detector registry, from-scratch architecture training, direct/sliced inference, postprocess and class mapping | Ultralytics training is runnable with `[vision]`; checkpoint inference returns owned immutable Manwe detections; `[rfdetr]` pins RF-DETR 1.8.3 for construction/inference and a contract-checked training argument mapping, but local-checkpoint fine-tuning is not implemented |
 | **audio** | Microphone-array direction-of-arrival (GCC-PHAT / SRP-PHAT), log-mel/SPL features, acoustic→fusion bridge | ✅ pure numpy |
 | **multicam** | Pinhole calibration, N-view DLT / midpoint triangulation, cross-camera correlation | ✅ pure numpy |
 | **fusion** | KF / EKF / UKF / PF / IMM, Mahalanobis gating, M-of-N track lifecycle, OSPA/GOSPA, synthetic scenarios | ✅ pure numpy |
@@ -94,6 +99,9 @@ Set accumulation with `extra.grad_accum_steps`; Manwe rejects the legacy
 `extra.gradient_accumulation_steps` name because RF-DETR 1.8.3 silently ignores it.
 CI checks the installed API and Manwe's argument mapping. It does not execute or
 qualify an RF-DETR training run or the separately curated training environment.
+Training output directories remain backend-owned working state, not Manwe's durable
+publication boundary. Treat generated checkpoints as candidates, move the exact
+chosen file into controlled storage, and record its SHA-256 before export or use.
 
 The `manwe` CLI:
 
@@ -109,18 +117,26 @@ uv run --locked --no-sync -- .venv/bin/manwe vision-train \
 uv run --locked --no-sync -- .venv/bin/manwe export /abs/best.pt -f onnx \
   --weights-sha256 <64-hex> --allow-pickle-checkpoint \
   --output /abs/candidate.onnx --allow-unverified
+uv run --locked --no-sync -- .venv/bin/manwe contract \
+  /abs/candidate.contract.json  # validate schema + sibling digest
 ```
 
-The example YAML files are repository fixtures, not wheel package data; this quick
-start assumes a checkout. A wheel user must supply an equivalent local config and
-dataset manifest explicitly.
+The example YAML files are source-checkout/sdist fixtures, not wheel package data;
+this quick start assumes one of those source trees. A wheel user must supply an
+equivalent local config and dataset manifest explicitly. The contract command
+assumes the sidecar has already been built from the raw receipt plus separately
+inspected tensor/runtime evidence;
+`manwe export` does not create or attest that sidecar.
 
 Both acknowledgements are intentional. `--allow-pickle-checkpoint` confirms that
 the exact digest-bound `.pt` origin is trusted even under restricted loading;
 `--allow-unverified` confirms that successful conversion is not a consumer handoff
 or fidelity result. The exporter works in a private snapshot and refuses to
-replace an existing destination. TensorRT INT8 calibration likewise uses a bounded
-read-only private dataset snapshot. Only the manifest's `val` images count: every
+replace an existing destination. Its existing destination parent must be a
+mode/ACL-inspectable publication boundary; a shared writable parent is accepted
+only when sticky and owned by the effective account or root. Contract sidecars
+apply the same parent policy before staging. TensorRT INT8 calibration likewise
+uses a bounded read-only private dataset snapshot. Only the manifest's `val` images count: every
 candidate must have matching suffix/content, identity EXIF orientation, bounded
 encoded/decoded size, and decode as 3-channel `uint8`; images that collapse to the
 same resized/letterboxed backend tensor are rejected. A hash-ranked 512-image
@@ -135,11 +151,22 @@ TensorRT version/route, loader policy, `imgsz`, normalized manifest, validated
 inventory, and exact copied tree; both the caller-visible manifest file and its
 declared source tree are pinned and rechecked through descriptor-relative POSIX
 I/O before publication. Dataset roots and splits must be absolute or descendant-
-relative, with nonempty `train` and `val` selections. Every selected split tree is
+relative, with nonempty `train` and `val` path selections. Every selected split tree is
 descriptor-inventoried under aggregate entry and byte limits: traversal rejects
 `..`, nested symlinks, and special entries, while regular-file identities must be
 unique both within and across splits. Opposite-order aggregate inventories reject
-changes during admission.
+changes during admission. Ordinary training repeats that complete admission check
+at consumption time, validates split identities against the exact descriptor
+inventory used by its copier, proves that inventory stayed stable, and passes
+Ultralytics a private read-only tree plus a normalized private manifest. Before
+backend construction, every backend-visible image is authenticated as a
+single-frame, identity-orientation still image with bounded encoded size and real
+decoded dimensions; formats recognized by the pinned backend but outside this
+reviewed decoder boundary fail closed. Ultralytics label paths mirror its pinned
+mapping; present labels must be stable, bounded UTF-8 five-column detection files
+with finite classes and normalized positive boxes contained by the image, and two images may not alias
+one label. RF-DETR receives an equivalent bounded private directory copy, and its
+COCO dimensions and boxes are checked against the actual image headers.
 These checks prove availability and byte/tensor uniqueness, not target-domain
 representativeness or per-layer INT8 execution. `precision="int8"` records the
 requested mixed-precision route; engine-inspector and fidelity evidence remain
@@ -148,10 +175,11 @@ promotion requirements. TensorRT 11 preflights locally installed
 image sizes whose conservative 10× tensor-materialization estimate exceeds
 8 GiB. The ModelOpt version and TensorRT route are not yet explicit receipt
 fields, so independent reconstruction still needs the build environment record.
-This is not an operating-system filesystem snapshot: mutation after a source
-path's final admission check, privileged mount changes, SHA-256 collisions, and
-malicious same-UID mutation of the process-owned private loader tree during
-backend reads require an isolated build worker or stronger OS containment.
+Admission alone is not an operating-system filesystem snapshot, which is why
+training and calibration revalidate and copy before backend use. Privileged mount
+changes, SHA-256 collisions, and malicious same-UID mutation of the process-owned
+private loader tree still require an isolated build worker or stronger OS
+containment.
 
 `uv run --locked --no-sync -- .venv/bin/manwe fusion-sim` on the default
 3-target, 3-sensor (visual + radar + acoustic)
@@ -175,22 +203,50 @@ defaults and seed, not real-world accuracy or a comparison with another tracker.
 cargo build --release --locked                         # CPU
 cargo build --release --locked --features metal       # Apple Metal
 cargo build --release --locked --features cuda        # NVIDIA CUDA (not yet CI-validated)
-./target/release/manwe --model path/to/yolov8s.safetensors --model-sha256 <64-hex> --which s path/to/image.jpg
-./target/release/manwe --model path/to/yolov8s-pose.safetensors --model-sha256 <64-hex> --which s --task pose path/to/image.jpg
+
+# The schema-2 JSON and its declared .safetensors artifact must be siblings.
+./target/release/manwe --contract path/to/model.contract.json path/to/image.jpg
+./target/release/manwe --contract path/to/pose.contract.json path/to/image.jpg
+# Keep untrusted/read-only inputs separate from owner-controlled publication:
+./target/release/manwe --contract path/to/model.contract.json \
+  --output-dir path/to/annotated path/to/image.jpg
 
 # Experimental macOS camera viewer (adds Bevy; not a cross-platform alpha API)
 cargo build --release --locked --features viewer,metal --bin camera_view
-# camera_view also requires --model and --model-sha256 (or matching MANWE_* variables)
+./target/release/camera_view --contract path/to/model.contract.json \
+  --url rtsp://camera.example/live
 ```
 
-These commands require the repository's exact Candle YOLOv8 key/shape convention;
+The contract is the sole authority for artifact digest, graph variant, task,
+classes, input/output tensors, image transform, thresholds, NMS, and result bound.
+`python/src/manwe/schemas/model-contract-v2.candle-detect.example.json` is a
+packaged, non-executable template with placeholder digests and evidence. These
+commands still require the repository's exact Candle YOLOv8 key/shape convention;
 a generic `.safetensors` extension or an Ultralytics checkpoint is insufficient.
-No checked-in converter currently produces that graph, so treat the commands as a
-reference runtime until a pinned artifact manifest and golden forward fixture are
-available. Neither accelerator path is a downstream deployment adapter.
+No checked-in converter currently produces that graph, so treat this as a
+reference runtime until a pinned real artifact and golden forward fixture exist.
+
+The batch CLI writes one tagged JSON result per input after no-replace publication
+of its annotated JPEG. Each receipt binds contract, artifact, input, and output
+digests and preserves the source class plus its optional Manwe airspace mapping.
+The viewer loads the same runtime once. Capture remains independent of inference;
+a single round-robin worker owns the runtime and keeps one replaceable latest-frame
+slot per stream. Saturation therefore drops superseded queued work instead of
+building a backlog. The display shows raw frames during warm-up, then holds the
+newest completed exact annotated sample until a newer inference completes. That
+keeps annotations internally consistent and memory bounded, but it is deliberately
+not a zero-latency raw monitor: display age depends on inference time and stream
+count. Operators that require an independent live view must keep one alongside it.
+Credential-bearing stream URLs reject raw and percent-encoded control bytes before
+they are placed in the private FFmpeg concat record; FFmpeg runs with an explicit
+protocol allowlist and a cleared environment.
 
 Annotated JPEGs are created owner-private, staged, synced, and verified before
-no-replace publication. A hard interruption may leave a sibling
+no-replace publication. `--output-dir` must name an existing owner-controlled
+directory; without it, each input's directory is used and must satisfy the same
+boundary. Multi-image execution is atomic per image rather than all-or-none, so a
+later failure leaves earlier outputs and JSON receipts valid. A hard interruption
+may leave a sibling
 `.manwe-image-output-*.in-progress` directory, optionally beside a complete-looking
 JPEG. The marker means either that publication is uncommitted/indeterminate or
 that the output was committed but exact-entry staging cleanup is incomplete;
@@ -251,9 +307,10 @@ det = replace(
 )
 measurement = det.to_measurement(sensor_origin=array_xyz)
 
-# Export — a raw receipt plus separately inspected signature are required
+# Export — a raw receipt plus separately inspected interface evidence are required
+from manwe.common.contracts import detection_runtime
 from manwe.export import (
-    export_model, ExportReceipt, VerifiedArtifactSignature,
+    export_model, VerifiedArtifactSignature,
     build_export_contract, fidelity_report,
 )
 ```
@@ -277,10 +334,11 @@ fail-closed until a calibration-parameter covariance model is implemented.
 
 ## Consumer integration status
 
-No reviewed consumer is currently a zero-adaptation target. In particular,
-crebain's native YOLO paths assume an 80-class COCO head while Manwe's candidate
-airspace contract has five classes; artifact containers and preprocessing also
-differ by backend. Galadriel, Engram/NCP, Prisoma, and pid-rs require additional
+No reviewed downstream consumer is currently a zero-adaptation target. In
+particular, crebain's native YOLO paths assume an 80-class COCO head while Manwe's
+typical local airspace candidate has five source classes; artifact containers and
+preprocessing also differ by backend. Galadriel, Engram/NCP, Prisoma, and pid-rs
+require additional
 sequence, frame, identity, shape, or statistical adapters. See the
 **[compatibility matrix and ten promotion gates](docs/INTEGRATION_CREBAIN.md)**.
 
@@ -306,7 +364,7 @@ benchmark README defines the retained timing boundary and evidence requirements.
 | Component | Technology |
 |-----------|-----------|
 | Training | PyTorch (MPS + CUDA), Ultralytics; model-family adapters are validated separately |
-| Small-object | SAHI-style sliced inference; sliced training and a P2 head are planned |
+| Small-object | Bounded SAHI-style sliced inference converted into owned Manwe detections; sliced training and a P2 head are planned |
 | Acoustic | numpy DSP (GCC-PHAT / SRP-PHAT); deep SELD is planned |
 | Fusion | numpy KF/EKF/UKF/PF/IMM, OSPA/GOSPA |
 | Export | Raw ONNX, CoreML and TensorRT conversion; MLX conversion is not implemented |

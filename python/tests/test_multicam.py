@@ -452,6 +452,10 @@ def test_detection_validation_identity_image_bounds_and_immutability():
         _detection(0, [1, 2], class_label="x" * 257)
     with pytest.raises(ValueError, match="camera_id"):
         _detection(0, [1, 2], camera_id="camera\nspoof")
+    with pytest.raises(ValueError, match="camera_id"):
+        _detection(0, [1, 2], camera_id="camera\u200bspoof")
+    with pytest.raises(ValueError, match="class_label"):
+        _detection(0, [1, 2], class_label="bird\u202espoof")
     with pytest.raises(ValueError, match="supported magnitude"):
         _detection(0, [1, 2], timestamp=float(1 << 33))
     with pytest.raises(ValueError, match="camera_index"):
@@ -543,6 +547,26 @@ def test_moving_capture_timestamps_are_exact_and_measurement_offset_is_propagate
         later.covariance - measurements[0].covariance,
         np.eye(3) * expected_added_variance,
     )
+
+
+def test_measurement_bridge_propagates_stored_and_override_time_uncertainty():
+    detection = Detection3D(
+        position=np.zeros(3),
+        class_label=None,
+        confidence=1.0,
+        camera_indices=(0, 1),
+        reprojection_error=0.0,
+        position_covariance=np.eye(3),
+        timestamp=10.0,
+        time_uncertainty_s=0.02,
+        motion_speed_bound_mps=10.0,
+    )
+
+    at_reference = to_measurements([detection])[0]
+    assert np.allclose(at_reference.covariance, np.eye(3) * 1.04)
+
+    shifted = to_measurements([detection], timestamp=10.03)[0]
+    assert np.allclose(shifted.covariance, np.eye(3) * 1.25)
 
 
 def test_asynchronous_far_target_perfect_fit_is_rejected_despite_small_legacy_covariance():

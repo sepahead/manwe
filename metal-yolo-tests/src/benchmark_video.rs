@@ -2,7 +2,7 @@ use anyhow::Context;
 use candle::{DType, Device, IndexOp, Tensor};
 use candle_nn::{Module, VarBuilder};
 use clap::Parser;
-use image::{ImageBuffer, Rgb};
+use image::DynamicImage;
 use std::ffi::OsString;
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
@@ -19,10 +19,13 @@ use manwe::model::{Multiples, YoloV8};
 use manwe::secure_io::{
     bounded_open_file_identity, ensure_file_identity, open_bounded_regular_file,
     read_bounded_open_file, read_bounded_regular_file, resolve_executable,
-    sha256_bounded_open_file, sha256_hex, BoundDirectory, FileIdentity, ResolvedExecutable,
-    MAX_MODEL_BYTES, MAX_VIDEO_BYTES,
+    sha256_bounded_open_file, sha256_hex, BoundDirectory, FileIdentity, HardLinkPublication,
+    ResolvedExecutable, MAX_MODEL_BYTES, MAX_VIDEO_BYTES,
 };
-use manwe::{validate_coco_detection_output_schema, validate_coco_model_output};
+use manwe::{
+    report_detect, validate_coco_detection_output_schema, validate_coco_model_output,
+    ImageTransform,
+};
 
 const NUM_CLASSES: usize = 80;
 const INPUT_W: usize = 640;
@@ -31,13 +34,18 @@ const EXPECTED_COCO_PREDICTIONS: usize = (INPUT_W / 8) * (INPUT_H / 8)
     + (INPUT_W / 16) * (INPUT_H / 16)
     + (INPUT_W / 32) * (INPUT_H / 32);
 const MAX_VIDEO_FRAMES: u64 = 1_000_000;
-const MAX_PREDICTIONS: usize = 100_000;
-const MAX_CANDIDATES: usize = 2_000;
 const DEFAULT_MAX_DURATION_SECONDS: u64 = 7_200;
 const MAX_BENCHMARK_DURATION_SECONDS: u64 = 30 * 24 * 60 * 60;
 const MAX_RESULT_BYTES: u64 = 64 * 1024 * 1024;
 const FILE_LIMIT_EXEC_MODE: &str = "--manwe-internal-file-limit-exec";
 const VIDEO_LETTERBOX_FILTER: &str = "scale=w='if(gte(iw,ih),640,max(1,floor(iw*640/ih)+gt(iw*640/ih-floor(iw*640/ih),0.5)+eq(iw*640/ih-floor(iw*640/ih),0.5)*mod(floor(iw*640/ih),2)))':h='if(gte(iw,ih),max(1,floor(ih*640/iw)+gt(ih*640/iw-floor(ih*640/iw),0.5)+eq(ih*640/iw-floor(ih*640/iw),0.5)*mod(floor(ih*640/iw),2)),640)':flags=bicubic:param0=0:param1=0.5,setsar=1,pad=640:640:(ow-iw)/2:(oh-ih)/2:color=0x727272";
+
+fn has_io_error_kind(error: &anyhow::Error, kind: std::io::ErrorKind) -> bool {
+    error
+        .chain()
+        .filter_map(|cause| cause.downcast_ref::<std::io::Error>())
+        .any(|cause| cause.kind() == kind)
+}
 
 fn bounded_fps(value: &str) -> std::result::Result<f64, String> {
     let parsed = value
@@ -292,6 +300,12 @@ fn video_demuxer(path: &Path) -> anyhow::Result<&'static str> {
         "avi" => Ok("avi"),
         _ => anyhow::bail!("video must be MP4/M4V/MOV, MKV/WebM, or AVI"),
     }
+}
+
+fn utf8_evidence_path(path: &Path, label: &str) -> anyhow::Result<String> {
+    path.to_str()
+        .map(str::to_owned)
+        .with_context(|| format!("{label} must be valid UTF-8 for JSON evidence"))
 }
 
 #[derive(Clone)]
@@ -565,16 +579,6 @@ fn percentile(sorted_samples: &[f64], percentile: f64) -> f64 {
     sorted_samples[index.min(sorted_samples.len() - 1)]
 }
 
-fn create_private_directory(path: &Path) -> std::io::Result<()> {
-    let mut builder = fs::DirBuilder::new();
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::DirBuilderExt;
-        builder.mode(0o700);
-    }
-    builder.create(path)
-}
-
 fn set_owner_only_permissions(file: &fs::File) -> std::io::Result<()> {
     #[cfg(not(unix))]
     {
@@ -768,23 +772,13 @@ impl EvidenceRun {
         });
         let stage_name =
             OsString::from(format!(".manwe-benchmark-{safe_name}-{run_id}.in-progress"));
-        let stage_path = run_dir.path().join(&stage_name);
         run_dir.verify()?;
-        match create_private_directory(&stage_path) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+        let stage_dir = match run_dir.create_directory_entry(&stage_name, 0o700) {
+            Ok(directory) => directory,
+            Err(error) if has_io_error_kind(&error, std::io::ErrorKind::AlreadyExists) => {
                 anyhow::bail!("this benchmark run is already active or needs stale-run cleanup")
             }
-            Err(error) => return Err(error.into()),
-        }
-        run_dir.verify()?;
-        let stage_dir = match BoundDirectory::open(&stage_path) {
-            Ok(directory) => directory,
-            Err(error) => {
-                let _ = run_dir.remove_directory_entry(&stage_name);
-                let _ = run_dir.sync();
-                return Err(error);
-            }
+            Err(error) => return Err(error),
         };
         let run = Self {
             stage_result: stage_dir.path().join("result.json"),
@@ -836,8 +830,32 @@ impl EvidenceRun {
                 verify_authenticated_file(staged, authenticated, MAX_VIDEO_BYTES)?;
                 self.stage_dir.verify()?;
                 self.run_dir.verify()?;
-                fs::hard_link(staged, final_path)?;
-                self.final_link_created = true;
+                let final_name = final_path
+                    .file_name()
+                    .context("benchmark video path lost its filename")?;
+                let publication = self.stage_dir.hard_link_file_entry_to(
+                    std::ffi::OsStr::new("output.mp4"),
+                    &self.run_dir,
+                    final_name,
+                    MAX_VIDEO_BYTES,
+                );
+                match publication {
+                    Ok(HardLinkPublication::Created | HardLinkPublication::AlreadyLinked) => {
+                        self.final_link_created = true;
+                    }
+                    Ok(HardLinkPublication::DestinationOccupied) => {
+                        anyhow::bail!("benchmark video already exists at {}", final_path.display())
+                    }
+                    Err(error) => {
+                        self.final_link_created = true;
+                        return Err(error).with_context(|| {
+                            format!(
+                                "benchmark video publication at {} has an indeterminate visibility state",
+                                final_path.display()
+                            )
+                        });
+                    }
+                }
                 self.run_dir.verify()?;
                 self.stage_dir.verify()?;
                 verify_hard_link_identity(staged, final_path, MAX_VIDEO_BYTES)?;
@@ -847,8 +865,34 @@ impl EvidenceRun {
             (None, None, None) => {}
             _ => anyhow::bail!("video staging and authentication state is inconsistent"),
         }
-        fs::hard_link(&self.stage_result, &self.result_path)?;
-        self.final_link_created = true;
+        let result_name = self
+            .result_path
+            .file_name()
+            .context("benchmark result path lost its filename")?;
+        let publication = self.stage_dir.hard_link_file_entry_to(
+            std::ffi::OsStr::new("result.json"),
+            &self.run_dir,
+            result_name,
+            MAX_RESULT_BYTES,
+        );
+        match publication {
+            Ok(HardLinkPublication::Created | HardLinkPublication::AlreadyLinked) => {
+                self.final_link_created = true;
+            }
+            Ok(HardLinkPublication::DestinationOccupied) => anyhow::bail!(
+                "benchmark result already exists at {}",
+                self.result_path.display()
+            ),
+            Err(error) => {
+                self.final_link_created = true;
+                return Err(error).with_context(|| {
+                    format!(
+                        "benchmark result publication at {} has an indeterminate visibility state",
+                        self.result_path.display()
+                    )
+                });
+            }
+        }
         self.run_dir.verify()?;
         self.stage_dir.verify()?;
         let stage_identity = verify_json_file(&self.stage_result, &expected_result)?;
@@ -911,13 +955,21 @@ fn main() -> anyhow::Result<()> {
         return result;
     }
     let args = Args::parse();
-    let ffmpeg = resolve_executable(&args.ffmpeg)?;
-    let run_dir = std::env::var("RUN_DIR").unwrap_or_else(|_| "video_results".to_string());
-    let run_dir = std::path::PathBuf::from(run_dir);
-    std::fs::create_dir_all(&run_dir)?;
+    let video_path_for_evidence = utf8_evidence_path(&args.video, "video path")?;
+    let run_dir = std::path::PathBuf::from(
+        std::env::var_os("RUN_DIR").unwrap_or_else(|| OsString::from("video_results")),
+    );
     let safe_name = safe_video_name(&args.video)?;
     let input_demuxer = video_demuxer(&args.video)?;
+    // The evidence boundary must exist before it can be bound and authenticated.
+    // Creating arbitrary path components here would follow links before that check.
     let mut evidence = EvidenceRun::acquire(&run_dir, &safe_name, &args.run_id, args.save_video)?;
+    let output_video_for_evidence = evidence
+        .output_path()
+        .map(|path| utf8_evidence_path(path, "output video path"))
+        .transpose()?;
+    let ffmpeg = resolve_executable(&args.ffmpeg)?;
+    let ffmpeg_path_for_evidence = utf8_evidence_path(ffmpeg.path(), "FFmpeg path")?;
 
     // 1. Load Model
     let device = Device::new_metal(0)?;
@@ -1005,7 +1057,6 @@ fn main() -> anyhow::Result<()> {
 
     // 3. Setup Output Pipe (Rust -> FFmpeg) if needed
     let (mut output_process, mut output_stdin) = if args.save_video {
-        std::fs::create_dir_all(&run_dir)?;
         let output_fps = if args.target_fps > 0.0 {
             args.target_fps
         } else {
@@ -1140,6 +1191,7 @@ fn main() -> anyhow::Result<()> {
     let mut model_forward_sync_times = Vec::new();
     let mut total_infer_times = Vec::new();
     let mut latencies = Vec::new();
+    let mut last_processed_completed_at = None;
 
     println!("Starting Rust Benchmark Loop...");
 
@@ -1218,83 +1270,35 @@ fn main() -> anyhow::Result<()> {
 
             // Video Writing (Optional)
             if let Some(ref mut writer) = output_stdin {
-                use candle_transformers::object_detection::Bbox;
-                use manwe::class_aware_non_maximum_suppression;
-
                 let pred = preds_host.i(0)?;
-                let (pred_size, npreds) = pred.dims2()?;
-                if pred_size != 4 + NUM_CLASSES {
-                    anyhow::bail!("video renderer requires the COCO-80 detection schema")
-                }
-                if npreds > MAX_PREDICTIONS {
-                    anyhow::bail!("prediction count exceeds the renderer limit")
-                }
-                let nclasses = NUM_CLASSES;
-                let mut bboxes: Vec<Vec<Bbox<Vec<()>>>> = (0..nclasses).map(|_| vec![]).collect();
-                let mut candidate_count = 0_usize;
-
-                for index in 0..npreds {
-                    let p_vec = Vec::<f32>::try_from(pred.i((.., index))?)?;
-                    if p_vec.iter().any(|value| !value.is_finite()) {
-                        anyhow::bail!("model output must contain only finite values")
-                    }
-                    let Some(confidence) = p_vec[4..].iter().copied().max_by(f32::total_cmp) else {
-                        continue;
-                    };
-                    if confidence > 0.25 {
-                        if candidate_count >= MAX_CANDIDATES {
-                            anyhow::bail!("detection candidate count exceeds the renderer limit")
-                        }
-                        let mut class_index = 0;
-                        for i in 0..nclasses {
-                            if p_vec[4 + i] > p_vec[4 + class_index] {
-                                class_index = i;
-                            }
-                        }
-                        let bbox = Bbox {
-                            xmin: p_vec[0] - p_vec[2] / 2.,
-                            ymin: p_vec[1] - p_vec[3] / 2.,
-                            xmax: p_vec[0] + p_vec[2] / 2.,
-                            ymax: p_vec[1] + p_vec[3] / 2.,
-                            confidence,
-                            data: vec![],
-                        };
-                        bboxes[class_index].push(bbox);
-                        candidate_count += 1;
-                    }
-                }
-                class_aware_non_maximum_suppression(&mut bboxes, 0.45)?;
-
-                let mut img_buf = ImageBuffer::<Rgb<u8>, _>::from_raw(
-                    INPUT_W as u32,
-                    INPUT_H as u32,
-                    packet.data.clone(),
-                )
-                .context("decoded frame had an invalid byte length")?;
-
-                for class_boxes in bboxes.iter() {
-                    for b in class_boxes {
-                        let xmin = b.xmin.clamp(0.0, (INPUT_W - 1) as f32);
-                        let ymin = b.ymin.clamp(0.0, (INPUT_H - 1) as f32);
-                        let xmax = b.xmax.clamp(0.0, INPUT_W as f32);
-                        let ymax = b.ymax.clamp(0.0, INPUT_H as f32);
-                        if xmax <= xmin || ymax <= ymin {
-                            continue;
-                        }
-
-                        imageproc::drawing::draw_hollow_rect_mut(
-                            &mut img_buf,
-                            imageproc::rect::Rect::at(xmin as i32, ymin as i32).of_size(
-                                ((xmax - xmin).ceil() as u32).max(1),
-                                ((ymax - ymin).ceil() as u32).max(1),
-                            ),
-                            Rgb([255, 0, 0]),
-                        );
-                    }
-                }
-
-                writer.write_all(&img_buf.into_raw())?;
+                let image =
+                    image::RgbImage::from_raw(INPUT_W as u32, INPUT_H as u32, packet.data.clone())
+                        .context("decoded frame had an invalid byte length")?;
+                let transform = ImageTransform {
+                    original_width: INPUT_W,
+                    original_height: INPUT_H,
+                    resized_width: INPUT_W,
+                    resized_height: INPUT_H,
+                    canvas_width: INPUT_W,
+                    canvas_height: INPUT_H,
+                    pad_left: 0,
+                    pad_top: 0,
+                };
+                let annotated = report_detect(
+                    &pred,
+                    DynamicImage::ImageRgb8(image),
+                    &transform,
+                    0.25,
+                    0.45,
+                    0,
+                )?;
+                writer.write_all(&annotated.into_rgb8().into_raw())?;
             }
+
+            // Processed throughput ends at the actual completion of this
+            // selected frame. Decoder EOF observation and child teardown occur
+            // later and belong to pipeline finalization, not frame throughput.
+            last_processed_completed_at = Some(Instant::now());
 
             if frames_processed.is_multiple_of(100) {
                 println!("[Rust] Processed {frames_processed} frames...");
@@ -1308,7 +1312,9 @@ fn main() -> anyhow::Result<()> {
             args.max_duration_seconds
         ));
     }
-    let benchmark_duration_s = start_time.elapsed().as_secs_f64();
+    let benchmark_duration_s = last_processed_completed_at
+        .map(|completed| completed.duration_since(start_time).as_secs_f64())
+        .unwrap_or_else(|| start_time.elapsed().as_secs_f64());
 
     if processing_result.is_err() {
         running.store(false, Ordering::Release);
@@ -1416,10 +1422,10 @@ fn main() -> anyhow::Result<()> {
     let results = serde_json::json!({
         "model": "rust_candle",
         "model_sha256": model_sha256,
-        "video": args.video,
+        "video": video_path_for_evidence,
         "video_sha256": video_sha256,
         "input_demuxer": input_demuxer,
-        "ffmpeg_path": ffmpeg.path(),
+        "ffmpeg_path": ffmpeg_path_for_evidence,
         "ffmpeg_sha256": ffmpeg.sha256(),
         "device": "Metal GPU",
         "target_fps": args.target_fps,
@@ -1443,7 +1449,7 @@ fn main() -> anyhow::Result<()> {
         "processed_fps_scope": "reader-start to final processed frame; includes producer pacing, frame drops, full-output device compaction, CPU readback, finite-value validation, and optional rendering/encoder-pipe writes but excludes encoder finalization",
         "producer_pacing": "reader thread paced at target_fps; 0 means unthrottled",
         "save_video": args.save_video,
-        "output_video": evidence.output_path(),
+        "output_video": output_video_for_evidence,
         "output_video_sha256": output_video_sha256,
     });
 
@@ -1524,6 +1530,17 @@ mod tests {
         assert_eq!(video_demuxer(Path::new("input.webm")).unwrap(), "matroska");
         assert!(video_demuxer(Path::new("input.m3u8")).is_err());
         assert!(video_demuxer(Path::new("input.ffconcat")).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn benchmark_evidence_rejects_lossy_paths() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let path = PathBuf::from(OsString::from_vec(vec![b'i', 0xff, b'.', b'm', b'p', b'4']));
+        let error = utf8_evidence_path(&path, "video path").unwrap_err();
+
+        assert!(error.to_string().contains("valid UTF-8"));
     }
 
     #[test]
