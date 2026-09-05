@@ -1,0 +1,87 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 940" role="img" aria-labelledby="title description">
+  <title id="title">Manwe: references, model interfaces, and ownership</title>
+  <desc id="description">Two independent paths. NumPy tools produce local reference outputs and tracking metrics. Optional Python training and raw export produce candidate weights and export receipts. Separate interface inspection and a compatible artifact are required to assemble a schema-2 package. The shared Candle runtime implements batch and viewer execution, but a real artifact and golden forward remain unqualified. No Manwe downstream adapter is implemented. Solid arrows mean local data flow. Dashed arrows mean a separately required handoff, not a completed conversion.</desc>
+  <defs>
+    <linearGradient id="paper" x2="0.9" y2="1"><stop stop-color="#0c1d2e"/><stop offset="1" stop-color="#101b27"/></linearGradient>
+    <linearGradient id="card" x2="0.8" y2="1"><stop stop-color="#182e40"/><stop offset="1" stop-color="#142536"/></linearGradient>
+    <pattern id="grid" width="32" height="32" patternUnits="userSpaceOnUse"><path d="M32 0H0V32" fill="none" stroke="#b9dcf2" stroke-opacity=".035"/></pattern>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="m1 1 8 4-8 4" fill="none" stroke="#7bd5ed" stroke-width="1.5"/></marker>
+    <marker id="required" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto"><path d="m1 1 8 4-8 4" fill="none" stroke="#ecc186" stroke-width="1.5"/></marker>
+    <style>
+      text{font-family:Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;fill:#eff7fc}
+      .kicker{font-size:14px;font-weight:650;letter-spacing:2px;fill:#8acddd}
+      .title{font-size:34px;font-weight:650;letter-spacing:-.8px}.sub{font-size:18px;fill:#b8cddc}
+      .heading{font-size:22px;font-weight:600}.body{font-size:18px;fill:#d0dfe9}.small{font-size:16px;fill:#b8cddc}
+      .number{font-size:15px;font-weight:700;fill:#8acddd}.warn{fill:#ecc186}
+      .box{fill:url(#card);stroke:#3c586d;stroke-width:1.2}.flow{fill:none;stroke:#7bd5ed;stroke-width:2;marker-end:url(#arrow)}
+      .need{fill:none;stroke:#ecc186;stroke-width:2;stroke-dasharray:6 5;marker-end:url(#required)}
+    </style>
+  </defs>
+  <rect width="1200" height="940" rx="24" fill="url(#paper)"/>
+  <rect width="1200" height="940" rx="24" fill="url(#grid)"/>
+  <g id="header">
+    <text x="48" y="44" class="kicker">MANWE / PERCEPTION RESEARCH</text>
+    <text x="48" y="94" class="title">Perception tools and model interfaces</text>
+    <text x="48" y="127" class="sub">Independent numerical references and an optional model workflow.</text>
+    <path d="M48 150H1152" stroke="#3c586d"/>
+  </g>
+  <g id="numerical-reference">
+    <text x="48" y="190" class="kicker">01 / NUMPY REFERENCE PATH</text>
+    <text x="1152" y="190" text-anchor="end" class="small">No model weights or hosted service</text>
+    <rect x="48" y="215" width="328" height="164" rx="14" class="box"/>
+    <text x="72" y="250" class="heading">Numerical tools</text>
+    <text x="72" y="286" class="body">Audio · camera geometry</text>
+    <text x="72" y="315" class="body">Tracking · synthetic scenarios</text>
+    <text x="72" y="351" class="small">Local units and assumptions</text>
+    <path d="M382 296H428" class="flow"/>
+    <rect x="436" y="215" width="328" height="164" rx="14" class="box"/>
+    <text x="460" y="250" class="heading">Reference outputs</text>
+    <text x="460" y="286" class="body">Measurements and tracks</text>
+    <text x="460" y="315" class="body">Explicit geometry and uncertainty</text>
+    <text x="460" y="351" class="small">Local objects; no wire protocol</text>
+    <path d="M770 296H816" class="flow"/>
+    <rect x="824" y="215" width="328" height="164" rx="14" class="box"/>
+    <text x="848" y="250" class="heading">Evaluate the reference</text>
+    <text x="848" y="286" class="body">OSPA / GOSPA tracking error</text>
+    <text x="848" y="315" class="body">Seeded numerical controls</text>
+    <text x="848" y="351" class="small">Synthetic evidence stays synthetic</text>
+    <text x="48" y="413" class="small">Direction is not range. Real-camera calibration uncertainty remains gated.</text>
+  </g>
+  <g id="model-workflow">
+    <text x="48" y="469" class="kicker">02 / OPTIONAL MODEL PATH</text>
+    <text x="1152" y="469" text-anchor="end" class="small">Each stage has separate evidence requirements</text>
+    <rect x="48" y="494" width="328" height="206" rx="14" class="box"/>
+    <text x="72" y="529" class="heading">Train and export</text>
+    <text x="72" y="568" class="body">Private dataset → trainer</text>
+    <text x="72" y="597" class="body">Checkpoint → raw conversion</text>
+    <text x="72" y="630" class="small">ONNX · CoreML · TensorRT</text>
+    <text x="72" y="670" class="small warn">Result: candidate + export receipt</text>
+    <path d="M382 595H428" class="need"/>
+    <rect x="436" y="494" width="328" height="206" rx="14" class="box"/>
+    <text x="460" y="529" class="heading">Assemble the interface</text>
+    <text x="460" y="568" class="body">Artifact + schema-2 contract</text>
+    <text x="460" y="597" class="body">Exact tensors, pixels, classes</text>
+    <text x="460" y="630" class="small">Separate backend inspection</text>
+    <text x="460" y="670" class="small warn">No automatic Candle conversion</text>
+    <path d="M770 595H816" class="flow"/>
+    <rect x="824" y="494" width="328" height="206" rx="14" class="box"/>
+    <text x="848" y="529" class="heading">Shared Candle runtime</text>
+    <text x="848" y="568" class="body">Batch JSON + annotations</text>
+    <text x="848" y="597" class="body">Experimental camera viewer</text>
+    <text x="848" y="630" class="small">Only implemented native adapters</text>
+    <text x="848" y="660" class="small warn">Real artifact + golden forward:</text>
+    <text x="848" y="682" class="small warn">qualification still required</text>
+    <text x="48" y="734" class="small">Export success, contract consistency, model quality, and device parity are different claims.</text>
+  </g>
+  <g id="downstream-boundary">
+    <rect x="48" y="772" width="1104" height="91" rx="14" fill="#18222d" stroke="#a48a6c" stroke-dasharray="4 5"/>
+    <text x="72" y="805" class="heading">Downstream composition</text>
+    <text x="1128" y="805" class="small warn" text-anchor="end">NO MANWE ADAPTER IMPLEMENTED</text>
+    <text x="72" y="840" class="body">CREBAIN · Galadriel · Engram/NCP · Prisoma · pid-rs — separate consumer fixtures are required.</text>
+  </g>
+  <g id="legend">
+    <path d="M49 904H93" class="flow"/><text x="108" y="910" class="small">Local data flow</text>
+    <path d="M292 904H336" class="need"/><text x="350" y="910" class="small">Required separate handoff</text>
+    <text x="1152" y="910" class="small" text-anchor="end">Alpha source • no deployment claim</text>
+  </g>
+</svg>

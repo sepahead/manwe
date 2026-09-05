@@ -1,0 +1,52 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark light">
+  <title>Manwe architecture</title>
+  <style>
+    :root { color-scheme: dark; background: #101b27; color: #eff7fc; font-family: system-ui, sans-serif; }
+    body { margin: 0; padding: clamp(16px, 3vw, 40px); }
+    main { max-width: 1200px; margin: auto; }
+    h1 { font-size: clamp(28px, 4vw, 42px); letter-spacing: -.04em; }
+    p, li { line-height: 1.65; max-width: 76ch; }
+    a { color: #9adef1; text-underline-offset: .2em; }
+    a:focus-visible { outline: 3px solid #ecc186; outline-offset: 5px; }
+    nav { display: flex; flex-wrap: wrap; gap: 12px 28px; margin: 24px 0; }
+    nav a { padding: 8px 0; }
+    figure { margin: 0; }
+    img { display: block; width: 100%; height: auto; }
+    figcaption { margin-top: 18px; color: #b8cddc; line-height: 1.65; }
+    section { margin-top: 36px; border-top: 1px solid #3c586d; padding-top: 16px; }
+    @media print { :root { background: white; color: #152a3c; } a { color: #075b79; } nav { display: none; } }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Manwe architecture</h1>
+    <p>Explore the numerical reference path and the optional model workflow. Each path preserves its own evidence and ownership boundaries.</p>
+    <nav aria-label="Diagram layouts">
+      <a href="../assets/architecture.svg">Open wide SVG</a>
+      <a href="../assets/architecture-mobile.svg">Open portrait SVG</a>
+      <a href="../README.md">Project README</a>
+    </nav>
+    <figure>
+      <picture>
+        <source media="(max-width: 600px)" srcset="../assets/architecture-mobile.svg">
+        <img src="../assets/architecture.svg" alt="Two independent Manwe paths: numerical references, and optional model preparation with a separate native interface boundary. Downstream adapters remain unimplemented.">
+      </picture>
+      <figcaption>Open either SVG to use browser zoom or pinch gestures. All lines and text remain vector-based. No script or external service is required.</figcaption>
+    </figure>
+    <section aria-labelledby="description">
+      <h2 id="description">Text description</h2>
+      <p>NumPy tools produce local measurements, tracks, and tracking metrics. They need no model weights or hosted service. Synthetic controls do not establish real-world accuracy.</p>
+      <p>Optional Python training and raw export produce candidate weights and export receipts. Separate backend inspection and a compatible artifact are required for a schema-2 package.</p>
+      <p>The shared Candle runtime implements native batch and viewer paths. A real artifact and golden forward remain required. No checked-in converter completes that handoff.</p>
+      <p>Solid arrows indicate local data flow. Dashed arrows indicate a required separate handoff. Neither style grants deployment or scientific authority.</p>
+      <p>No Manwe adapter connects CREBAIN, Galadriel, Engram/NCP, Prisoma, or pid-rs. Each consumer still requires its own versioned adapter and fixtures.</p>
+      <p>Read the <a href="ARCHITECTURE.md">architecture guide</a> and <a href="MODEL_CONTRACTS.md">model contracts</a> for exact requirements.</p>
+    </section>
+  </main>
+</body>
+</html>
