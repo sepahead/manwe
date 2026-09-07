@@ -5,6 +5,8 @@
   </picture>
 </p>
 
+<p align="center"><a href="assets/archive/logos/README.md">Logo design archive</a></p>
+
 # Manwe
 
 **Perception research, from numerical references to checked model interfaces.**

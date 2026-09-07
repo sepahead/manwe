@@ -1,0 +1,60 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="188 608 124 124" width="124" height="124" role="img" aria-label="MANWE historical profile mark"><title>MANWE historical profile mark</title><desc>Archived design extracted from a historical portfolio SVG. This image makes no current product or release claim.</desc><defs><filter id="mwBloom" x="-170%" y="-170%" width="440%" height="440%">
+      <feGaussianBlur stdDeviation="1.4" result="b" />
+      <feMerge><feMergeNode in="b" /><feMergeNode in="SourceGraphic" /></feMerge>
+    </filter>
+  <filter id="nodeShadow" x="-40%" y="-40%" width="180%" height="180%">
+      <feDropShadow dx="0" dy="1.5" stdDeviation="2.4" flood-color="#000000" flood-opacity="0.38" />
+    </filter>
+    </defs><style>.mw-iris{fill: #101a26; stroke: #38bdf8; stroke-opacity: 0.25; stroke-width: 1;}
+.mw-well{fill: url(#mwWell);}
+.mw-core{fill: url(#mwCore);}
+.mw-aphex{fill: none; stroke: #e0f2fe; stroke-opacity: 0.45; stroke-width: 0.8; stroke-linejoin: round;}
+.mw-blade{fill: none; stroke: #7dd3fc; stroke-opacity: 0.55; stroke-width: 1.2;}
+.mw-blade-sh{fill: none; stroke: #05070b; stroke-opacity: 0.7; stroke-width: 1.2;}
+.mw-inner{fill: none; stroke: url(#mwBezel); stroke-width: 1.6; stroke-opacity: 0.9; stroke-linecap: round;}
+.mw-notch{fill: none; stroke: #bae6fd; stroke-width: 1.4; stroke-linejoin: round; stroke-linecap: round;}
+.mw-tick{stroke: #38bdf8; stroke-opacity: 0.4; stroke-width: 1;}
+.mw-dot{fill: #7dd3fc; fill-opacity: 0.16;}
+.mw-lock{fill: none; stroke: #ef4444; stroke-width: 1.2; stroke-linecap: round; stroke-linejoin: round;}
+.mw-lock-dot{fill: #ff6b5e;}
+.mw-lock-g{fill: none; stroke: #4ade80; stroke-width: 1.2; stroke-linecap: round; stroke-linejoin: round;}
+.mw-lock-g-dot{fill: #86efac;}
+.mw-lock-y{fill: none; stroke: #facc15; stroke-width: 1.2; stroke-linecap: round; stroke-linejoin: round;}
+.mw-lock-y-dot{fill: #fde047;}
+.mw-lock-o{fill: none; stroke: #fb923c; stroke-width: 1.2; stroke-linecap: round; stroke-linejoin: round;}
+.mw-lock-o-dot{fill: #fdba74;}
+.mw-drone-arm{fill: none; stroke: #7dd3fc; stroke-width: 1.4; stroke-linecap: round;}
+.mw-rotor{fill: #12283b; stroke: #7dd3fc; stroke-width: 1.2;}
+.mw-hub{fill: #f0f9ff;}
+.mw-ring{fill: none; stroke: url(#mwBezel); stroke-width: 2.2;}
+.mw-groove{fill: none; stroke: #05070b; stroke-opacity: 0.5; stroke-width: 1;}
+.mw-hairline{fill: none; stroke: #2b333d; stroke-opacity: 0.55; stroke-width: 1;}</style><g class="nodes"><g>
+    <defs>
+      <radialGradient id="mwBarrel" gradientUnits="userSpaceOnUse" cx="250" cy="664" r="40">
+        <stop offset="0%" stop-color="#22384e" /><stop offset="60%" stop-color="#131f2e" /><stop offset="100%" stop-color="#0a1119" />
+      </radialGradient>
+      <linearGradient id="mwBezel" x1="0" y1="636" x2="0" y2="704" gradientUnits="userSpaceOnUse">
+        <stop offset="0%" stop-color="#bae6fd" /><stop offset="45%" stop-color="#38bdf8" /><stop offset="100%" stop-color="#0c4a6e" />
+      </linearGradient>
+      <radialGradient id="mwWell" gradientUnits="userSpaceOnUse" cx="250" cy="666" r="13">
+        <stop offset="0%" stop-color="#17324a" /><stop offset="60%" stop-color="#0b2035" /><stop offset="100%" stop-color="#050f1b" />
+      </radialGradient>
+      <radialGradient id="mwCore" gradientUnits="userSpaceOnUse" cx="250" cy="670" r="6">
+        <stop offset="0%" stop-color="#cfeafe" stop-opacity="0.7" /><stop offset="45%" stop-color="#38bdf8" stop-opacity="0.42" /><stop offset="100%" stop-color="#38bdf8" stop-opacity="0" />
+      </radialGradient>
+      <clipPath id="mwDisc"><circle cx="250" cy="670" r="26.5" /></clipPath>
+    </defs>
+    <g filter="url(#nodeShadow)"><circle cx="250" cy="670" r="34" fill="url(#mwBarrel)" /></g>
+    <circle cx="250" cy="670" r="28" class="mw-iris" />
+    <g><animateTransform attributeName="transform" type="rotate" values="0 250 670;0 250 670;360 250 670;360 250 670" keyTimes="0;0.34;0.7;1" calcMode="spline" keySplines="0 0 1 1;0.45 0 0.55 1;0 0 1 1" dur="10s" repeatCount="indefinite" /><g clip-path="url(#mwDisc)"><circle class="mw-dot" cx="223.9" cy="665.9" r="0.5" /><circle class="mw-dot" cx="223.9" cy="671.4" r="0.5" /><circle class="mw-dot" cx="223.9" cy="676.9" r="0.5" /><circle class="mw-dot" cx="229.4" cy="654.9" r="0.5" /><circle class="mw-dot" cx="229.4" cy="660.4" r="0.5" /><circle class="mw-dot" cx="229.4" cy="665.9" r="0.5" /><circle class="mw-dot" cx="229.4" cy="671.4" r="0.5" /><circle class="mw-dot" cx="229.4" cy="676.9" r="0.5" /><circle class="mw-dot" cx="229.4" cy="682.4" r="0.5" /><circle class="mw-dot" cx="234.9" cy="649.4" r="0.5" /><circle class="mw-dot" cx="234.9" cy="654.9" r="0.5" /><circle class="mw-dot" cx="234.9" cy="660.4" r="0.5" /><circle class="mw-dot" cx="234.9" cy="665.9" r="0.5" /><circle class="mw-dot" cx="234.9" cy="671.4" r="0.5" /><circle class="mw-dot" cx="234.9" cy="676.9" r="0.5" /><circle class="mw-dot" cx="234.9" cy="682.4" r="0.5" /><circle class="mw-dot" cx="234.9" cy="687.9" r="0.5" /><circle class="mw-dot" cx="240.4" cy="649.4" r="0.5" /><circle class="mw-dot" cx="240.4" cy="654.9" r="0.5" /><circle class="mw-dot" cx="240.4" cy="660.4" r="0.5" /><circle class="mw-dot" cx="240.4" cy="665.9" r="0.5" /><circle class="mw-dot" cx="240.4" cy="671.4" r="0.5" /><circle class="mw-dot" cx="240.4" cy="676.9" r="0.5" /><circle class="mw-dot" cx="240.4" cy="682.4" r="0.5" /><circle class="mw-dot" cx="240.4" cy="687.9" r="0.5" /><circle class="mw-dot" cx="240.4" cy="693.4" r="0.5" /><circle class="mw-dot" cx="245.9" cy="643.9" r="0.5" /><circle class="mw-dot" cx="245.9" cy="649.4" r="0.5" /><circle class="mw-dot" cx="245.9" cy="654.9" r="0.5" /><circle class="mw-dot" cx="245.9" cy="660.4" r="0.5" /><circle class="mw-dot" cx="245.9" cy="665.9" r="0.5" /><circle class="mw-dot" cx="245.9" cy="671.4" r="0.5" /><circle class="mw-dot" cx="245.9" cy="676.9" r="0.5" /><circle class="mw-dot" cx="245.9" cy="682.4" r="0.5" /><circle class="mw-dot" cx="245.9" cy="687.9" r="0.5" /><circle class="mw-dot" cx="245.9" cy="693.4" r="0.5" /><circle class="mw-dot" cx="251.4" cy="643.9" r="0.5" /><circle class="mw-dot" cx="251.4" cy="649.4" r="0.5" /><circle class="mw-dot" cx="251.4" cy="654.9" r="0.5" /><circle class="mw-dot" cx="251.4" cy="660.4" r="0.5" /><circle class="mw-dot" cx="251.4" cy="665.9" r="0.5" /><circle class="mw-dot" cx="251.4" cy="671.4" r="0.5" /><circle class="mw-dot" cx="251.4" cy="676.9" r="0.5" /><circle class="mw-dot" cx="251.4" cy="682.4" r="0.5" /><circle class="mw-dot" cx="251.4" cy="687.9" r="0.5" /><circle class="mw-dot" cx="251.4" cy="693.4" r="0.5" /><circle class="mw-dot" cx="256.9" cy="643.9" r="0.5" /><circle class="mw-dot" cx="256.9" cy="649.4" r="0.5" /><circle class="mw-dot" cx="256.9" cy="654.9" r="0.5" /><circle class="mw-dot" cx="256.9" cy="660.4" r="0.5" /><circle class="mw-dot" cx="256.9" cy="665.9" r="0.5" /><circle class="mw-dot" cx="256.9" cy="671.4" r="0.5" /><circle class="mw-dot" cx="256.9" cy="676.9" r="0.5" /><circle class="mw-dot" cx="256.9" cy="682.4" r="0.5" /><circle class="mw-dot" cx="256.9" cy="687.9" r="0.5" /><circle class="mw-dot" cx="256.9" cy="693.4" r="0.5" /><circle class="mw-dot" cx="262.4" cy="649.4" r="0.5" /><circle class="mw-dot" cx="262.4" cy="654.9" r="0.5" /><circle class="mw-dot" cx="262.4" cy="660.4" r="0.5" /><circle class="mw-dot" cx="262.4" cy="665.9" r="0.5" /><circle class="mw-dot" cx="262.4" cy="671.4" r="0.5" /><circle class="mw-dot" cx="262.4" cy="676.9" r="0.5" /><circle class="mw-dot" cx="262.4" cy="682.4" r="0.5" /><circle class="mw-dot" cx="262.4" cy="687.9" r="0.5" /><circle class="mw-dot" cx="262.4" cy="693.4" r="0.5" /><circle class="mw-dot" cx="267.9" cy="654.9" r="0.5" /><circle class="mw-dot" cx="267.9" cy="660.4" r="0.5" /><circle class="mw-dot" cx="267.9" cy="665.9" r="0.5" /><circle class="mw-dot" cx="267.9" cy="671.4" r="0.5" /><circle class="mw-dot" cx="267.9" cy="676.9" r="0.5" /><circle class="mw-dot" cx="267.9" cy="682.4" r="0.5" /><circle class="mw-dot" cx="267.9" cy="687.9" r="0.5" /><circle class="mw-dot" cx="273.4" cy="660.4" r="0.5" /><circle class="mw-dot" cx="273.4" cy="665.9" r="0.5" /><circle class="mw-dot" cx="273.4" cy="671.4" r="0.5" /><circle class="mw-dot" cx="273.4" cy="676.9" r="0.5" /><circle class="mw-dot" cx="273.4" cy="682.4" r="0.5" /></g><polygon points="259,679 246.7,682.3 237.7,673.3 241,661 253.3,657.7 262.3,666.7" class="mw-well" /></g>
+    <circle cx="250" cy="670" r="6" class="mw-core">
+      <animate attributeName="opacity" values="1;0.82;1" dur="3.4s" repeatCount="indefinite" />
+    </circle>
+    <g class="mw-drone" opacity="1"><animate attributeName="opacity" values="0;0;1;1;0;0" keyTimes="0;0.04;0.13;0.9;0.98;1" dur="10s" repeatCount="indefinite" /><path class="mw-drone-arm" d="M248.8 668.8 L245.1 665.1 M251.2 668.8 L254.9 665.1 M248.8 671.2 L245.1 674.9 M251.2 671.2 L254.9 674.9" /><circle class="mw-rotor" cx="245.1" cy="665.1" r="2.2" /><circle class="mw-rotor" cx="254.9" cy="665.1" r="2.2" /><circle class="mw-rotor" cx="245.1" cy="674.9" r="2.2" /><circle class="mw-rotor" cx="254.9" cy="674.9" r="2.2" /><circle cx="250" cy="670" r="1.4" class="mw-hub" filter="url(#mwBloom)" /></g>
+    <g class="mw-trigger" opacity="1" transform="rotate(90 250 670)"><animate attributeName="opacity" values="0;0;1;1;0;0" keyTimes="0;0.2;0.27;0.9;0.97;1" dur="10s" repeatCount="indefinite" /><polyline class="mw-lock-g" points="248.6,660.4 250,661.8 251.4,660.4" /><circle class="mw-lock-g-dot" cx="250" cy="660.1" r="0.6" /></g><g class="mw-trigger" opacity="1" transform="rotate(180 250 670)"><animate attributeName="opacity" values="0;0;1;1;0;0" keyTimes="0;0.34;0.41;0.9;0.97;1" dur="10s" repeatCount="indefinite" /><polyline class="mw-lock-y" points="248.6,660.4 250,661.8 251.4,660.4" /><circle class="mw-lock-y-dot" cx="250" cy="660.1" r="0.6" /></g><g class="mw-trigger" opacity="1" transform="rotate(270 250 670)"><animate attributeName="opacity" values="0;0;1;1;0;0" keyTimes="0;0.47;0.54;0.9;0.97;1" dur="10s" repeatCount="indefinite" /><polyline class="mw-lock-o" points="248.6,660.4 250,661.8 251.4,660.4" /><circle class="mw-lock-o-dot" cx="250" cy="660.1" r="0.6" /></g><g class="mw-trigger" opacity="1"><animate attributeName="opacity" values="0;0;1;1;0;0" keyTimes="0;0.6;0.67;0.9;0.97;1" dur="10s" repeatCount="indefinite" /><polyline class="mw-lock" points="248.6,660.4 250,661.8 251.4,660.4" /><circle class="mw-lock-dot" cx="250" cy="660.1" r="0.6" /></g>
+    <g class="mw-blades"><animateTransform attributeName="transform" type="rotate" values="0 250 670;0 250 670;360 250 670;360 250 670" keyTimes="0;0.34;0.7;1" calcMode="spline" keySplines="0 0 1 1;0.45 0 0.55 1;0 0 1 1" dur="10s" repeatCount="indefinite" /><polygon points="259,679 246.7,682.3 237.7,673.3 241,661 253.3,657.7 262.3,666.7" class="mw-aphex" /><path class="mw-blade-sh" d="M260.4 679.4 L255.7 696.9 M247.1 683.7 L229.6 688.4 M236.7 674.3 L223.9 661.5 M239.6 660.6 L244.3 643.1 M252.9 656.3 L270.4 651.6 M263.3 665.7 L276.1 678.5" /><path class="mw-blade" d="M259 679 L254.1 697.1 M246.7 682.3 L228.6 687.1 M237.7 673.3 L224.4 660 M241 661 L245.9 642.9 M253.3 657.7 L271.4 652.9 M262.3 666.7 L275.6 680" /><path class="mw-inner" d="M254.2 640.3 A30 30 0 1 1 245.8 640.3" /><path class="mw-notch" d="M254.2 640.3 L250 643 L245.8 640.3" /><path class="mw-tick" d="M280.6 670 L283.4 670 M276.5 685.3 L278.9 686.7 M265.3 696.5 L266.7 698.9 M250 700.6 L250 703.4 M234.7 696.5 L233.3 698.9 M223.5 685.3 L221.1 686.7 M219.4 670 L216.6 670 M223.5 654.7 L221.1 653.3 M234.7 643.5 L233.3 641.1 M250 639.4 L250 636.6 M265.3 643.5 L266.7 641.1 M276.5 654.7 L278.9 653.3" /></g>
+    <circle cx="250" cy="670" r="34" class="mw-ring" />
+    <circle cx="250" cy="670" r="31.8" class="mw-groove" />
+    <circle cx="250" cy="670" r="35.4" class="mw-hairline" />
+    </g>
+  </g></svg>

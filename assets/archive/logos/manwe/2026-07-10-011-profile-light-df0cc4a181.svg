@@ -1,0 +1,49 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="236 324 124 124" width="124" height="124" role="img" aria-label="MANWE historical profile mark"><title>MANWE historical profile mark</title><desc>Archived design extracted from a historical portfolio SVG. This image makes no current product or release claim.</desc><defs><filter id="nodeShadow" x="-40%" y="-40%" width="180%" height="180%">
+      <feDropShadow dx="0" dy="1.5" stdDeviation="2.4" flood-color="#000000" flood-opacity="0.38" />
+    </filter>
+    <filter id="soft" x="-60%" y="-60%" width="220%" height="220%">
+      <feGaussianBlur stdDeviation="4" result="b" />
+      <feMerge><feMergeNode in="b" /><feMergeNode in="SourceGraphic" /></feMerge>
+    </filter>
+    </defs><style>:root{--hub-accent: #34d399; --cube-accent: #fb923c; --tri-accent: #a78bfa;}
+.mw-iris{fill: #101a26; stroke: #38bdf8; stroke-opacity: 0.25; stroke-width: 1;}
+.mw-apglow{fill: #38bdf8; opacity: 0.85;}
+.mw-aphex{fill: none; stroke: #e0f2fe; stroke-opacity: 0.45; stroke-width: 0.8; stroke-linejoin: round;}
+.mw-blade{fill: none; stroke: #7dd3fc; stroke-opacity: 0.55; stroke-width: 1.2;}
+.mw-blade-sh{fill: none; stroke: #05070b; stroke-opacity: 0.7; stroke-width: 1.2;}
+.mw-bracket{fill: none; stroke: #bae6fd; stroke-width: 1.5; stroke-linecap: round;}
+.mw-tick{stroke: #38bdf8; stroke-opacity: 0.35; stroke-width: 1;}
+.mw-sil{fill: none; stroke: #020617; stroke-width: 1.7; stroke-linecap: round;}
+.mw-sil-rotor{fill: none; stroke: #020617; stroke-width: 1.4;}
+.mw-sil-hub{fill: #020617;}
+.mw-ring{fill: none; stroke: url(#mwBezel); stroke-width: 2.2;}
+.mw-groove{fill: none; stroke: #05070b; stroke-opacity: 0.5; stroke-width: 1;}
+.mw-hairline{fill: none; stroke: #2b333d; stroke-opacity: 0.55; stroke-width: 1;}
+:root{--hub-accent: #059669; --cube-accent: #c2410c; --tri-accent: #7c3aed;}</style><g class="nodes"><g>
+    <defs>
+      <radialGradient id="mwBarrel" gradientUnits="userSpaceOnUse" cx="298" cy="380" r="40">
+        <stop offset="0%" stop-color="#22384e" /><stop offset="60%" stop-color="#131f2e" /><stop offset="100%" stop-color="#0a1119" />
+      </radialGradient>
+      <linearGradient id="mwBezel" x1="0" y1="352" x2="0" y2="420" gradientUnits="userSpaceOnUse">
+        <stop offset="0%" stop-color="#bae6fd" /><stop offset="45%" stop-color="#38bdf8" /><stop offset="100%" stop-color="#0c4a6e" />
+      </linearGradient>
+      <radialGradient id="mwAperture" gradientUnits="userSpaceOnUse" cx="298" cy="386" r="13">
+        <stop offset="0%" stop-color="#f0f9ff" /><stop offset="55%" stop-color="#7dd3fc" stop-opacity="0.9" /><stop offset="100%" stop-color="#0ea5e9" stop-opacity="0.15" />
+      </radialGradient>
+    </defs>
+    <g filter="url(#nodeShadow)"><circle cx="298" cy="386" r="34" fill="url(#mwBarrel)" /></g>
+    <circle cx="298" cy="386" r="28" class="mw-iris" />
+    <circle cx="298" cy="386" r="13.4" class="mw-apglow" filter="url(#soft)">
+      <animate attributeName="opacity" values="0.65;1;0.65" dur="3s" repeatCount="indefinite" />
+    </circle>
+    <polygon points="307,395 294.7,398.3 285.7,389.3 289,377 301.3,373.7 310.3,382.7" fill="url(#mwAperture)" />
+    <polygon points="307,395 294.7,398.3 285.7,389.3 289,377 301.3,373.7 310.3,382.7" class="mw-aphex" />
+    <path class="mw-sil" d="M292.8 380.8 L303.2 391.2 M303.2 380.8 L292.8 391.2" /><circle class="mw-sil-rotor" cx="292.8" cy="380.8" r="2" /><circle class="mw-sil-rotor" cx="303.2" cy="380.8" r="2" /><circle class="mw-sil-rotor" cx="292.8" cy="391.2" r="2" /><circle class="mw-sil-rotor" cx="303.2" cy="391.2" r="2" /><circle class="mw-sil-hub" cx="298" cy="386" r="1.4" />
+    <path class="mw-blade-sh" d="M308.4 395.4 L303.7 412.9" /><path class="mw-blade" d="M307 395 L302.1 413.1" /><path class="mw-blade-sh" d="M295.1 399.7 L277.6 404.4" /><path class="mw-blade" d="M294.7 398.3 L276.6 403.1" /><path class="mw-blade-sh" d="M284.7 390.3 L271.9 377.5" /><path class="mw-blade" d="M285.7 389.3 L272.4 376" /><path class="mw-blade-sh" d="M287.6 376.6 L292.3 359.1" /><path class="mw-blade" d="M289 377 L293.9 358.9" /><path class="mw-blade-sh" d="M300.9 372.3 L318.4 367.6" /><path class="mw-blade" d="M301.3 373.7 L319.4 368.9" /><path class="mw-blade-sh" d="M311.3 381.7 L324.1 394.5" /><path class="mw-blade" d="M310.3 382.7 L323.6 396" />
+    <path class="mw-bracket" d="M281 374 V369 H286" /><path class="mw-bracket" d="M310 369 H315 V374" /><path class="mw-bracket" d="M315 398 V403 H310" /><path class="mw-bracket" d="M286 403 H281 V398" />
+    <line class="mw-tick" x1="327" y1="386" x2="329.2" y2="386" /><line class="mw-tick" x1="323.1" y1="400.5" x2="325" y2="401.6" /><line class="mw-tick" x1="312.5" y1="411.1" x2="313.6" y2="413" /><line class="mw-tick" x1="298" y1="415" x2="298" y2="417.2" /><line class="mw-tick" x1="283.5" y1="411.1" x2="282.4" y2="413" /><line class="mw-tick" x1="272.9" y1="400.5" x2="271" y2="401.6" /><line class="mw-tick" x1="269" y1="386" x2="266.8" y2="386" /><line class="mw-tick" x1="272.9" y1="371.5" x2="271" y2="370.4" /><line class="mw-tick" x1="283.5" y1="360.9" x2="282.4" y2="359" /><line class="mw-tick" x1="298" y1="357" x2="298" y2="354.8" /><line class="mw-tick" x1="312.5" y1="360.9" x2="313.6" y2="359" /><line class="mw-tick" x1="323.1" y1="371.5" x2="325" y2="370.4" />
+    <circle cx="298" cy="386" r="34" class="mw-ring" />
+    <circle cx="298" cy="386" r="31.8" class="mw-groove" />
+    <circle cx="298" cy="386" r="35.4" class="mw-hairline" />
+    </g>
+  </g></svg>

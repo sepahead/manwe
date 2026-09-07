@@ -1,0 +1,46 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="236 324 124 124" width="124" height="124" role="img" aria-label="MANWE historical profile mark"><title>MANWE historical profile mark</title><desc>Archived design extracted from a historical portfolio SVG. This image makes no current product or release claim.</desc><defs><filter id="soft" x="-60%" y="-60%" width="220%" height="220%">
+      <feGaussianBlur stdDeviation="4" result="b" />
+      <feMerge><feMergeNode in="b" /><feMergeNode in="SourceGraphic" /></feMerge>
+    </filter>
+    </defs><style>:root{--hub-accent: #34d399; --cube-accent: #fb923c; --tri-accent: #a78bfa;}
+.radar{color: #38bdf8;}
+.radar-seat{fill: #38bdf8; fill-opacity: 0.08; filter: url(#soft);}
+.radar-ring{fill: none; stroke: #38bdf8; stroke-opacity: 0.4; stroke-width: 1;}
+.radar-line{fill: none; stroke: #7dd3fc; stroke-width: 1.4; stroke-linecap: round; opacity: 0.95;}
+.radar-blip{fill: #7dd3fc;}
+.radar-wing{fill: none; stroke: #7dd3fc; stroke-linecap: round;}
+:root{--hub-accent: #059669; --cube-accent: #c2410c; --tri-accent: #7c3aed;}
+.radar{color: #0284c7;}
+.radar-seat{fill: #0284c7; fill-opacity: 0.05;}
+.radar-ring{stroke: #0284c7;}
+.radar-line{stroke: #0284c7;}
+.radar-blip{fill: #0284c7;}
+.radar-wing{stroke: #0284c7;}</style><g class="nodes"><g class="radar">
+    <defs>
+      <radialGradient id="radarBeam" gradientUnits="userSpaceOnUse" cx="298" cy="386" r="30">
+        <stop offset="0%" stop-color="currentColor" stop-opacity="0.34" />
+        <stop offset="100%" stop-color="currentColor" stop-opacity="0" />
+      </radialGradient>
+    </defs>
+    <circle cx="298" cy="386" r="34" class="radar-seat" />
+    <circle cx="298" cy="386" r="11" class="radar-ring" />
+    <circle cx="298" cy="386" r="21" class="radar-ring" />
+    <circle cx="298" cy="386" r="30" class="radar-ring" />
+    <line x1="268" y1="386" x2="328" y2="386" class="radar-ring" />
+    <line x1="298" y1="356" x2="298" y2="416" class="radar-ring" />
+    <g class="radar-sweep">
+      <path d="M298 386 L328 386 A30 30 0 0 1 318.8 407.6 Z" class="radar-beam" fill="url(#radarBeam)" />
+      <line x1="298" y1="386" x2="328" y2="386" class="radar-line" />
+      <animateTransform attributeName="transform" type="rotate" from="0 298 386" to="360 298 386" dur="5s" repeatCount="indefinite" />
+    </g>
+    <path d="M276.4 396.8 Q292.6 391.4 313.1 374.1" class="radar-wing" stroke-width="2.2" stroke-opacity="0.95" />
+    <path d="M279.6 401.7 Q296.9 396.3 316.4 379.5" class="radar-wing" stroke-width="1.6" stroke-opacity="0.7" />
+    <path d="M283.4 406 Q300.7 400.6 318.5 384.9" class="radar-wing" stroke-width="1.1" stroke-opacity="0.5" />
+    <circle cx="310" cy="371" r="2.6" class="radar-blip">
+      <animate attributeName="opacity" values="1;0.15;1" dur="2s" repeatCount="indefinite" />
+    </circle>
+    <circle cx="288.8" cy="370.3" r="1.8" class="radar-blip">
+      <animate attributeName="opacity" values="0.15;1;0.15" dur="2s" repeatCount="indefinite" />
+    </circle>
+    </g>
+  </g></svg>
