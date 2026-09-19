@@ -94,6 +94,7 @@ Ragged detections and autocorrelated tracking frames need an explicit extraction
 The [integration audit](docs/INTEGRATION_CREBAIN.md) retains dated source observations and required promotion gates.
 Its historical consumer revisions do not describe later ecosystem releases.
 Current Manwe source still supplies no downstream adapter.
+The [NCP modular architecture and status guide](https://github.com/sepahead/NCP/blob/main/local/modular/STATUS.md) describes related applications, without establishing a Manwe integration.
 
 ## Work on Manwe
 
