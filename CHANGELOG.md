@@ -31,6 +31,8 @@ This is the first planned tagged alpha after the untagged Rust/Candle prototypes
 
 - Raised the locked transitive `anyio` to 4.14.2 and `urllib3` to 2.8.0. This fixes
   PYSEC-2026-4023, -4024, -4025, -4175, -4176, and -4177, which failed the CI dependency audit.
+- Raised the locked `pip` tool dependency to 26.2 for CVE-2026-13346. The CI audit covers
+  runtime and build dependencies, so only Dependabot reported it.
 - The agent contract now records the owner's authorization to commit, push, and merge to
   `main` after the applicable complete gate, requires signed commits without AI attribution,
   and names the three lock files. `CLAUDE.md` imports `AGENTS.md`.
