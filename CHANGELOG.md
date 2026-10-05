@@ -29,6 +29,9 @@ This is the first planned tagged alpha after the untagged Rust/Candle prototypes
 
 ### Changed
 
+- The agent contract now records the owner's authorization to commit, push, and merge to
+  `main` after the applicable complete gate, requires signed commits without AI attribution,
+  and names the three lock files. `CLAUDE.md` imports `AGENTS.md`.
 - Corrected general-alpha GOSPA to follow its cut-off-metric definition and
   corrected the synthetic scenario's constant-acceleration position step; the
   deterministic `fusion-sim` reference values now reflect the exact kinematics.

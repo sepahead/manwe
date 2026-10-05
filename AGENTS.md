@@ -4,6 +4,18 @@ Manwe develops perception research tools, numerical references, and checked mode
 Keep each completion claim within its executed and source-bound evidence.
 This file is the canonical entrypoint for coding agents.
 
+## Authority and workflow
+
+The owner authorizes agents to commit, push, and merge to `main`.
+`main` has no branch protection. Run the applicable complete gate before each push.
+Sign every commit. The Git configuration signs with the owner's SSH key.
+Preserve required checks and signing requirements.
+Push only the exact gated milestone.
+Do not add AI attribution or co-author trailers.
+Report a server-side rejection without bypassing repository protection.
+A documentation or source milestone does not authorize an alpha tag or scientific promotion.
+Releases, tags, registry publication, and repository settings remain owner actions.
+
 ## Read before changing
 
 Read [README.md](README.md) and [CONTRIBUTING.md](CONTRIBUTING.md) first.
@@ -23,15 +35,16 @@ Then read the document that owns the proposed change.
 ## Working method
 
 1. Inspect the owning implementation, tests, and evidence before proposing a change.
-2. Inventory staged changes, unstaged changes, branches, and worktrees before recovery work.
-3. Preserve unrelated changes and their staged state.
-4. Compare five to ten credible approaches before a material design decision.
-5. Record assumptions, benefits, failure modes, and a decisive control for each approach.
-6. Request independent review for separable, consequential decisions.
-7. Implement generic behavior from explicit contracts.
-8. Pair each new accept path with a negative control.
-9. Pair each new rejection path with a positive control.
-10. Run the applicable complete gate before publication.
+2. Question each assumption in the task and verify each fact against its primary source.
+3. Inventory staged changes, unstaged changes, branches, and worktrees before recovery work.
+4. Preserve unrelated changes and their staged state.
+5. Compare five to ten credible approaches before a material design decision.
+6. Record assumptions, benefits, failure modes, and a decisive control for each approach.
+7. Request independent review for separable, consequential decisions.
+8. Implement generic behavior from explicit contracts.
+9. Pair each new accept path with a negative control.
+10. Pair each new rejection path with a positive control.
+11. Run the applicable complete gate before publication.
 
 Review consequential changes through these twelve lenses:
 purpose, ownership, types, mathematics, time, identity, scientific validity, reproducibility, resource bounds, security, rights, and reader usability.
@@ -40,12 +53,6 @@ Resolve each failed requirement separately; a council vote cannot override a fai
 Freeze selected cases, seeds, exclusions, and thresholds before inspecting outcomes.
 Retain failures and negative results.
 Never substitute easier cases or branch on an expected fixture value.
-
-Honor the user's delivery instructions.
-When direct-main publication is authorized, commit and push only the exact gated milestone.
-Preserve required checks and signing requirements.
-Report a server-side rejection without bypassing repository protection.
-A documentation or source milestone does not authorize an alpha tag or scientific promotion.
 
 Do not modify another contributor's active scope.
 Do not change protected PID or KG work through dependency, index, branch, or worktree operations.
@@ -64,6 +71,9 @@ Inspect published interfaces read-only when needed for an authorized adapter rev
 - Keep batch CLI and viewer on the shared native runtime.
 - Preserve source taxonomy and explicit missing mappings in output.
 - Preserve bounded queues, exact sample identity, and conservative publication recovery.
+
+`Cargo.lock`, `metal-yolo-tests/Cargo.lock`, and `python/uv.lock` hold the exact pins.
+Change a lock only after an installed compatibility review and a reviewed lock diff.
 
 Raw export stops at an `ExportReceipt`.
 `VerifiedArtifactSignature` records tensor-interface evidence, not a cryptographic signature.
