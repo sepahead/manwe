@@ -1,0 +1,51 @@
+{
+  "schema": "sepahead.agent-index.v1",
+  "repository": "sepahead/manwe",
+  "summary": "Manwe: an alpha perception research workbench for vision, audio, multi-camera geometry and multi-target tracking, with a NumPy-only Python core, optional model pillars, a Rust inference CLI on a schema-2 model contract, and an Apple Metal benchmark crate. AGENTS.md is the operating contract; this index restates its facts for tools.",
+  "entry_documents": [
+    {"path": "AGENTS.md", "role": "operating contract for agents"},
+    {"path": "README.md", "role": "overview and quick start"},
+    {"path": "CONTRIBUTING.md", "role": "setup, dependencies and test commands"},
+    {"path": "docs/ARCHITECTURE.md", "role": "architecture, ownership, datasets and native runtime"},
+    {"path": "docs/WORKFLOWS.md", "role": "training, inference, export, recovery and numerical examples"},
+    {"path": "docs/MODEL_CONTRACTS.md", "role": "artifact admission, tensors, preprocessing, taxonomy and fidelity"},
+    {"path": "docs/INTEGRATION_CREBAIN.md", "role": "consumer adapters, frames, clocks, identity and PID extraction boundary"},
+    {"path": "docs/RELEASING.md", "role": "release guide"},
+    {"path": "SECURITY.md", "role": "security, credentials and publication"}
+  ],
+  "delivery": {
+    "default_branch": "main",
+    "merge": "Commit and push the exact gated milestone to main; main has no branch protection, so the applicable complete gate is the check before a push.",
+    "signing": "required: sign every commit; the Git configuration signs with the owner's SSH key",
+    "attribution": "no AI attribution or co-author trailers",
+    "owner_only": [
+      "release",
+      "tag",
+      "registry publication",
+      "repository setting change",
+      "scientific promotion"
+    ]
+  },
+  "gates": [
+    {"id": "python-tests", "when": "python/ or a Python dependency changes", "command": "make test", "cost": "medium"},
+    {"id": "python-quality", "when": "python/ or scripts/verify_python_sdist.py changes", "command": "make lint && make typecheck", "cost": "fast"},
+    {"id": "rust", "when": "src/, Cargo.toml or Cargo.lock changes", "command": "make rust-check", "cost": "medium"},
+    {"id": "metal-bench", "when": "metal-yolo-tests/ changes; needs macOS with Metal", "command": "make rust-bench-check", "cost": "medium"},
+    {"id": "secret-scan", "when": "any change", "command": "python3 scripts/check_secrets.py", "cost": "fast"},
+    {"id": "agent-index", "when": "agent-index.json or a path it names changes", "command": "python3 scripts/check_agent_index.py", "cost": "fast"},
+    {"id": "diff-hygiene", "when": "any change", "command": "git diff --check", "cost": "fast"}
+  ],
+  "generated": [
+    {"path": "python/uv.lock", "regenerate": "uv lock in python/, only after an installed compatibility review and a reviewed lock diff"},
+    {"path": "Cargo.lock", "regenerate": "cargo update, only after an installed compatibility review and a reviewed lock diff"},
+    {"path": "metal-yolo-tests/Cargo.lock", "regenerate": "cargo update in metal-yolo-tests/, only after an installed compatibility review and a reviewed lock diff"}
+  ],
+  "frozen": [
+    {"path": "assets/archive/", "reason": "historical figures kept as dated records; do not rewrite"}
+  ],
+  "ecosystem": [
+    {"repository": "sepahead/crebain", "relation": "intended consumer of perception models; no implemented adapter"},
+    {"repository": "sepahead/galadriel", "relation": "possible consumer of tracking output; no implemented adapter"},
+    {"repository": "sepahead/pid-rs", "relation": "no implemented adapter; tracking frames are autocorrelated and are not valid PID samples by themselves"}
+  ]
+}

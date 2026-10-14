@@ -123,3 +123,9 @@ Run documented lightweight examples when their instructions change.
 Check package inventories when adding files inside a distribution boundary.
 Retain exact code parity when a documentation milestone relies on unchanged implementation evidence.
 Report executed checks, unavailable host lanes, and remaining operational gates separately.
+
+## Agent index
+
+[`agent-index.json`](agent-index.json) restates the operational facts of this file for tools.
+Update it when a gate or a named path changes.
+Then run `python3 scripts/check_agent_index.py`.
