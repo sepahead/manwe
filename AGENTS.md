@@ -112,6 +112,9 @@ Follow an ASD-STE100-aligned style without claiming full standard compliance.
 Keep procedural sentences within 20 words and descriptive sentences within 25 words where practical.
 Put necessary conditions before commands.
 Preserve exact schema, wire, model, and historical identifiers.
+Do not cite social-media posts. A post can be deleted or edited, and it can state an opinion as a fact.
+That biases readers and agents and weakens scientific rigor.
+State the substance in your own words with its date, cite the primary source, and do not link the post or name its author.
 
 Keep README concise and detailed contracts in their owning guides.
 Define each mathematical symbol, unit, assumption, and operating bound.
